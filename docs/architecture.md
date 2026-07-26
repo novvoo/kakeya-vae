@@ -404,7 +404,8 @@ graph TD
         L5[multiscale<br/>0.25 x 多尺度 L1]
         L6[kl<br/>kl_weight x KL]
         L7[kakeya<br/>lambda x 覆盖正则<br/>§1 挂谷正则]
-        L8[rate<br/>rate_weight x 码率超限]
+        L8[lab<br/>0.05 x CIELAB ΔE<br/>低权重辅助约束]
+        L9[rate<br/>rate_weight x 码率超限]
     end
 
     L1 --> TOTAL[total loss]
@@ -415,6 +416,7 @@ graph TD
     L6 --> TOTAL
     L7 --> TOTAL
     L8 --> TOTAL
+    L9 --> TOTAL
 
     subgraph DetailWeight
         DW1[灰度边缘检测<br/>x8 梯度]
@@ -444,7 +446,7 @@ graph TD
         RL1 --> RL2
         RL2 --> RL3
         RL3 --> RL4
-        RL4 --> L8
+        RL4 --> L9
     end
 
     style TOTAL fill:#fff9c4
@@ -452,6 +454,7 @@ graph TD
     style MS_AVG fill:#f3e5f5
     style RL4 fill:#fce4ec
     style L7 fill:#e1f5fe
+    style L8 fill:#fff9c4
 ```
 
 ---
@@ -1021,7 +1024,7 @@ flowchart TD
 
 #### 9.5.2 真实颜色问题的根因：训练集多样性不足
 
-泛化问题修复后，大图仍存在颜色偏移（如整体泛蓝、暗红色偏色）。**最初以为是损失函数的颜色约束不够强，尝试了多种损失函数优化（LAB ΔE 色差、RGB 通道 detail_weight、亮度自适应权重等），但实测效果有限甚至拖累训练速度，最终已从代码中移除。** 真正的根因是训练数据的颜色分布过于单一——增加真实高清多彩图片到训练集后，问题立竿见影地解决。
+泛化问题修复后，大图仍存在颜色偏移（如整体泛蓝、暗红色偏色）。**最初尝试了多种复杂的损失函数优化（亮度自适应 LAB 权重、RGB 通道 detail_weight 等），但实测效果有限甚至拖累训练速度，已移除。** 真正的根因是训练数据的颜色分布过于单一——增加真实高清多彩图片到训练集后，问题立竿见影地解决。目前保留一个**低权重（λ=0.05）的基础版 CIELAB ΔE 损失**作为弱辅助约束，主要作用仍由数据多样性承担。
 
 ```mermaid
 flowchart TD

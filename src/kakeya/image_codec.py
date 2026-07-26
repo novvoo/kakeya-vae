@@ -875,8 +875,10 @@ def _epoch(
         "multiscale": 0.0,
         "kl": 0.0,
         "kakeya": 0.0,
+        "lab": 0.0,
         "kl_contribution": 0.0,
         "kakeya_contribution": 0.0,
+        "lab_contribution": 0.0,
         "rate_bpp": 0.0,
         "rate_excess_bpp": 0.0,
         "rate_contribution": 0.0,
@@ -946,6 +948,8 @@ def _epoch(
                     else RATE_LOSS_WEIGHT
                 )
                 rate_contribution = rate_weight * rate_excess_bpp
+                lab = _lab_loss(reconstructed, images)
+                lab_contribution = _LAMBDA_LAB * lab
                 total = (
                     reconstruction
                     + 5.0 * mse
@@ -954,6 +958,7 @@ def _epoch(
                     + 0.25 * multiscale
                     + kl_contribution
                     + kakeya_contribution
+                    + lab_contribution
                     + rate_contribution
                 )
                 if optimizer is not None:
@@ -982,8 +987,10 @@ def _epoch(
                 ("multiscale", multiscale),
                 ("kl", kl),
                 ("kakeya", coverage),
+                ("lab", lab),
                 ("kl_contribution", kl_contribution),
                 ("kakeya_contribution", kakeya_contribution),
+                ("lab_contribution", lab_contribution),
                 ("rate_bpp", rate_bpp),
                 ("rate_excess_bpp", rate_excess_bpp),
                 ("rate_contribution", rate_contribution),
@@ -1418,6 +1425,63 @@ def _edges(image: torch.Tensor) -> torch.Tensor:
         ),
         dim=1,
     )
+
+
+_SRGB_TO_LIN_COEFF = 1.0 / 12.92
+_SRGB_TO_LIN_EXP = 1.0 / 2.4
+_SRGB_TO_LIN_OFFSET = 0.055
+_SRGB_TO_LIN_SCALE = 1.055
+
+_LAB_DELTA = 6.0 / 29.0
+_LAB_DELTA_CUBED = _LAB_DELTA ** 3
+_LAB_FACTOR = 3.0 * _LAB_DELTA ** 2
+
+_D65_XYZ = torch.tensor([0.95047, 1.0, 1.08883])
+
+_XYZ_TO_LAB = torch.tensor([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+])
+
+
+def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    if rgb.max() <= 1.5:
+        srgb = rgb.clamp(0, 1)
+    else:
+        srgb = (rgb / 255.0).clamp(0, 1)
+    lin = torch.where(
+        srgb <= 0.04045,
+        srgb * _SRGB_TO_LIN_COEFF,
+        ((srgb + _SRGB_TO_LIN_OFFSET) / _SRGB_TO_LIN_SCALE).pow(_SRGB_TO_LIN_EXP),
+    )
+    if lin.size(1) == 3:
+        rgb_ch = lin.permute(0, 2, 3, 1)
+        xyz = (rgb_ch @ _XYZ_TO_LAB.to(lin.device).T).permute(0, 3, 1, 2)
+    else:
+        xyz = lin
+    ref = _D65_XYZ.to(lin.device).view(1, 3, 1, 1)
+    xyz_norm = xyz / ref
+    f = torch.where(
+        xyz_norm > _LAB_DELTA_CUBED,
+        xyz_norm.pow(1.0 / 3.0),
+        xyz_norm / _LAB_FACTOR + 4.0 / 29.0,
+    )
+    L = 116.0 * f[:, 1:2, :, :] - 16.0
+    a = 500.0 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
+    b = 200.0 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
+    return torch.cat([L, a, b], dim=1)
+
+
+def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    rec_lab = _rgb_to_lab(reconstructed)
+    tgt_lab = _rgb_to_lab(target)
+    diff = rec_lab - tgt_lab
+    delta_e = torch.sqrt((diff ** 2).sum(dim=1, keepdim=True) + 1e-8)
+    return delta_e.mean()
+
+
+_LAMBDA_LAB = 0.05
 
 
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:
