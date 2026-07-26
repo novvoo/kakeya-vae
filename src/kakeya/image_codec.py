@@ -1477,7 +1477,14 @@ def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     rec_lab = _rgb_to_lab(reconstructed)
     tgt_lab = _rgb_to_lab(target)
     diff = rec_lab - tgt_lab
-    delta_e = torch.sqrt((diff ** 2).sum(dim=1, keepdim=True) + 1e-8)
+    L = tgt_lab[:, 0:1, :, :]
+    chroma_weight = 1.0 + 2.0 * ((50.0 - L.clamp(0.0, 50.0)) / 50.0)
+    delta_e = torch.sqrt(
+        0.25 * diff[:, 0:1, :, :].pow(2)
+        + chroma_weight * diff[:, 1:2, :, :].pow(2)
+        + chroma_weight * diff[:, 2:3, :, :].pow(2)
+        + 1e-8,
+    )
     return delta_e.mean()
 
 
