@@ -1488,7 +1488,7 @@ def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return delta_e.mean()
 
 
-_LAMBDA_LAB = 0.05
+_LAMBDA_LAB = 0.15
 
 
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:
