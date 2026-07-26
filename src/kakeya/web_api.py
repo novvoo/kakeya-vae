@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 
 from kakeya.config import ExperimentConfig
@@ -232,6 +233,109 @@ def experiment_checkpoint(job_id: str) -> FileResponse:
         media_type="application/octet-stream",
         filename="final.pt",
     )
+
+
+@app.post("/api/experiments/{job_id}/reconstruct")
+async def reconstruct_uploaded(
+    job_id: str, file: Annotated[UploadFile, File(...)]
+) -> dict[str, Any]:
+    import base64
+    import io
+    from copy import deepcopy
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    from kakeya.image_codec import ImageCodecVAE
+
+    record = manager.get(job_id)
+    if record is None or not record.run_dir:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    run_dir = (manager.project_root / record.run_dir).resolve()
+    checkpoint_path = run_dir / "checkpoints/final.pt"
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail="模型检查点不存在")
+
+    image_bytes = await file.read()
+    try:
+        source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="无法解析上传的图片")
+
+    if source_image.size != (256, 256):
+        source_image = source_image.resize((256, 256), Image.LANCZOS)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    latent_dim = payload["config"].get("latent_dim", 8)
+    model = ImageCodecVAE(latent_dim=latent_dim).to(device)
+    model.load_state_dict(payload["model_state_dict"])
+    model.eval()
+
+    source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
+    source = source.permute(2, 0, 1).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        mu, _ = model.encode(source)
+        entropy_model = deepcopy(model.entropy_bottleneck).cpu().eval()
+        entropy_model.update(force=True)
+        latent_cpu = mu.detach().cpu()
+        strings = entropy_model.compress(latent_cpu)
+        payload_data = strings[0]
+        shape = list(latent_cpu.shape[-2:])
+        decoded_latent = entropy_model.decompress([payload_data], shape).to(device)
+        reconstructed = model.decode(decoded_latent).clamp(0, 1)
+
+    mse = float(F.mse_loss(reconstructed, source))
+    psnr = 99.0 if mse == 0 else 10 * np.log10(1.0 / mse)
+    ssim = float(_ssim_torch(reconstructed, source))
+    bitstream_bytes = len(payload_data) + 64
+    bpp = bitstream_bytes * 8 / (256 * 256)
+
+    def _to_png(tensor: torch.Tensor) -> str:
+        arr = tensor.detach().cpu().permute(1, 2, 0).numpy()
+        img = Image.fromarray((arr.clip(0, 1) * 255).astype(np.uint8), mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    diff = (reconstructed - source).abs()[0]
+    heat = torch.stack(
+        (
+            diff.mean(dim=0).mul(3).clamp(0, 1),
+            diff.mean(dim=0).mul(0.7).clamp(0, 1),
+            torch.zeros_like(diff[0]),
+        )
+    )
+
+    return {
+        "original": _to_png(source[0]),
+        "reconstruction": _to_png(reconstructed[0]),
+        "error": _to_png(heat),
+        "metrics": {
+            "mse": mse,
+            "psnr": float(psnr),
+            "ssim": ssim,
+            "bitstream_bytes": bitstream_bytes,
+            "bpp": float(bpp),
+        },
+    }
+
+
+def _ssim_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    mu_x = F.avg_pool2d(x, 11, stride=1, padding=5)
+    mu_y = F.avg_pool2d(y, 11, stride=1, padding=5)
+    sigma_x = F.avg_pool2d(x * x, 11, 1, 5) - mu_x.square()
+    sigma_y = F.avg_pool2d(y * y, 11, 1, 5) - mu_y.square()
+    sigma_xy = F.avg_pool2d(x * y, 11, 1, 5) - mu_x * mu_y
+    c1, c2 = 0.01**2, 0.03**2
+    return (
+        ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2))
+        / ((mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2))
+    ).mean()
 
 
 @app.post("/api/experiments/{job_id}/artifact/open-checkpoint-dir")

@@ -871,7 +871,61 @@ def reference_codec_baselines() -> list[dict[str, Any]]:
                 "ssim": float(_ssim(decoded_tensor, source)),
             }
         )
+    rows.extend(_compressai_baselines(source, source_image))
     return rows
+
+
+def _compressai_baselines(
+    source: torch.Tensor, source_image: Image.Image
+) -> list[dict[str, Any]]:
+    try:
+        from compressai.zoo import mbt2018_mean
+    except ImportError:
+        return []
+    import ssl
+
+    original_context = ssl._create_default_https_context
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
+    results: list[dict[str, Any]] = []
+    try:
+        for quality in (2, 4, 6):
+            try:
+                net = mbt2018_mean(
+                    quality=quality, metric="mse", pretrained=True
+                )
+            except Exception:
+                continue
+            net.eval()
+            with torch.no_grad():
+                compressed = net.compress(source)
+                strings = compressed["strings"]
+                out = net.decompress(strings, compressed["shape"])
+                x_hat = out["x_hat"].clamp(0, 1)
+            total_bytes = sum(
+                len(s) for string_list in strings for s in string_list
+            )
+            total_bytes += 64
+            mse = float(F.mse_loss(x_hat, source))
+            results.append(
+                {
+                    "codec": "CompressAI mbt2018",
+                    "settings": f"quality {quality} (mse)",
+                    "bytes": total_bytes,
+                    "mse": mse,
+                    "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+                    "ssim": float(_ssim(x_hat, source)),
+                    "learned": True,
+                }
+            )
+    finally:
+        try:
+            ssl._create_default_https_context = original_context
+        except Exception:
+            pass
+    return results
 
 
 def _ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -1201,6 +1201,41 @@ function ImageCodecResults({
     ["reconstruction", "模型还原图"],
     ["error", "误差热图"],
   ] as const;
+  const [customRecon, setCustomRecon] = useState<{
+    original: string;
+    reconstruction: string;
+    error: string;
+    metrics: { psnr: number; ssim: number; bpp: number; bitstream_bytes: number };
+  } | null>(null);
+  const [customLoading, setCustomLoading] = useState(false);
+  const handleCustomUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setCustomLoading(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(
+        `${API_BASE}/api/experiments/${jobId}/reconstruct`,
+        { method: "POST", body: form }
+      );
+      if (!res.ok) throw new Error("还原失败");
+      const data = await res.json();
+      setCustomRecon(data);
+    } catch (err) {
+      console.error(err);
+      alert("图片还原失败，请检查图片格式");
+    } finally {
+      setCustomLoading(false);
+    }
+  };
+  const customPanels = customRecon
+    ? [
+        ["original", "你的原图", customRecon.original],
+        ["reconstruction", "模型还原图", customRecon.reconstruction],
+        ["error", "误差热图", customRecon.error],
+      ]
+    : [];
   return (
     <>
       <div className="metric-grid codec-metrics">
@@ -1272,6 +1307,57 @@ function ImageCodecResults({
             <figcaption>{label}</figcaption>
           </figure>
         ))}
+      </div>
+      <div className="custom-recon-section">
+        <div className="custom-recon-header">
+          <div>
+            <p className="section-index">TRY IT YOURSELF</p>
+            <h3>上传你的图测试压缩</h3>
+          </div>
+          <label className="upload-btn">
+            <input
+              type="file"
+              accept="image/*"
+              onChange={handleCustomUpload}
+              disabled={customLoading}
+            />
+            {customLoading ? "处理中…" : "选择图片"}
+          </label>
+        </div>
+        <p className="custom-recon-note">
+          图片会自动缩放到 256×256，使用本次训练的 final.pt 做真实熵编码，
+          结果只在你本机处理。
+        </p>
+        {customRecon && (
+          <>
+            <div className="codec-images">
+              {customPanels.map(([kind, label, dataUrl]) => (
+                <figure key={kind}>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={`data:image/png;base64,${dataUrl}`} alt={label} />
+                  <figcaption>{label}</figcaption>
+                </figure>
+              ))}
+            </div>
+            <div className="custom-recon-metrics">
+              <span>
+                PSNR <strong>{customRecon.metrics.psnr.toFixed(2)} dB</strong>
+              </span>
+              <span>
+                SSIM <strong>{customRecon.metrics.ssim.toFixed(4)}</strong>
+              </span>
+              <span>
+                码流{" "}
+                <strong>
+                  {formatBytes(customRecon.metrics.bitstream_bytes)}
+                </strong>
+              </span>
+              <span>
+                bpp <strong>{customRecon.metrics.bpp.toFixed(3)}</strong>
+              </span>
+            </div>
+          </>
+        )}
       </div>
       {bitstream && (
         <div className="bitstream-callout">
