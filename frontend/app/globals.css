@@ -994,6 +994,16 @@ h2 {
   color: white;
 }
 
+button.upload-btn {
+  font-family: var(--mono);
+  line-height: 1.4;
+}
+
+button.upload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .upload-btn input {
   display: none;
 }
@@ -1001,6 +1011,239 @@ h2 {
 .upload-btn:has(input:disabled) {
   opacity: 0.5;
   cursor: progress;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sandbox-trigger {
+  padding: 10px 18px;
+  border: 1px solid var(--ink);
+  background: white;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.sandbox-trigger:hover {
+  background: var(--ink);
+  color: white;
+}
+
+.sandbox-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  animation: fadeIn 0.15s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.sandbox-panel {
+  background: var(--panel);
+  width: 100%;
+  max-width: 900px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  animation: slideUp 0.2s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sandbox-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 24px 28px;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+
+.sandbox-header h2 {
+  margin: 4px 0 0;
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.04em;
+}
+
+.sandbox-close {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  background: white;
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+}
+
+.sandbox-close:hover {
+  background: var(--ink);
+  color: white;
+}
+
+.sandbox-body {
+  padding: 28px;
+}
+
+.sandbox-intro {
+  margin: 0 0 24px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.sandbox-upload-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.sandbox-upload-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 20px;
+  border: 2px dashed var(--line);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: all 0.15s;
+  background: var(--panel);
+}
+
+.sandbox-upload-card:hover {
+  border-color: var(--ink);
+  background: white;
+}
+
+.sandbox-card-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+
+.sandbox-upload-card strong {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.sandbox-upload-card input {
+  display: none;
+}
+
+.sandbox-upload-card small {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 4px;
+}
+
+.sandbox-run-btn-lg {
+  width: 100%;
+  padding: 16px;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: white;
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  letter-spacing: 0.06em;
+  transition: all 0.15s;
+}
+
+.sandbox-run-btn-lg:hover:not(:disabled) {
+  background: #000;
+}
+
+.sandbox-run-btn-lg:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sandbox-result-header {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+
+.sandbox-result-header h3 {
+  margin: 4px 0 16px;
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+}
+
+.sandbox-result-images {
+  margin: 0;
+}
+
+.sandbox-result-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.sandbox-result-metrics .metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+}
+
+.sandbox-result-metrics .metric span {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.sandbox-result-metrics .metric strong {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--ink);
 }
 
 .custom-recon-metrics {

@@ -7,7 +7,7 @@ def test_image_codec_defaults_use_fifty_epoch_capacity_run() -> None:
     request = ExperimentRequest()
 
     assert request.method == "image_codec"
-    assert request.epochs == 50
+    assert request.epochs == 80
     assert request.train_limit == 128
 
 

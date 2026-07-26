@@ -2,6 +2,14 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
+function FormattedDate({ dateString }: { dateString: string }) {
+  const [formatted, setFormatted] = useState<string>("");
+  useEffect(() => {
+    setFormatted(new Date(dateString).toLocaleString("zh-CN"));
+  }, [dateString]);
+  return <>{formatted || <span suppressHydrationWarning>—</span>}</>;
+}
+
 const API_BASE =
   process.env.NEXT_PUBLIC_KAKEYA_API_URL ?? "http://127.0.0.1:8000";
 
@@ -124,8 +132,8 @@ type ResultPayload = {
 
 const DEFAULT_CONFIG: ExperimentConfig = {
   method: "image_codec",
-  epochs: 50,
-  latent_dim: 8,
+  epochs: 80,
+  latent_dim: 16,
   batch_size: 4,
   learning_rate: 0.0005,
   seed: 42,
@@ -234,6 +242,7 @@ export default function Home() {
   const [result, setResult] = useState<ResultPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [sandboxOpen, setSandboxOpen] = useState(false);
   const eventSource = useRef<EventSource | null>(null);
 
   const refreshEnvironment = useCallback(async () => {
@@ -370,8 +379,8 @@ export default function Home() {
       setConfig({
         ...config,
         method,
-        epochs: 50,
-        latent_dim: 8,
+        epochs: 80,
+        latent_dim: 16,
         batch_size: 4,
         train_limit: 128,
         test_limit: 0,
@@ -396,10 +405,19 @@ export default function Home() {
           <p className="eyebrow">KAKEYA / EXPERIMENT OPERATIONS</p>
           <h1>图文压缩实验台</h1>
         </div>
-        <EnvironmentControl
-          environment={environment}
-          onInstall={installDependencies}
-        />
+        <div className="topbar-actions">
+          <button
+            type="button"
+            className="sandbox-trigger"
+            onClick={() => setSandboxOpen(true)}
+          >
+            模型试玩台
+          </button>
+          <EnvironmentControl
+            environment={environment}
+            onInstall={installDependencies}
+          />
+        </div>
       </header>
 
       <OperationStatusBoard
@@ -674,7 +692,7 @@ export default function Home() {
                   {METHOD_LABELS[job.config.method] ?? job.config.method}
                 </span>
                 <span>{job.config.epochs} epochs</span>
-                <span>{new Date(job.created_at).toLocaleString("zh-CN")}</span>
+                <FormattedDate dateString={job.created_at} />
                 <span className={`status status-${job.status}`}>
                   {STATUS_LABELS[job.status]}
                 </span>
@@ -685,6 +703,10 @@ export default function Home() {
           )}
         </div>
       </section>
+      <SandboxPlayground
+        open={sandboxOpen}
+        onClose={() => setSandboxOpen(false)}
+      />
     </main>
   );
 }
@@ -1171,6 +1193,155 @@ function ImagePreviewPanel({
   );
 }
 
+function SandboxPlayground({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
+  const [checkpointFile, setCheckpointFile] = useState<File | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [recon, setRecon] = useState<{
+    original: string;
+    reconstruction: string;
+    error: string;
+    metrics: { psnr: number; ssim: number; bpp: number; bitstream_bytes: number };
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleRun = async () => {
+    if (!checkpointFile || !imageFile) return;
+    setLoading(true);
+    try {
+      const form = new FormData();
+      form.append("checkpoint", checkpointFile);
+      form.append("image", imageFile);
+      const res = await fetch(`${API_BASE}/api/reconstruct-custom`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "还原失败");
+      }
+      const data = await res.json();
+      setRecon(data);
+    } catch (err) {
+      alert((err as Error).message || "图片还原失败，请检查模型和图片");
+    } finally {
+      setLoading(false);
+    }
+  };
+  const panels = recon
+    ? [
+        ["original", "原图", recon.original],
+        ["reconstruction", "还原图", recon.reconstruction],
+        ["error", "误差热图", recon.error],
+      ]
+    : [];
+  if (!open) return null;
+  return (
+    <div className="sandbox-overlay" onClick={onClose}>
+      <div className="sandbox-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="sandbox-header">
+          <div>
+            <p className="section-index">SANDBOX · NO TRAINING NEEDED</p>
+            <h2>模型试玩台</h2>
+          </div>
+          <button
+            type="button"
+            className="sandbox-close"
+            onClick={onClose}
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div className="sandbox-body">
+          <p className="sandbox-intro">
+            上传别人训练好的 Kakeya ImageCodecVAE checkpoint（.pt 文件）和一张测试图，
+            立即看压缩还原效果。不需要训练，所有计算都在你本机完成。
+          </p>
+          <div className="sandbox-upload-grid">
+            <label className="sandbox-upload-card">
+              <span className="sandbox-card-label">模型文件</span>
+              <strong>.pt / .pth / .ckpt</strong>
+              <input
+                type="file"
+                accept=".pt,.pth,.ckpt"
+                onChange={(e) => {
+                  setCheckpointFile(e.target.files?.[0] || null);
+                  setRecon(null);
+                }}
+              />
+              <small>
+                {checkpointFile ? checkpointFile.name : "点击选择文件"}
+              </small>
+            </label>
+            <label className="sandbox-upload-card">
+              <span className="sandbox-card-label">测试图片</span>
+              <strong>任意图片格式</strong>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  setImageFile(e.target.files?.[0] || null);
+                  setRecon(null);
+                }}
+              />
+              <small>{imageFile ? imageFile.name : "点击选择图片"}</small>
+            </label>
+          </div>
+          <button
+            type="button"
+            className="sandbox-run-btn-lg"
+            onClick={handleRun}
+            disabled={loading || !checkpointFile || !imageFile}
+          >
+            {loading ? "编码解码中…" : "开始压缩还原"}
+          </button>
+          {recon && (
+            <>
+              <div className="sandbox-result-header">
+                <p className="section-index">RESULT</p>
+                <h3>还原结果</h3>
+              </div>
+              <div className="codec-images sandbox-result-images">
+                {panels.map(([kind, label, dataUrl]) => (
+                  <figure key={kind}>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={`data:image/png;base64,${dataUrl}`} alt={label} />
+                    <figcaption>{label}</figcaption>
+                  </figure>
+                ))}
+              </div>
+              <div className="sandbox-result-metrics">
+                <div className="metric">
+                  <span>PSNR</span>
+                  <strong>{recon.metrics.psnr.toFixed(2)} dB</strong>
+                </div>
+                <div className="metric">
+                  <span>SSIM</span>
+                  <strong>{recon.metrics.ssim.toFixed(4)}</strong>
+                </div>
+                <div className="metric">
+                  <span>码流大小</span>
+                  <strong>{formatBytes(recon.metrics.bitstream_bytes)}</strong>
+                </div>
+                <div className="metric">
+                  <span>bpp</span>
+                  <strong>{recon.metrics.bpp.toFixed(3)}</strong>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ImageCodecResults({
   result,
   jobId,
@@ -1208,9 +1379,8 @@ function ImageCodecResults({
     metrics: { psnr: number; ssim: number; bpp: number; bitstream_bytes: number };
   } | null>(null);
   const [customLoading, setCustomLoading] = useState(false);
-  const handleCustomUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+
+  const handleCustomUpload = async (file: File) => {
     setCustomLoading(true);
     try {
       const form = new FormData();
@@ -1219,12 +1389,14 @@ function ImageCodecResults({
         `${API_BASE}/api/experiments/${jobId}/reconstruct`,
         { method: "POST", body: form }
       );
-      if (!res.ok) throw new Error("还原失败");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "还原失败");
+      }
       const data = await res.json();
       setCustomRecon(data);
     } catch (err) {
-      console.error(err);
-      alert("图片还原失败，请检查图片格式");
+      alert((err as Error).message || "图片还原失败，请检查图片格式");
     } finally {
       setCustomLoading(false);
     }
@@ -1318,7 +1490,10 @@ function ImageCodecResults({
             <input
               type="file"
               accept="image/*"
-              onChange={handleCustomUpload}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleCustomUpload(file);
+              }}
               disabled={customLoading}
             />
             {customLoading ? "处理中…" : "选择图片"}
@@ -1326,7 +1501,7 @@ function ImageCodecResults({
         </div>
         <p className="custom-recon-note">
           图片会自动缩放到 256×256，使用本次训练的 final.pt 做真实熵编码，
-          结果只在你本机处理。
+          结果只在你本机处理。也可以在左侧「模型试玩台」上传别人训练的模型。
         </p>
         {customRecon && (
           <>

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck
 from PIL import Image, ImageDraw, ImageFont
 from torch import nn, optim
+from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import DataLoader, Dataset
 
 from kakeya.config import ExperimentConfig
@@ -28,6 +29,14 @@ from kakeya.training import seed_everything
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_IMAGE = PROJECT_ROOT / "assets/test_images/kakeya_codec_card_v2_256.png"
+SOURCE_IMAGE_SIZE = 512
+TARGET_IMAGE_SIZE = 256
+# Multi-scale training sizes (must be multiples of 8 due to 3× PixelShuffle).
+# 50% of samples stay at 256² to preserve core codec quality; the other 50%
+# are drawn from these sizes so the model sees a real range of resolutions.
+MULTISCALE_TRAIN_SIZES = (128, 192, 256, 384, 512, 768)
+MULTISCALE_PRIMARY_SIZE = 256
+MULTISCALE_PRIMARY_RATIO = 0.5
 LATENT_MEAN_BOUND = 3.0
 CAPACITY_GATE_PSNR = 30.0
 CAPACITY_GATE_SSIM = 0.97
@@ -39,9 +48,9 @@ BITSTREAM_MAGIC = b"KKEYA-EB1"
 
 
 class ImageCodecVAE(nn.Module):
-    """Detail-preserving learned codec with a quantized 32×32 latent."""
+    """Detail-preserving learned codec with a fully scale-invariant architecture."""
 
-    def __init__(self, latent_dim: int = 8) -> None:
+    def __init__(self, latent_dim: int = 16) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.encoder = nn.Sequential(
@@ -52,20 +61,20 @@ class ImageCodecVAE(nn.Module):
             SpaceToDepth(32, 64),
             ResidualBlock(64),
         )
-        self.to_mu = nn.Conv2d(64, latent_dim, 1)
-        self.to_log_var = nn.Conv2d(64, latent_dim, 1)
+        self.to_mu = weight_norm(nn.Conv2d(64, latent_dim, 1))
+        self.to_log_var = weight_norm(nn.Conv2d(64, latent_dim, 1))
         self.entropy_bottleneck = EntropyBottleneck(latent_dim)
         self.decoder = nn.Sequential(
-            nn.Conv2d(latent_dim, 64, 3, padding=1),
+            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
             ResidualBlock(64),
             DepthToSpace(64, 32),
             ResidualBlock(32),
             DepthToSpace(32, 24),
             ResidualBlock(24),
             DepthToSpace(24, 12),
-            nn.Conv2d(12, 24, 3, padding=1),
+            weight_norm(nn.Conv2d(12, 24, 3, padding=1)),
             nn.SiLU(),
-            nn.Conv2d(24, 3, 3, padding=1),
+            weight_norm(nn.Conv2d(24, 3, 3, padding=1)),
             nn.Sigmoid(),
         )
 
@@ -95,12 +104,12 @@ class ResidualBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.GroupNorm(_groups(channels), channels),
+            nn.InstanceNorm2d(channels, affine=True),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(_groups(channels), channels),
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+            nn.InstanceNorm2d(channels, affine=True),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -114,8 +123,8 @@ class SpaceToDepth(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.PixelUnshuffle(2),
-            nn.Conv2d(input_channels * 4, output_channels, 3, padding=1),
-            nn.GroupNorm(_groups(output_channels), output_channels),
+            weight_norm(nn.Conv2d(input_channels * 4, output_channels, 3, padding=1)),
+            nn.InstanceNorm2d(output_channels, affine=True),
             nn.SiLU(),
         )
 
@@ -129,9 +138,9 @@ class DepthToSpace(nn.Module):
     def __init__(self, input_channels: int, output_channels: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(input_channels, output_channels * 4, 3, padding=1),
+            weight_norm(nn.Conv2d(input_channels, output_channels * 4, 3, padding=1)),
             nn.PixelShuffle(2),
-            nn.GroupNorm(_groups(output_channels), output_channels),
+            nn.InstanceNorm2d(output_channels, affine=True),
             nn.SiLU(),
         )
 
@@ -140,7 +149,16 @@ class DepthToSpace(nn.Module):
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
-    """Synthetic cards mixed with a declared codec-calibration reference."""
+    """Multi-scale synthetic cards for scale-invariant codec training.
+
+    Each sample is rendered at a randomly chosen resolution from
+    MULTISCALE_TRAIN_SIZES, so the model sees 128² through 768² inputs every
+    epoch.  Half of the samples stay at the primary 256² size to preserve
+    core codec quality; the other half are drawn uniformly from the full
+    size pool.  Content is always authored at SOURCE_IMAGE_SIZE (512²) and
+    then resized to the target size, so large samples keep fine detail and
+    small samples mimic real downscaled inputs.
+    """
 
     WORDS = (
         "KAKEYA",
@@ -157,19 +175,42 @@ class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
         self.size = size
         self.seed = seed
         reference = Image.open(TEST_IMAGE).convert("RGB")
+        self.reference_full = reference.resize(
+            (SOURCE_IMAGE_SIZE, SOURCE_IMAGE_SIZE), Image.LANCZOS
+        )
         reference_array = np.asarray(reference, dtype=np.float32) / 255.0
-        self.reference = torch.from_numpy(reference_array).permute(2, 0, 1)
+        self.reference_tensor = torch.from_numpy(reference_array).permute(2, 0, 1)
 
     def __len__(self) -> int:
         return self.size
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        # This verifies codec fidelity/capacity; it is not generalization.
-        if index % 2 == 0:
-            return self.reference.clone(), 1
         rng = random.Random(self.seed + index * 104729)
+        target_size = self._pick_target_size(rng)
+        if index % 2 == 0:
+            image = self.reference_full.resize(
+                (target_size, target_size), Image.LANCZOS
+            )
+            label = 1
+        else:
+            image = self._generate_procedural(rng).resize(
+                (target_size, target_size), Image.LANCZOS
+            )
+            label = 0
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(array).permute(2, 0, 1), label
+
+    @staticmethod
+    def _pick_target_size(rng: random.Random) -> int:
+        if rng.random() < MULTISCALE_PRIMARY_RATIO:
+            return MULTISCALE_PRIMARY_SIZE
+        return rng.choice(MULTISCALE_TRAIN_SIZES)
+
+    def _generate_procedural(self, rng: random.Random) -> Image.Image:
         image = Image.new(
-            "RGB", (256, 256), tuple(rng.randint(225, 255) for _ in range(3))
+            "RGB",
+            (SOURCE_IMAGE_SIZE, SOURCE_IMAGE_SIZE),
+            tuple(rng.randint(225, 255) for _ in range(3)),
         )
         draw = ImageDraw.Draw(image)
         palette = [
@@ -179,26 +220,27 @@ class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
             (255, 117, 72),
             (200, 61, 45),
         ]
-        for _ in range(rng.randint(5, 10)):
-            x0, y0 = rng.randint(4, 210), rng.randint(4, 210)
-            x1, y1 = rng.randint(x0 + 10, 252), rng.randint(y0 + 10, 252)
+        margin = 8
+        inner = SOURCE_IMAGE_SIZE - margin * 2
+        for _ in range(rng.randint(5, 12)):
+            x0, y0 = rng.randint(margin, inner - 20), rng.randint(margin, inner - 20)
+            x1, y1 = rng.randint(x0 + 20, inner), rng.randint(y0 + 20, inner)
             color = rng.choice(palette)
             if rng.random() < 0.55:
-                draw.rectangle((x0, y0, x1, y1), outline=color, width=rng.randint(1, 4))
+                draw.rectangle((x0, y0, x1, y1), outline=color, width=rng.randint(2, 8))
             else:
-                draw.line((x0, y0, x1, y1), fill=color, width=rng.randint(1, 4))
-        for row in range(rng.randint(4, 8)):
-            size = rng.choice((11, 13, 16, 20))
-            font = _font(size)
+                draw.line((x0, y0, x1, y1), fill=color, width=rng.randint(2, 8))
+        for row in range(rng.randint(4, 10)):
+            font_size = rng.choice((16, 20, 26, 32))
+            font = _font(font_size)
             text = rng.choice(self.WORDS)
             draw.text(
-                (rng.randint(8, 120), 10 + row * 30),
+                (rng.randint(12, SOURCE_IMAGE_SIZE // 2), 16 + row * 56),
                 text,
                 font=font,
                 fill=rng.choice(palette[:2]),
             )
-        array = np.asarray(image, dtype=np.float32) / 255.0
-        return torch.from_numpy(array).permute(2, 0, 1), 0
+        return image
 
 
 class CalibrationCardDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -229,6 +271,26 @@ class ImageCodecResult:
     bitstream: dict[str, Any]
 
 
+def _size_aware_collate(
+    batch: list[tuple[torch.Tensor, int]],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Group samples by spatial size so mixed 256² and 512² batches coexist.
+
+    Returns a list of (images, labels) mini-batches, each with uniform size.
+    """
+    groups: dict[int, list[tuple[torch.Tensor, int]]] = {}
+    for image, label in batch:
+        size = image.shape[-1]
+        groups.setdefault(size, []).append((image, label))
+    mini_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for size in sorted(groups):
+        items = groups[size]
+        images = torch.stack([item[0] for item in items])
+        labels = torch.tensor([item[1] for item in items], dtype=torch.long)
+        mini_batches.append((images, labels))
+    return mini_batches
+
+
 EpochCallback = Callable[
     [int, int, dict[str, float], dict[str, float], Path], None
 ]
@@ -247,12 +309,14 @@ def train_image_codec(
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
+        collate_fn=_size_aware_collate,
     )
     validation_loader = DataLoader(
         ProceduralDocumentDataset(validation_size, config.seed + 1_000_000),
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
+        collate_fn=_size_aware_collate,
     )
     capacity_loader = DataLoader(
         CalibrationCardDataset(CAPACITY_STEPS_PER_EPOCH),
@@ -295,30 +359,80 @@ def train_image_codec(
     last_validation_capacity_stage: bool | None = None
     gate_epoch: int | None = None
     train_reference = (
-        ProceduralDocumentDataset(1, config.seed).reference.unsqueeze(0).to(device)
+        ProceduralDocumentDataset(1, config.seed).reference_tensor.unsqueeze(0).to(device)
     )
 
+    TRANSITION_EPOCHS = 5
     for epoch in range(1, config.epochs + 1):
         capacity_stage = gate_epoch is None
+        transition_stage = (
+            gate_epoch is not None
+            and epoch - gate_epoch <= TRANSITION_EPOCHS
+            and epoch < config.epochs
+        )
         for group in optimizer.param_groups:
-            group["lr"] = (
-                max(config.learning_rate, 1e-3)
-                if capacity_stage
-                else config.learning_rate
-            )
+            if capacity_stage:
+                group["lr"] = max(config.learning_rate, 1e-3)
+            elif transition_stage:
+                lr = config.learning_rate
+                group["lr"] = max(lr, 5e-4)
+            else:
+                group["lr"] = config.learning_rate
         # A learned entropy rate replaces the VAE KL proxy after the gate.
         kl_weight = 0.0
-        train_metrics = _epoch(
-            model,
-            capacity_loader if capacity_stage else train_loader,
-            device,
-            config,
-            optimizer=optimizer,
-            kl_weight=kl_weight,
-            kakeya_weight_override=0.0 if capacity_stage else None,
-            use_entropy=True,
-            auxiliary_optimizer=auxiliary_optimizer,
-        )
+        if capacity_stage:
+            train_metrics = _epoch(
+                model,
+                capacity_loader,
+                device,
+                config,
+                optimizer=optimizer,
+                kl_weight=kl_weight,
+                kakeya_weight_override=0.0,
+                use_entropy=True,
+                auxiliary_optimizer=auxiliary_optimizer,
+            )
+        elif transition_stage:
+            # Smooth transition: train on both reference and procedural data
+            # to prevent a sudden loss spike from data distribution shift.
+            ref_metrics = _epoch(
+                model,
+                capacity_loader,
+                device,
+                config,
+                optimizer=optimizer,
+                kl_weight=kl_weight,
+                kakeya_weight_override=None,
+                use_entropy=True,
+                auxiliary_optimizer=auxiliary_optimizer,
+            )
+            prog_metrics = _epoch(
+                model,
+                train_loader,
+                device,
+                config,
+                optimizer=optimizer,
+                kl_weight=kl_weight,
+                kakeya_weight_override=None,
+                use_entropy=True,
+                auxiliary_optimizer=auxiliary_optimizer,
+            )
+            train_metrics = {
+                key: 0.5 * ref_metrics[key] + 0.5 * prog_metrics[key]
+                for key in ref_metrics
+            }
+        else:
+            train_metrics = _epoch(
+                model,
+                train_loader,
+                device,
+                config,
+                optimizer=optimizer,
+                kl_weight=kl_weight,
+                kakeya_weight_override=None,
+                use_entropy=True,
+                auxiliary_optimizer=auxiliary_optimizer,
+            )
         if not capacity_stage:
             rehearsal_metrics = _epoch(
                 model,
@@ -362,22 +476,20 @@ def train_image_codec(
                     device,
                     config,
                     kl_weight=kl_weight,
-                    kakeya_weight_override=(
-                        0.0 if capacity_stage else None
-                    ),
+                    kakeya_weight_override=0.0 if capacity_stage else None,
                     use_entropy=True,
                 )
                 if capacity_stage
                 else dict(validation_metrics)
             )
             last_validation_capacity_stage = capacity_stage
-        assert generalization_metrics is not None
-        validation_metrics.update(
-            {
-                f"generalization_{key}": value
-                for key, value in generalization_metrics.items()
-            }
-        )
+        if generalization_metrics is not None:
+            validation_metrics.update(
+                {
+                    f"generalization_{key}": value
+                    for key, value in generalization_metrics.items()
+                }
+            )
         calibration = _calibration_metrics(model, train_reference)
         best_eligible = calibration["rate_bpp"] <= TARGET_RATE_BPP
         if best_eligible and calibration["psnr"] > best_psnr:
@@ -437,6 +549,7 @@ def train_image_codec(
             "capacity_gate_epoch": float(gate_epoch or 0),
         }
     )
+    rate_consistency = _rate_consistency_check(model, device, run_dir)
     training_summary = {
         "capacity_gate_passed": gate_epoch is not None,
         "capacity_gate_epoch": gate_epoch,
@@ -456,6 +569,8 @@ def train_image_codec(
         "compression_finetune_epochs": (
             max(config.epochs - gate_epoch, 0) if gate_epoch is not None else 0
         ),
+        "rate_consistency_max_deviation": rate_consistency["max_deviation"],
+        "rate_consistency_scales": rate_consistency["scales"],
     }
     (run_dir / "metrics/history.json").write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -543,103 +658,110 @@ def _epoch(
         "entropy_aux": 0.0,
         "latent_rms": 0.0,
     }
-    for images, _ in loader:
-        images = images.to(device)
-        with torch.set_grad_enabled(optimizer is not None):
-            mu, log_var = model.encode(images)
-            if use_entropy:
-                latent, rate_bpp = _entropy_quantize_and_rate(
-                    model, mu, images, training=optimizer is not None
+    step_count = 0
+    for batch in loader:
+        if isinstance(batch, list) and batch and isinstance(batch[0], (tuple, list)):
+            mini_batches = batch
+        else:
+            mini_batches = [batch]
+        for images, _ in mini_batches:
+            images = images.to(device)
+            with torch.set_grad_enabled(optimizer is not None):
+                mu, log_var = model.encode(images)
+                if use_entropy:
+                    latent, rate_bpp = _entropy_quantize_and_rate(
+                        model, mu, images, training=optimizer is not None
+                    )
+                else:
+                    # Straight-through rounding makes capacity training see the
+                    # same integer latent that the final entropy coder stores.
+                    latent = (
+                        mu + (mu.round() - mu).detach()
+                        if optimizer is not None
+                        else mu.round()
+                    )
+                    rate_bpp = torch.zeros((), device=images.device)
+                reconstructed = model.decode(latent)
+                detail_weight = _detail_weight(images)
+                reconstruction = (
+                    (reconstructed - images).abs() * detail_weight
+                ).mean()
+                mse = F.mse_loss(reconstructed, images)
+                edge = F.l1_loss(_edges(reconstructed), _edges(images))
+                structural = 1 - _ssim(reconstructed, images)
+                multiscale = _multiscale_l1(reconstructed, images)
+                kl = -0.5 * (1 + log_var - mu.square() - log_var.exp()).mean()
+                latent_points = latent.permute(0, 2, 3, 1).reshape(
+                    -1, latent.size(1)
                 )
-            else:
-                # Straight-through rounding makes capacity training see the
-                # same integer latent that the final entropy coder stores.
-                latent = (
-                    mu + (mu.round() - mu).detach()
-                    if optimizer is not None
-                    else mu.round()
+                bounded_latent_points = F.normalize(
+                    latent_points, dim=1, eps=1e-6
                 )
-                rate_bpp = torch.zeros((), device=images.device)
-            reconstructed = model.decode(latent)
-            detail_weight = _detail_weight(images)
-            reconstruction = (
-                (reconstructed - images).abs() * detail_weight
-            ).mean()
-            mse = F.mse_loss(reconstructed, images)
-            edge = F.l1_loss(_edges(reconstructed), _edges(images))
-            structural = 1 - _ssim(reconstructed, images)
-            multiscale = _multiscale_l1(reconstructed, images)
-            kl = -0.5 * (1 + log_var - mu.square() - log_var.exp()).mean()
-            latent_points = latent.permute(0, 2, 3, 1).reshape(
-                -1, latent.size(1)
-            )
-            bounded_latent_points = F.normalize(
-                latent_points, dim=1, eps=1e-6
-            )
-            coverage = kakeya_regularization(
-                bounded_latent_points,
-                num_projections=int(config.objective.get("num_projections", 32)),
-                k=int(config.objective.get("k", 8)),
-            )
-            kakeya_weight = (
-                float(config.objective.get("lambda_kakeya", 0.001))
-                if kakeya_weight_override is None
-                else kakeya_weight_override
-            )
-            kl_contribution = kl_weight * kl
-            kakeya_contribution = kakeya_weight * coverage
-            rate_excess_bpp = (
-                F.relu(rate_bpp - TARGET_RATE_BPP)
-                if use_entropy
-                else torch.zeros((), device=images.device)
-            )
-            rate_contribution = RATE_LOSS_WEIGHT * rate_excess_bpp
-            total = (
-                reconstruction
-                + 5.0 * mse
-                + 1.5 * edge
-                + 0.5 * structural
-                + 0.25 * multiscale
-                + kl_contribution
-                + kakeya_contribution
-                + rate_contribution
-            )
-            if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-                total.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                optimizer.step()
-                entropy_aux = torch.zeros((), device=images.device)
-                if auxiliary_optimizer is not None:
-                    auxiliary_optimizer.zero_grad(set_to_none=True)
-                    entropy_aux = model.entropy_bottleneck.loss()
-                    entropy_aux.backward()
-                    auxiliary_optimizer.step()
-            else:
-                entropy_aux = (
-                    model.entropy_bottleneck.loss()
+                coverage = kakeya_regularization(
+                    bounded_latent_points,
+                    num_projections=int(config.objective.get("num_projections", 32)),
+                    k=int(config.objective.get("k", 8)),
+                )
+                kakeya_weight = (
+                    float(config.objective.get("lambda_kakeya", 0.001))
+                    if kakeya_weight_override is None
+                    else kakeya_weight_override
+                )
+                kl_contribution = kl_weight * kl
+                kakeya_contribution = kakeya_weight * coverage
+                rate_excess_bpp = (
+                    F.relu(rate_bpp - TARGET_RATE_BPP)
                     if use_entropy
                     else torch.zeros((), device=images.device)
                 )
-        for key, value in (
-            ("total", total),
-            ("reconstruction", reconstruction),
-            ("mse", mse),
-            ("edge", edge),
-            ("structural", structural),
-            ("multiscale", multiscale),
-            ("kl", kl),
-            ("kakeya", coverage),
-            ("kl_contribution", kl_contribution),
-            ("kakeya_contribution", kakeya_contribution),
-            ("rate_bpp", rate_bpp),
-            ("rate_excess_bpp", rate_excess_bpp),
-            ("rate_contribution", rate_contribution),
-            ("entropy_aux", entropy_aux),
-            ("latent_rms", latent.square().mean().sqrt()),
-        ):
-            totals[key] += float(value.detach())
-    return {key: value / len(loader) for key, value in totals.items()}
+                rate_contribution = RATE_LOSS_WEIGHT * rate_excess_bpp
+                total = (
+                    reconstruction
+                    + 5.0 * mse
+                    + 1.5 * edge
+                    + 0.5 * structural
+                    + 0.25 * multiscale
+                    + kl_contribution
+                    + kakeya_contribution
+                    + rate_contribution
+                )
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                    total.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    optimizer.step()
+                    entropy_aux = torch.zeros((), device=images.device)
+                    if auxiliary_optimizer is not None:
+                        auxiliary_optimizer.zero_grad(set_to_none=True)
+                        entropy_aux = model.entropy_bottleneck.loss()
+                        entropy_aux.backward()
+                        auxiliary_optimizer.step()
+                else:
+                    entropy_aux = (
+                        model.entropy_bottleneck.loss()
+                        if use_entropy
+                        else torch.zeros((), device=images.device)
+                    )
+            for key, value in (
+                ("total", total),
+                ("reconstruction", reconstruction),
+                ("mse", mse),
+                ("edge", edge),
+                ("structural", structural),
+                ("multiscale", multiscale),
+                ("kl", kl),
+                ("kakeya", coverage),
+                ("kl_contribution", kl_contribution),
+                ("kakeya_contribution", kakeya_contribution),
+                ("rate_bpp", rate_bpp),
+                ("rate_excess_bpp", rate_excess_bpp),
+                ("rate_contribution", rate_contribution),
+                ("entropy_aux", entropy_aux),
+                ("latent_rms", latent.square().mean().sqrt()),
+            ):
+                totals[key] += float(value.detach())
+        step_count += 1
+    return {key: value / step_count for key, value in totals.items()}
 
 
 @torch.no_grad()
@@ -658,6 +780,55 @@ def _calibration_metrics(
         "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
         "ssim": float(_ssim(reconstructed, source)),
         "rate_bpp": float(rate_bpp),
+    }
+
+
+def _rate_consistency_check(
+    model: ImageCodecVAE,
+    device: torch.device,
+    run_dir: Path,
+) -> dict[str, Any]:
+    source_image = Image.open(TEST_IMAGE).convert("RGB")
+    model.eval()
+    results: list[dict[str, float]] = []
+    reference_bpp: float | None = None
+    for scale in (0.5, 1.0, 1.5, 2.0):
+        w = int(256 * scale)
+        h = int(256 * scale)
+        resized = source_image.resize((w, h), Image.LANCZOS)
+        source = torch.from_numpy(
+            np.asarray(resized, dtype=np.float32) / 255.0
+        ).permute(2, 0, 1).unsqueeze(0).to(device)
+        with torch.no_grad():
+            latent, _ = model.encode(source)
+            _, rate_bpp = _entropy_quantize_and_rate(
+                model, latent, source, training=False
+            )
+            quantized = model.decode(latent.round()).clamp(0, 1)
+            mse = float(F.mse_loss(quantized, source))
+        entry = {
+            "scale": scale,
+            "size": w,
+            "rate_bpp": float(rate_bpp),
+            "mse": mse,
+        }
+        results.append(entry)
+        if scale == 1.0:
+            reference_bpp = float(rate_bpp)
+    if reference_bpp is not None:
+        for entry in results:
+            entry["bpp_deviation"] = (
+                (entry["rate_bpp"] - reference_bpp) / reference_bpp
+                if reference_bpp > 0
+                else 0.0
+            )
+    return {
+        "scales": results,
+        "max_deviation": max(
+            abs(e.get("bpp_deviation", 0.0)) for e in results
+        )
+        if results
+        else 0.0,
     }
 
 
@@ -974,12 +1145,21 @@ def _multiscale_l1(
     reconstructed: torch.Tensor, target: torch.Tensor
 ) -> torch.Tensor:
     losses = []
+    cur = min(reconstructed.shape[-1], target.shape[-1])
     for size in (128, 64):
+        if cur <= size:
+            continue
+        # Use bilinear instead of area mode: MPS does not support
+        # non-divisible adaptive pool, and bilinear works for any size.
         reconstructed_level = F.interpolate(
-            reconstructed, size=(size, size), mode="area"
+            reconstructed, size=(size, size), mode="bilinear", align_corners=False
         )
-        target_level = F.interpolate(target, size=(size, size), mode="area")
+        target_level = F.interpolate(
+            target, size=(size, size), mode="bilinear", align_corners=False
+        )
         losses.append(F.l1_loss(reconstructed_level, target_level))
+    if not losses:
+        return torch.zeros((), device=reconstructed.device)
     return torch.stack(losses).mean()
 
 
@@ -993,6 +1173,105 @@ def _run_directory(config: ExperimentConfig) -> Path:
     for name in ("checkpoints", "metrics", "reports"):
         (run_dir / name).mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def migrate_legacy_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    latent_dim: int = 16,
+) -> dict[str, torch.Tensor]:
+    """Convert a legacy GroupNorm-based state dict to the new WeightNorm format.
+
+    Old checkpoints use GroupNorm + plain Conv2d; the new architecture uses
+    WeightNorm + plain Conv2d.  We match Conv2d weights and biases by tensor
+    shape (out_channels, in_channels, kH, kW) and decompose each weight into
+    the WeightNorm ``(original0, original1)`` pair.
+    """
+
+    dummy = ImageCodecVAE(latent_dim=latent_dim)
+    new_state = dummy.state_dict()
+
+    new_conv_info: dict[tuple[int, ...], list[dict[str, str]]] = {}
+    for key in new_state:
+        if "parametrizations.weight.original1" in key:
+            shape = tuple(new_state[key].shape)
+            entry = {
+                "w_key": key,
+                "g_key": key.replace("original1", "original0"),
+                "b_key": key.replace("parametrizations.weight.original1", "bias"),
+            }
+            new_conv_info.setdefault(shape, []).append(entry)
+
+    old_conv_weights: dict[tuple[int, ...], list[torch.Tensor]] = {}
+    old_conv_biases: dict[tuple[int, ...], list[torch.Tensor]] = {}
+    old_norm_params: dict[tuple[int, ...], list[torch.Tensor]] = {}
+    for key, tensor in state_dict.items():
+        if tensor.dim() == 4 and "weight" in key.lower():
+            shape = tuple(tensor.shape)
+            old_conv_weights.setdefault(shape, []).append(tensor)
+        elif tensor.dim() == 1 and "bias" in key.lower():
+            shape = (tensor.shape[0],)
+            old_conv_biases.setdefault(shape, []).append(tensor)
+        elif tensor.dim() == 1 and "weight" in key.lower():
+            shape = (tensor.shape[0],)
+            old_norm_params.setdefault(shape, []).append(tensor)
+
+    migrated: dict[str, torch.Tensor] = {}
+
+    for shape, entries in new_conv_info.items():
+        old_weights = old_conv_weights.get(shape, [])
+        for i, entry in enumerate(entries):
+            if i < len(old_weights):
+                w = old_weights[i]
+                out_ch = w.shape[0]
+                norm = w.reshape(out_ch, -1).norm(dim=1)
+                migrated[entry["w_key"]] = w / norm.reshape(out_ch, 1, 1, 1).clamp_min(1e-10)
+                migrated[entry["g_key"]] = norm.reshape(out_ch, 1, 1, 1)
+            else:
+                migrated[entry["w_key"]] = new_state[entry["w_key"]]
+                migrated[entry["g_key"]] = new_state[entry["g_key"]]
+
+    for shape, entries in new_conv_info.items():
+        bias_shape = (shape[0],)
+        old_biases = old_conv_biases.get(bias_shape, [])
+        for i, entry in enumerate(entries):
+            b_key = entry["b_key"]
+            if i < len(old_biases):
+                migrated[b_key] = old_biases[i]
+            elif b_key in new_state:
+                migrated[b_key] = new_state[b_key]
+
+    norm_weight_keys = [
+        k for k in new_state
+        if k.endswith(".weight") and new_state[k].dim() == 1 and "parametrizations" not in k
+    ]
+    norm_bias_keys = [
+        k for k in new_state
+        if k.endswith(".bias") and "parametrizations" not in k
+    ]
+    for k in norm_weight_keys:
+        shape = (new_state[k].shape[0],)
+        params = old_norm_params.get(shape, [])
+        if params:
+            migrated[k] = params.pop(0)
+        else:
+            migrated[k] = new_state[k]
+    for k in norm_bias_keys:
+        if k not in migrated:
+            migrated[k] = new_state[k]
+
+    for key, tensor in new_state.items():
+        if key not in migrated:
+            if "_medians" in key:
+                for old_key, old_tensor in state_dict.items():
+                    if "_medians" in old_key:
+                        migrated[key] = old_tensor
+                        break
+                else:
+                    migrated[key] = tensor
+            else:
+                migrated[key] = tensor
+
+    return migrated
 
 
 def _checkpoint(
@@ -1014,13 +1293,6 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         return ImageFont.truetype("DejaVuSans.ttf", size)
     except OSError:
         return ImageFont.load_default()
-
-
-def _groups(channels: int) -> int:
-    for value in (8, 4, 2):
-        if channels % value == 0:
-            return value
-    return 1
 
 
 def _to_image(tensor: torch.Tensor) -> Image.Image:

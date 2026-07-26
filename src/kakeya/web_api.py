@@ -27,8 +27,8 @@ manager = JobManager()
 
 class ExperimentRequest(BaseModel):
     method: Literal["image_codec"] = "image_codec"
-    epochs: Annotated[int, Field(ge=1, le=500)] = 50
-    latent_dim: Annotated[int, Field(ge=2, le=256)] = 8
+    epochs: Annotated[int, Field(ge=1, le=500)] = 80
+    latent_dim: Annotated[int, Field(ge=2, le=256)] = 16
     batch_size: Annotated[int, Field(ge=1, le=2048)] = 4
     learning_rate: Annotated[float, Field(gt=0, le=1)] = 0.0005
     seed: Annotated[int, Field(ge=0, le=2**31 - 1)] = 42
@@ -239,6 +239,39 @@ def experiment_checkpoint(job_id: str) -> FileResponse:
 async def reconstruct_uploaded(
     job_id: str, file: Annotated[UploadFile, File(...)]
 ) -> dict[str, Any]:
+    record = manager.get(job_id)
+    if record is None or not record.run_dir:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    run_dir = (manager.project_root / record.run_dir).resolve()
+    checkpoint_path = run_dir / "checkpoints/final.pt"
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail="模型检查点不存在")
+    image_bytes = await file.read()
+    return _do_reconstruct(checkpoint_path, image_bytes)
+
+
+@app.post("/api/reconstruct-custom")
+async def reconstruct_custom_checkpoint(
+    checkpoint: Annotated[UploadFile, File(...)],
+    image: Annotated[UploadFile, File(...)],
+) -> dict[str, Any]:
+    checkpoint_bytes = await checkpoint.read()
+    image_bytes = await image.read()
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+        f.write(checkpoint_bytes)
+        temp_path = Path(f.name)
+    try:
+        return _do_reconstruct(temp_path, image_bytes)
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]:
     import base64
     import io
     from copy import deepcopy
@@ -247,51 +280,84 @@ async def reconstruct_uploaded(
     import torch
     import torch.nn.functional as F
 
-    from kakeya.image_codec import ImageCodecVAE
+    from kakeya.image_codec import ImageCodecVAE, migrate_legacy_state_dict
 
-    record = manager.get(job_id)
-    if record is None or not record.run_dir:
-        raise HTTPException(status_code=404, detail="实验不存在")
-    run_dir = (manager.project_root / record.run_dir).resolve()
-    checkpoint_path = run_dir / "checkpoints/final.pt"
-    if not checkpoint_path.is_file():
-        raise HTTPException(status_code=404, detail="模型检查点不存在")
-
-    image_bytes = await file.read()
     try:
         source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="无法解析上传的图片")
 
-    if source_image.size != (256, 256):
-        source_image = source_image.resize((256, 256), Image.LANCZOS)
+    w, h = source_image.size
+    if w > 4096 or h > 4096:
+        raise HTTPException(status_code=400, detail="图片尺寸过大（上限 4096×4096），请先缩小后再试")
+    if w < 16 or h < 16:
+        raise HTTPException(status_code=400, detail="图片尺寸过小（下限 16×16）")
+
+    pad_w = (8 - w % 8) % 8
+    pad_h = (8 - h % 8) % 8
+    if pad_w or pad_h:
+        padded = Image.new("RGB", (w + pad_w, h + pad_h), (0, 0, 0))
+        padded.paste(source_image, (0, 0))
+        source_image = padded
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    latent_dim = payload["config"].get("latent_dim", 8)
-    model = ImageCodecVAE(latent_dim=latent_dim).to(device)
-    model.load_state_dict(payload["model_state_dict"])
+    try:
+        payload = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="无法加载模型检查点")
+
+    config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    latent_dim = config.get("latent_dim", 16) if isinstance(config, dict) else 16
+    try:
+        model = ImageCodecVAE(latent_dim=latent_dim).to(device)
+        model.load_state_dict(payload["model_state_dict"])
+    except RuntimeError:
+        try:
+            migrated = migrate_legacy_state_dict(payload["model_state_dict"])
+            model.load_state_dict(migrated)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="模型结构不匹配，且旧版迁移也失败",
+            )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="模型结构不匹配，请确认是 Kakeya image_codec 训练的 checkpoint",
+        )
     model.eval()
 
     source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
     source = source.permute(2, 0, 1).unsqueeze(0).to(device)
 
+    # Whole-image encode / compress / decode path.  The multi-scale trained
+    # model handles any resolution directly, so no tiling or rescaling is
+    # needed; padding to a multiple of 8 (above) keeps the encoder happy.
+    header_estimate = 64 + 256
     with torch.no_grad():
-        mu, _ = model.encode(source)
         entropy_model = deepcopy(model.entropy_bottleneck).cpu().eval()
         entropy_model.update(force=True)
+
+        mu, _ = model.encode(source)
         latent_cpu = mu.detach().cpu()
         strings = entropy_model.compress(latent_cpu)
         payload_data = strings[0]
         shape = list(latent_cpu.shape[-2:])
         decoded_latent = entropy_model.decompress([payload_data], shape).to(device)
+        bitstream_bytes_estimate = len(payload_data) + header_estimate
         reconstructed = model.decode(decoded_latent).clamp(0, 1)
+
+    if pad_w or pad_h:
+        reconstructed = reconstructed[:, :, :h, :w]
+        source = source[:, :, :h, :w]
 
     mse = float(F.mse_loss(reconstructed, source))
     psnr = 99.0 if mse == 0 else 10 * np.log10(1.0 / mse)
     ssim = float(_ssim_torch(reconstructed, source))
-    bitstream_bytes = len(payload_data) + 64
-    bpp = bitstream_bytes * 8 / (256 * 256)
+    out_h, out_w = source.shape[2], source.shape[3]
+    bpp = bitstream_bytes_estimate * 8 / (out_h * out_w)
 
     def _to_png(tensor: torch.Tensor) -> str:
         arr = tensor.detach().cpu().permute(1, 2, 0).numpy()
@@ -317,8 +383,9 @@ async def reconstruct_uploaded(
             "mse": mse,
             "psnr": float(psnr),
             "ssim": ssim,
-            "bitstream_bytes": bitstream_bytes,
+            "bitstream_bytes": bitstream_bytes_estimate,
             "bpp": float(bpp),
+            "downscaled": False,
         },
     }
 
