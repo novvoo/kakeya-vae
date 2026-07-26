@@ -175,7 +175,13 @@ def experiment_result(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/experiments/{job_id}/image/{kind}")
-def experiment_image(job_id: str, kind: Literal["original", "reconstruction", "error"]) -> FileResponse:
+def experiment_image(
+    job_id: str,
+    kind: Literal[
+        "original", "reconstruction", "error",
+        "original_hd", "reconstruction_hd", "error_hd",
+    ],
+) -> FileResponse:
     record = manager.get(job_id)
     if record is None or not record.run_dir:
         raise HTTPException(status_code=404, detail="实验不存在")

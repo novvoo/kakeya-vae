@@ -96,7 +96,14 @@ type ResultPayload = {
     test_asset: string;
     test_role: string;
     latent_shape?: number[];
-    images: Record<"original" | "reconstruction" | "error", string>;
+    images: {
+      original?: string;
+      reconstruction?: string;
+      error?: string;
+      original_hd?: string;
+      reconstruction_hd?: string;
+      error_hd?: string;
+    };
     training?: {
       capacity_gate_passed: boolean;
       capacity_gate_epoch: number | null;
@@ -1372,6 +1379,22 @@ function ImageCodecResults({
     ["reconstruction", "模型还原图"],
     ["error", "误差热图"],
   ] as const;
+  const hdPanels = [
+    ["original_hd", "高清原图"],
+    ["reconstruction_hd", "高清还原图"],
+    ["error_hd", "高清误差热图"],
+  ] as const;
+  const hasHdImages = Boolean(
+    result.image_codec?.images?.original_hd &&
+      result.image_codec?.images?.reconstruction_hd &&
+      result.image_codec?.images?.error_hd,
+  );
+  const hdMetrics = result.metrics as {
+    hd_psnr?: number;
+    hd_ssim?: number;
+    hd_width?: number;
+    hd_height?: number;
+  };
   const [customRecon, setCustomRecon] = useState<{
     original: string;
     reconstruction: string;
@@ -1480,6 +1503,52 @@ function ImageCodecResults({
           </figure>
         ))}
       </div>
+      {hasHdImages && (
+        <>
+          <div className="codec-summary codec-summary-hd">
+            <div>
+              <p className="section-index">HIGH-RES GENERALIZATION</p>
+              <h3>
+                {hdMetrics.hd_width && hdMetrics.hd_height
+                  ? `${hdMetrics.hd_width}×${hdMetrics.hd_height} 图文还原结果`
+                  : "高清原图还原结果"}
+              </h3>
+            </div>
+            <p>
+              这是模型在 256² 之外的泛化能力测试，直接对 1024² 源图做 encode → decode，
+              不经过 resize，反映真实大图压缩表现。
+            </p>
+          </div>
+          <div className="codec-images">
+            {hdPanels.map(([kind, label]) => (
+              <figure key={kind}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`${API_BASE}/api/experiments/${jobId}/image/${kind}`}
+                  alt={label}
+                />
+                <figcaption>{label}</figcaption>
+              </figure>
+            ))}
+          </div>
+          {(hdMetrics.hd_psnr !== undefined || hdMetrics.hd_ssim !== undefined) && (
+            <div className="custom-recon-metrics">
+              {hdMetrics.hd_psnr !== undefined && (
+                <span>
+                  PSNR{" "}
+                  <strong>{hdMetrics.hd_psnr.toFixed(2)} dB</strong>
+                </span>
+              )}
+              {hdMetrics.hd_ssim !== undefined && (
+                <span>
+                  SSIM{" "}
+                  <strong>{hdMetrics.hd_ssim.toFixed(4)}</strong>
+                </span>
+              )}
+            </div>
+          )}
+        </>
+      )}
       <div className="custom-recon-section">
         <div className="custom-recon-header">
           <div>
