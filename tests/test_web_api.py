@@ -1,0 +1,62 @@
+from fastapi.testclient import TestClient
+
+from kakeya.web_api import ExperimentRequest, app
+
+
+def test_image_codec_defaults_use_fifty_epoch_capacity_run() -> None:
+    request = ExperimentRequest()
+
+    assert request.method == "image_codec"
+    assert request.epochs == 50
+    assert request.train_limit == 128
+
+
+def test_health_and_environment_endpoints() -> None:
+    with TestClient(app) as client:
+        health = client.get("/api/health")
+        environment = client.get("/api/environment")
+
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+    assert environment.status_code == 200
+    assert "packages" in environment.json()
+
+
+def test_builtin_image_probe_is_available() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/test-image")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG")
+
+
+def test_request_builds_method_specific_objective() -> None:
+    request = ExperimentRequest(
+        method="image_codec",
+        train_limit=32,
+        lambda_kakeya=0.025,
+        num_projections=16,
+        batch_size=4,
+        k=10,
+    )
+
+    config = request.experiment_config()
+
+    assert config["train_limit"] == 32
+    assert config["test_limit"] is None
+    assert config["objective"] == {
+        "lambda_kakeya": 0.025,
+        "num_projections": 16,
+        "k": 3,
+    }
+
+
+def test_invalid_epoch_count_returns_validation_error() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/experiments",
+            json={"method": "image_codec", "epochs": 0},
+        )
+
+    assert response.status_code == 422

@@ -1,0 +1,14 @@
+method: poly_kakeya
+epochs: 25
+latent_dim: 32
+batch_size: 128
+learning_rate: 0.001
+seed: 42
+data_dir: data
+output_dir: runs
+num_workers: 0
+download: true
+objective:
+  lambda_kakeya: 1.0
+  degree: 3
+  num_projections: 64

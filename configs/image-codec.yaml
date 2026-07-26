@@ -1,0 +1,15 @@
+method: image_codec
+epochs: 50
+latent_dim: 8
+batch_size: 4
+learning_rate: 0.0005
+seed: 42
+data_dir: data
+output_dir: runs
+num_workers: 0
+train_limit: 128
+download: false
+objective:
+  lambda_kakeya: 0.001
+  num_projections: 32
+  k: 3

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kakeya-vae"
+version = "0.1.0"
+description = "Reproducible experiments for Kakeya-regularized variational autoencoders"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "certifi>=2024.2.2",
+  "compressai>=1.2.8,<2",
+  "fastapi>=0.115",
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+  "scikit-learn>=1.4",
+  "torch>=2.2",
+  "torchvision>=0.17",
+  "tqdm>=4.66",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+kakeya-run = "kakeya.cli:main"
+kakeya-web = "kakeya.web_api:main"
+kakeya-lab = "kakeya.lab:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
