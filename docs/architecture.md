@@ -396,27 +396,52 @@ graph LR
 
 ```mermaid
 graph TD
-    subgraph LossComponents
-        L1[reconstruction<br/>加权 L1<br/>detail_weight]
-        L2[mse<br/>5.0 x MSE]
-        L3[edge<br/>1.5 x L1 边缘]
-        L4[structural<br/>0.5 x 1-SSIM]
-        L5[multiscale<br/>0.25 x 多尺度 L1]
-        L6[kl<br/>kl_weight x KL]
-        L7[kakeya<br/>lambda x 覆盖正则<br/>§1 挂谷正则]
-        L8[lab<br/>0.15 x CIELAB ΔE<br/>亮度自适应权重]
-        L9[rate<br/>rate_weight x 码率超限]
+    subgraph 分阶段损失调度
+        direction LR
+        S_CAP[Capacity Stage<br/>学方向覆盖]
+        S_TRANS[Transition Stage<br/>平滑过渡]
+        S_FT[Finetune Stage<br/>码率与感知优化]
+        S_CAP -->|逐步加入损失| S_TRANS -->|全部损失| S_FT
     end
 
-    L1 --> TOTAL[total loss]
-    L2 --> TOTAL
-    L3 --> TOTAL
-    L4 --> TOTAL
-    L5 --> TOTAL
-    L6 --> TOTAL
-    L7 --> TOTAL
-    L8 --> TOTAL
-    L9 --> TOTAL
+    subgraph Capacity_Loss [Capacity 阶段损失]
+        direction TB
+        C1[reconstruction<br/>加权 L1 + detail_weight]
+        C2[edge<br/>1.5 x L1 边缘]
+        C3[multiscale<br/>0.25 x 多尺度 L1]
+        C4[kl<br/>kl_weight x KL]
+        C5[kakeya<br/>0.002 x 覆盖正则]
+    end
+
+    subgraph Transition_Loss [Transition 阶段损失]
+        direction TB
+        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya(0.001)]
+        T2[mse<br/>5.0 x MSE]
+        T3[lab<br/>0.05 x CIELAB ΔE]
+    end
+
+    subgraph Finetune_Loss [Finetune 阶段损失]
+        direction TB
+        F1[reconstruction + edge + multiscale<br/>+ kl + kakeya(0.0005) + mse + lab]
+        F2[structural<br/>0.5 x 1-SSIM]
+        F3[rate<br/>rate_weight x 码率超限]
+    end
+
+    S_CAP --> C1 & C2 & C3 & C4 & C5
+    S_TRANS --> T1 & T2 & T3
+    S_FT --> F1 & F2 & F3
+
+    C1 --> CT[total loss<br/>stage-dependent]
+    C2 --> CT
+    C3 --> CT
+    C4 --> CT
+    C5 --> CT
+    T1 --> CT
+    T2 --> CT
+    T3 --> CT
+    F1 --> CT
+    F2 --> CT
+    F3 --> CT
 
     subgraph DetailWeight
         DW1[灰度边缘检测<br/>x8 梯度]
@@ -425,7 +450,7 @@ graph TD
         DW1 --> DW3
         DW2 --> DW3
         DW3 --> DW[detail_weight<br/>1-4x]
-        DW --> L1
+        DW --> C1
     end
 
     subgraph MultiscaleLoss
@@ -435,7 +460,7 @@ graph TD
         MS0 --> MS_AVG[加权平均]
         MS1 --> MS_AVG
         MS2 --> MS_AVG
-        MS_AVG --> L5
+        MS_AVG --> C3
     end
 
     subgraph RateLoss
@@ -446,15 +471,17 @@ graph TD
         RL1 --> RL2
         RL2 --> RL3
         RL3 --> RL4
-        RL4 --> L9
+        RL4 --> F3
     end
 
-    style TOTAL fill:#fff9c4
+    style CT fill:#fff9c4
     style DW fill:#e3f2fd
     style MS_AVG fill:#f3e5f5
     style RL4 fill:#fce4ec
-    style L7 fill:#e1f5fe
-    style L8 fill:#fff9c4
+    style C5 fill:#e1f5fe
+    style Capacity_Loss fill:#e3f2fd
+    style Transition_Loss fill:#fff3e0
+    style Finetune_Loss fill:#fce4ec
 ```
 
 ---
@@ -549,33 +576,45 @@ flowchart TD
     subgraph CAP [Capacity Stage 容量阶段]
         direction TB
         CAP_LR[LR: max lr, 1e-3<br/>高学习率]
+        CAP_LOSS[损失: recon + edge + multiscale<br/>+ kl + kakeya(0.002)<br/>无 mse / structural / lab]
         CAP_REF[训练参考图<br/>capacity_loader<br/>32 steps]
         CAP_PROG[训练程序图<br/>train_loader<br/>多尺度 128-768]
+        CAP_REAL[训练真实图<br/>real_loader]
         CAP_REH[Rehearsal<br/>rehearsal_loader<br/>8 steps 参考图]
-        CAP_REF --> CAP_MERGE[合并指标<br/>0.5 ref + 0.5 prog]
+        CAP_LR --> CAP_LOSS --> CAP_REF
+        CAP_REF --> CAP_MERGE[合并指标<br/>0.4 ref + 0.3 prog + 0.3 real]
         CAP_PROG --> CAP_MERGE
+        CAP_REAL --> CAP_MERGE
         CAP_MERGE --> CAP_REH
     end
 
     subgraph TRANS [Transition Stage 过渡阶段]
         direction TB
         TRANS_LR[LR: max lr, 5e-4<br/>中等学习率]
+        TRANS_LOSS[损失: capacity 全部 + mse(5.0)<br/>+ lab(0.05)<br/>无 structural]
+        TRANS_KAKEYA[kakeya 权重: 0.001]
         TRANS_REF[训练参考图<br/>capacity_loader]
         TRANS_PROG[训练程序图<br/>train_loader]
+        TRANS_REAL[训练真实图<br/>real_loader]
         TRANS_REH[Rehearsal<br/>rehearsal_loader]
-        TRANS_REF --> TRANS_MERGE[合并指标<br/>0.5 ref + 0.5 prog]
+        TRANS_LR --> TRANS_LOSS --> TRANS_KAKEYA --> TRANS_REF
+        TRANS_REF --> TRANS_MERGE[合并指标<br/>0.4 ref + 0.3 prog + 0.3 real]
         TRANS_PROG --> TRANS_MERGE
+        TRANS_REAL --> TRANS_MERGE
         TRANS_MERGE --> TRANS_REH
     end
 
     subgraph FINETUNE [Finetune Stage 压缩微调]
         direction TB
         FT_LR[LR: config.lr<br/>0.0005]
+        FT_LOSS[损失: transition 全部<br/>+ structural(0.5) + lab(0.15) + rate<br/>全部损失项]
+        FT_KAKEYA[kakeya 权重: 0.0005]
         FT_WARMUP{gate 后<br/>≤ 10 epochs?}
         FT_WARMUP -->|是| FT_W[Warmup<br/>rate_weight=0.001<br/>grad_clip=10.0]
         FT_WARMUP -->|否| FT_FULL[Full finetune<br/>rate_weight=0.01<br/>grad_clip=5.0]
-        FT_W --> FT_TRAIN[训练 train_loader<br/>多尺度程序图]
+        FT_W --> FT_TRAIN[训练 train_loader + real_loader<br/>0.5 prog + 0.5 real]
         FT_FULL --> FT_TRAIN
+        FT_LR --> FT_LOSS --> FT_KAKEYA --> FT_WARMUP
         FT_TRAIN --> FT_REH[Rehearsal<br/>rehearsal_loader]
     end
 
@@ -1022,64 +1061,55 @@ flowchart TD
     style FIX4 fill:#c8e6c9
 ```
 
-#### 9.5.2 真实颜色问题的根因：训练集多样性不足
+#### 9.5.2 失真问题的优化：分阶段损失调度
 
-泛化问题修复后，大图仍存在颜色偏移（如整体泛蓝、暗红色偏色）。**最初尝试了多种复杂的损失函数优化（亮度自适应 LAB 权重、RGB 通道 detail_weight 等），但发现高权重时容易拖累训练，低权重时效果有限。** 真正的根因是训练数据的颜色分布过于单一——增加真实高清多彩图片到训练集后，问题立竿见影地解决。目前保留一个**中等权重（λ=0.15）的完整版 LAB ΔE 损失**（含 L 通道 0.25 权重、a/b 通道亮度自适应），与数据多样性协同作用。
+训练后期出现明显失真，根因是**9 个损失项全程同时作用**——容量阶段的目标是学方向覆盖，感知损失（MSE/SSIM/lab）会干扰这个核心目标，导致梯度方向冲突、模型震荡。
+
+**解决方案：分阶段损失调度**——不同阶段启用不同的损失项，让模型先"看得宽"，再"看得清"。
+
+| 阶段 | 启用的损失 | kakeya 权重 | 设计意图 |
+|------|-----------|-------------|----------|
+| Capacity | recon + edge + multiscale + kl + kakeya | 0.002 | 纯重建 + 正则，专注潜空间方向覆盖 |
+| Transition | capacity 全部 + mse(5.0) + lab(0.05) | 0.001 | 逐步引入感知约束，平滑过渡 |
+| Finetune | transition 全部 + structural(0.5) + lab(0.15) + rate | 0.0005 | 全部约束协同，优化最终码率与画质 |
 
 ```mermaid
 flowchart TD
     subgraph 问题现象
-        P1[高清大图整体泛蓝<br/>R 通道细节丢失多]
-        P2[暗红色偏橙偏棕<br/>暗色区域色相向亮度偏移]
-        P3[饱和度不足<br/>鲜艳颜色变灰白]
+        P1[训练后期失真明显<br/>细节模糊 / 色块 / 偏色]
+        P2[损失曲线震荡<br/>多个损失项梯度方向冲突]
     end
 
-    subgraph 曾尝试但效果有限
-        ATT1[detail_weight 扩展到 RGB 通道<br/>理论上增强颜色边缘约束]
-        ATT2[multiscale 增加原分辨率权重<br/>理论上保留高频颜色细节]
-        ATT3[CIELAB DeltaE 色差损失<br/>理论上感知式颜色约束]
-        ATT4[亮度自适应 LAB 权重<br/>理论上增强暗色区域色相梯度]
-
-        ATT1 --> RESULT1[实际: PSNR 提升微<br/>训练速度下降<br/>效果不明显]
-        ATT2 --> RESULT2[实际: 收益甚微<br/>增加计算量]
-        ATT3 --> RESULT3[实际: 权重需精心调<br/>调不好反而模糊细节]
-        ATT4 --> RESULT4[实际: 暗红色改善有限<br/>引入额外复杂度]
-    end
-
-    subgraph 真正根因
-        R1[训练数据颜色分布单一<br/>程序化图文卡 + 参考图<br/>颜色种类有限]
-        R2[模型未见足够多样的<br/>真实色彩分布<br/>encoder/decoder 未学到<br/>通用颜色映射]
-        R3[InstanceNorm 统计量<br/>在新颜色分布上失配<br/>累积误差导致偏色]
+    subgraph 根因分析
+        R1[9 个损失项全程同时作用]
+        R2[容量阶段目标: 学方向覆盖<br/>感知损失干扰核心目标]
+        R3[过渡不平滑<br/>损失项突然全部加入]
         R1 --> R2 --> R3
     end
 
-    subgraph 真正有效的方案
-        S1[添加真实高清多彩图片<br/>assets/hd_images/<br/>10-30 张多样内容]
-        S2[容量阶段混合训练<br/>40% 参考图 + 30% 程序图 + 30% 真实图]
-        S3[模型学到通用颜色映射<br/>encoder/decoder 见过足够多样色彩]
-        S4[颜色与亮度问题<br/>立竿见影地解决]
-        S1 --> S2 --> S3 --> S4
+    subgraph 解决方案：分阶段损失调度
+        S1[Capacity: 仅重建+正则<br/>recon + edge + multiscale<br/>+ kl + kakeya(0.002)]
+        S2[Transition: 逐步加入感知<br/>+ mse(5.0) + lab(0.05)<br/>kakeya=0.001]
+        S3[Finetune: 全部损失<br/>+ structural(0.5) + lab(0.15) + rate<br/>kakeya=0.0005]
+        S1 --> S2 --> S3
     end
 
-    P1 -.->|尝试| ATT1
-    P2 -.->|尝试| ATT3
-    P3 -.->|尝试| ATT2
-    R3 --> P1
-    R3 --> P2
-    R3 --> P3
-    S4 -.->|解决| P1
-    S4 -.->|解决| P2
-    S4 -.->|解决| P3
+    subgraph 效果
+        E1[容量阶段更纯粹<br/>方向覆盖更充分]
+        E2[过渡更平滑<br/>避免梯度方向突变]
+        E3[微调更精细<br/>感知质量更优]
+        E4[整体失真明显减少]
+        E1 --> E2 --> E3 --> E4
+    end
+
+    P1 --> R1
+    P2 --> R2
+    S3 -.->|解决| P1
+    S2 -.->|解决| P2
 
     style P1 fill:#ffcdd2
     style P2 fill:#ffcdd2
-    style P3 fill:#ffcdd2
-    style RESULT1 fill:#fff9c4
-    style RESULT2 fill:#fff9c4
-    style RESULT3 fill:#fff9c4
-    style RESULT4 fill:#fff9c4
     style R1 fill:#fce4ec
-    style R3 fill:#fce4ec
     style S4 fill:#c8e6c9
 ```
 

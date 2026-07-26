@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -480,6 +480,11 @@ def train_image_codec(
             and epoch - gate_epoch <= TRANSITION_EPOCHS
             and epoch < config.epochs
         )
+        stage_name: Literal["capacity", "transition", "finetune"] = (
+            "capacity" if capacity_stage
+            else "transition" if transition_stage
+            else "finetune"
+        )
         for group in optimizer.param_groups:
             if capacity_stage:
                 group["lr"] = max(config.learning_rate, 1e-3)
@@ -523,6 +528,7 @@ def train_image_codec(
                 kakeya_weight_override=None,
                 use_entropy=True,
                 auxiliary_optimizer=auxiliary_optimizer,
+                stage=stage_name,
             )
             prog_metrics = _epoch(
                 model,
@@ -534,6 +540,7 @@ def train_image_codec(
                 kakeya_weight_override=None,
                 use_entropy=True,
                 auxiliary_optimizer=auxiliary_optimizer,
+                stage=stage_name,
             )
             real_metrics = _epoch(
                 model,
@@ -545,6 +552,7 @@ def train_image_codec(
                 kakeya_weight_override=None,
                 use_entropy=True,
                 auxiliary_optimizer=auxiliary_optimizer,
+                stage=stage_name,
             )
             train_metrics = {
                 key: 0.4 * ref_metrics[key]
@@ -567,6 +575,7 @@ def train_image_codec(
                 auxiliary_optimizer=auxiliary_optimizer,
                 rate_loss_weight_override=current_rate_weight,
                 grad_clip_max_norm=current_grad_clip,
+                stage=stage_name,
             )
             prog_metrics = _epoch(
                 model,
@@ -580,6 +589,7 @@ def train_image_codec(
                 auxiliary_optimizer=auxiliary_optimizer,
                 rate_loss_weight_override=current_rate_weight,
                 grad_clip_max_norm=current_grad_clip,
+                stage=stage_name,
             )
             real_metrics = _epoch(
                 model,
@@ -593,6 +603,7 @@ def train_image_codec(
                 auxiliary_optimizer=auxiliary_optimizer,
                 rate_loss_weight_override=current_rate_weight,
                 grad_clip_max_norm=current_grad_clip,
+                stage=stage_name,
             )
             train_metrics = {
                 key: 0.4 * ref_metrics[key]
@@ -615,6 +626,7 @@ def train_image_codec(
                 auxiliary_optimizer=auxiliary_optimizer,
                 rate_loss_weight_override=current_rate_weight,
                 grad_clip_max_norm=current_grad_clip,
+                stage=stage_name,
             )
             real_metrics = _epoch(
                 model,
@@ -628,6 +640,7 @@ def train_image_codec(
                 auxiliary_optimizer=auxiliary_optimizer,
                 rate_loss_weight_override=current_rate_weight,
                 grad_clip_max_norm=current_grad_clip,
+                stage=stage_name,
             )
             train_metrics = {
                 key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
@@ -647,6 +660,7 @@ def train_image_codec(
             auxiliary_optimizer=auxiliary_optimizer,
             rate_loss_weight_override=current_rate_weight,
             grad_clip_max_norm=current_grad_clip,
+            stage=stage_name,
         )
         train_metrics.update(
             {
@@ -671,6 +685,7 @@ def train_image_codec(
                 kl_weight=kl_weight,
                 kakeya_weight_override=0.0 if capacity_stage else None,
                 use_entropy=True,
+                stage=stage_name,
             )
             generalization_metrics = (
                 _epoch(
@@ -681,6 +696,7 @@ def train_image_codec(
                     kl_weight=kl_weight,
                     kakeya_weight_override=0.0 if capacity_stage else None,
                     use_entropy=True,
+                    stage=stage_name,
                 )
                 if capacity_stage
                 else dict(validation_metrics)
@@ -864,6 +880,7 @@ def _epoch(
     auxiliary_optimizer: optim.Optimizer | None = None,
     rate_loss_weight_override: float | None = None,
     grad_clip_max_norm: float = 5.0,
+    stage: Literal["capacity", "transition", "finetune"] = "capacity",
 ) -> dict[str, float]:
     model.train(optimizer is not None)
     totals = {
@@ -917,6 +934,7 @@ def _epoch(
                 edge = F.l1_loss(_edges(reconstructed), _edges(images))
                 structural = 1 - _ssim(reconstructed, images)
                 multiscale = _multiscale_l1(reconstructed, images)
+                lab = _lab_loss(reconstructed, images)
                 kl = -0.5 * (1 + log_var - mu.square() - log_var.exp()).mean()
                 latent_points = latent.permute(0, 2, 3, 1).reshape(
                     -1, latent.size(1)
@@ -929,32 +947,44 @@ def _epoch(
                     num_projections=int(config.objective.get("num_projections", 32)),
                     k=int(config.objective.get("k", 8)),
                 )
-                kakeya_weight = (
-                    float(config.objective.get("lambda_kakeya", 0.001))
-                    if kakeya_weight_override is None
-                    else kakeya_weight_override
-                )
+                if stage == "capacity":
+                    kakeya_default = 0.002
+                    mse_w = 0.0
+                    structural_w = 0.0
+                    lab_w = 0.0
+                elif stage == "transition":
+                    kakeya_default = 0.001
+                    mse_w = 5.0
+                    structural_w = 0.0
+                    lab_w = 0.05
+                else:
+                    kakeya_default = 0.0005
+                    mse_w = 5.0
+                    structural_w = 0.5
+                    lab_w = _LAMBDA_LAB
+                if kakeya_weight_override is not None:
+                    kakeya_weight = kakeya_weight_override
+                else:
+                    kakeya_weight = kakeya_default
                 kl_contribution = kl_weight * kl
                 kakeya_contribution = kakeya_weight * coverage
+                lab_contribution = lab_w * lab
                 rate_excess_bpp = (
                     F.relu(rate_bpp - TARGET_RATE_BPP)
                     if use_entropy
                     else torch.zeros((), device=images.device)
                 )
-                # Use warmup-adjusted rate loss weight if provided, else default
                 rate_weight = (
                     rate_loss_weight_override
                     if rate_loss_weight_override is not None
                     else RATE_LOSS_WEIGHT
                 )
                 rate_contribution = rate_weight * rate_excess_bpp
-                lab = _lab_loss(reconstructed, images)
-                lab_contribution = _LAMBDA_LAB * lab
                 total = (
                     reconstruction
-                    + 5.0 * mse
+                    + mse_w * mse
                     + 1.5 * edge
-                    + 0.5 * structural
+                    + structural_w * structural
                     + 0.25 * multiscale
                     + kl_contribution
                     + kakeya_contribution
