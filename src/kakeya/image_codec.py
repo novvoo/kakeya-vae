@@ -948,8 +948,6 @@ def _epoch(
                     else RATE_LOSS_WEIGHT
                 )
                 rate_contribution = rate_weight * rate_excess_bpp
-                lab = _lab_loss(reconstructed, images)
-                lab_contribution = _LAMBDA_LAB * lab
                 total = (
                     reconstruction
                     + 5.0 * mse
@@ -958,7 +956,6 @@ def _epoch(
                     + 0.25 * multiscale
                     + kl_contribution
                     + kakeya_contribution
-                    + lab_contribution
                     + rate_contribution
                 )
                 if optimizer is not None:
@@ -1427,92 +1424,9 @@ def _edges(image: torch.Tensor) -> torch.Tensor:
     )
 
 
-_SRGB_TO_LIN_COEFF = 1.0 / 12.92
-_SRGB_TO_LIN_EXP = 1.0 / 2.4
-_SRGB_TO_LIN_OFFSET = 0.055
-_SRGB_TO_LIN_SCALE = 1.055
-
-_LAB_DELTA = 6.0 / 29.0
-_LAB_DELTA_CUBED = _LAB_DELTA ** 3
-_LAB_FACTOR = 3.0 * _LAB_DELTA ** 2
-
-_D65_XYZ = torch.tensor([0.95047, 1.0, 1.08883])
-
-_XYZ_TO_LAB = torch.tensor([
-    [0.4124564, 0.3575761, 0.1804375],
-    [0.2126729, 0.7151522, 0.0721750],
-    [0.0193339, 0.1191920, 0.9503041],
-])
-
-def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
-    if rgb.max() <= 1.5:
-        srgb = rgb.clamp(0, 1)
-    else:
-        srgb = (rgb / 255.0).clamp(0, 1)
-    lin = torch.where(
-        srgb <= 0.04045,
-        srgb * _SRGB_TO_LIN_COEFF,
-        ((srgb + _SRGB_TO_LIN_OFFSET) / _SRGB_TO_LIN_SCALE).pow(_SRGB_TO_LIN_EXP),
-    )
-    if lin.size(1) == 3:
-        rgb_ch = lin.permute(0, 2, 3, 1)
-        xyz = (rgb_ch @ _XYZ_TO_LAB.to(lin.device).T).permute(0, 3, 1, 2)
-    else:
-        xyz = lin
-    ref = _D65_XYZ.to(lin.device).view(1, 3, 1, 1)
-    xyz_norm = xyz / ref
-    f = torch.where(
-        xyz_norm > _LAB_DELTA_CUBED,
-        xyz_norm.pow(1.0 / 3.0),
-        xyz_norm / _LAB_FACTOR + 4.0 / 29.0,
-    )
-    L = 116.0 * f[:, 1:2, :, :] - 16.0
-    a = 500.0 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
-    b = 200.0 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
-    return torch.cat([L, a, b], dim=1)
-
-def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    rec_lab = _rgb_to_lab(reconstructed)
-    tgt_lab = _rgb_to_lab(target)
-    diff = rec_lab - tgt_lab
-    # Weight chroma (a, b) more than lightness (L): color shifts
-    # (red->yellow, blue->gray) are more perceptible than brightness drift.
-    # Brightness-adaptive chroma weight: dark pixels (L<50) get up to 3x
-    # a/b weight because their chroma values are absolutely small, so a
-    # fixed-weight ΔE under-penalizes hue shifts on dark reds / dark blues.
-    L = tgt_lab[:, 0:1, :, :]
-    chroma_weight = 1.0 + 2.0 * ((50.0 - L.clamp(0.0, 50.0)) / 50.0)
-    delta_e = torch.sqrt(
-        0.25 * diff[:, 0:1, :, :].pow(2)
-        + chroma_weight * diff[:, 1:2, :, :].pow(2)
-        + chroma_weight * diff[:, 2:3, :, :].pow(2)
-        + 1e-8,
-    )
-    return delta_e.mean()
-
-_LAMBDA_LAB = 0.3
-
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:
-    """Emphasize color edges and text strokes instead of flat backgrounds.
-
-    Computes edge attention per-channel (R, G, B) so that pure-color
-    transitions (e.g. red->yellow) produce high gradient even when the
-    grayscale version stays flat.  Falls back to grayscale for images
-    that are already single-channel.
-    """
-
-    if image.size(1) == 1:
-        grayscale = image
-    else:
-        edge_max = None
-        for c in range(image.size(1)):
-            ch = image[:, c : c + 1, :, :]
-            h = F.pad((ch[:, :, :, 1:] - ch[:, :, :, :-1]).abs(), (0, 1, 0, 0))
-            v = F.pad((ch[:, :, 1:, :] - ch[:, :, :-1, :]).abs(), (0, 0, 0, 1))
-            ch_edge = (h + v) * 8
-            edge_max = ch_edge if edge_max is None else torch.maximum(edge_max, ch_edge)
-        edge_attention = edge_max.clamp(0, 1)
-        grayscale = image.mean(dim=1, keepdim=True)
+    """Emphasize edges and text strokes instead of flat backgrounds."""
+    grayscale = image.mean(dim=1, keepdim=True)
     horizontal = F.pad(
         (grayscale[:, :, :, 1:] - grayscale[:, :, :, :-1]).abs(),
         (0, 1, 0, 0),
@@ -1521,8 +1435,7 @@ def _detail_weight(image: torch.Tensor) -> torch.Tensor:
         (grayscale[:, :, 1:, :] - grayscale[:, :, :-1, :]).abs(),
         (0, 0, 0, 1),
     )
-    if image.size(1) == 1:
-        edge_attention = ((horizontal + vertical) * 8).clamp(0, 1)
+    edge_attention = ((horizontal + vertical) * 8).clamp(0, 1)
     dark_foreground = ((0.75 - grayscale) * 2).clamp(0, 1)
     return 1 + 3 * torch.maximum(edge_attention, dark_foreground)
 

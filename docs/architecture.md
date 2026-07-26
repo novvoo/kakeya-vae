@@ -404,8 +404,7 @@ graph TD
         L5[multiscale<br/>0.25 x 多尺度 L1]
         L6[kl<br/>kl_weight x KL]
         L7[kakeya<br/>lambda x 覆盖正则<br/>§1 挂谷正则]
-        L8[lab<br/>0.3 x CIELAB ΔE<br/>色相权重高于亮度<br/>暗色区域 a/b 权重自适应提升]
-        L9[rate<br/>rate_weight x 码率超限]
+        L8[rate<br/>rate_weight x 码率超限]
     end
 
     L1 --> TOTAL[total loss]
@@ -416,10 +415,9 @@ graph TD
     L6 --> TOTAL
     L7 --> TOTAL
     L8 --> TOTAL
-    L9 --> TOTAL
 
     subgraph DetailWeight
-        DW1[RGB 逐通道边缘检测<br/>x8 梯度 取 max]
+        DW1[灰度边缘检测<br/>x8 梯度]
         DW2[暗色前景<br/>0.75-gray x2]
         DW3[max edge, dark<br/>1 + 3x]
         DW1 --> DW3
@@ -853,19 +851,21 @@ graph TD
 graph TD
     subgraph 修复前
         OLD_CAP[capacity_loader<br/>仅参考图多尺寸<br/>32 steps]
-        OLD_CAP -->|内容单一| OVERFIT[过拟合参考图]
+        OLD_CAP -->|内容单一| OVERFIT[过拟合参考图<br/>颜色分布窄]
     end
 
     subgraph 修复后
         NEW_CAP_REF[capacity_loader<br/>参考图多尺寸<br/>32 steps]
         NEW_CAP_PROG[train_loader<br/>程序图多尺度<br/>128+ 样本]
+        NEW_CAP_REAL[real_loader<br/>真实高清图<br/>assets/hd_images/<br/>多样色彩与纹理]
         NEW_REH[rehearsal_loader<br/>参考图多尺寸<br/>8 steps]
 
-        NEW_CAP_REF --> MERGE[合并训练<br/>0.5 ref + 0.5 prog]
+        NEW_CAP_REF --> MERGE[合并训练<br/>40% ref + 30% prog + 30% real]
         NEW_CAP_PROG --> MERGE
+        NEW_CAP_REAL --> MERGE
         MERGE --> NEW_REH
         NEW_REH -->|保证| GATE[闸门可通过<br/>参考图 PSNR≥26<br/>或 epoch≥40 强制过闸]
-        MERGE -->|保证| GEN[泛化能力<br/>多内容多尺度]
+        MERGE -->|保证| GEN[泛化能力<br/>多内容多尺度<br/>颜色分布广]
     end
 
     OVERFIT -.->|修复| MERGE
@@ -874,6 +874,7 @@ graph TD
     style GATE fill:#c8e6c9
     style GEN fill:#c8e6c9
     style MERGE fill:#fff9c4
+    style NEW_CAP_REAL fill:#e8f5e9
 ```
 
 ### 9.3 高清大图推理流程
@@ -956,9 +957,11 @@ graph LR
     style I_LARGE fill:#fff9c4
 ```
 
-### 9.5 高清大图颜色丢失问题链路
+### 9.5 高清大图颜色与亮度问题
 
-#### 9.5.1 历史诊断（已修复）
+#### 9.5.1 历史诊断：过拟合导致颜色丢失
+
+模型早期出现严重的过拟合问题——只学会重建 256² 参考图，对其他内容完全失效：
 
 ```mermaid
 flowchart TD
@@ -1016,126 +1019,100 @@ flowchart TD
     style FIX4 fill:#c8e6c9
 ```
 
-#### 9.5.2 深层颜色损失根因
+#### 9.5.2 真实颜色问题的根因：训练集多样性不足
 
-即使泛化问题修复后，大图仍可能出现颜色偏移。深入分析损失函数发现三个颜色约束薄弱点：
+泛化问题修复后，大图仍存在颜色偏移（如整体泛蓝、暗红色偏色）。**最初以为是损失函数的颜色约束不够强，尝试了多种损失函数优化（LAB ΔE 色差、RGB 通道 detail_weight、亮度自适应权重等），但实测效果有限甚至拖累训练速度，最终已从代码中移除。** 真正的根因是训练数据的颜色分布过于单一——增加真实高清多彩图片到训练集后，问题立竿见影地解决。
 
 ```mermaid
 flowchart TD
-    subgraph 颜色损失根因
-        direction LR
-
-        subgraph 根因1: 灰度权重
-            RW1[detail_weight<br/>在灰度空间计算]
-            RW2[只看亮度梯度<br/>鲜艳红色在灰度中接近背景]
-            RW3[红色区域权重低<br/>模型不精确重建颜色]
-            RW1 --> RW2 --> RW3
-        end
-
-        subgraph 根因2: 多尺度降采样
-            MS1[multiscale_l1<br/>只用 128 和 64]
-            MS2[512px 缩到 128px<br/>平均化损失颜色细节]
-            MS3[全分辨率无颜色约束<br/>模型不关心原色精度]
-            MS1 --> MS2 --> MS3
-        end
-
-        subgraph 根因3: 纯L1重建
-            L1A[reconstruction = L1<br/>逐像素差 无感知约束]
-            L1B[L1 对颜色偏移不敏感<br/>R=255到250 G=0到0 误差小]
-            L1C[人眼对颜色差异<br/>远比对亮度更敏感]
-            L1A --> L1B
-            L1C -.-> L1B
-        end
+    subgraph 问题现象
+        P1[高清大图整体泛蓝<br/>R 通道细节丢失多]
+        P2[暗红色偏橙偏棕<br/>暗色区域色相向亮度偏移]
+        P3[饱和度不足<br/>鲜艳颜色变灰白]
     end
 
-    subgraph 现象
-        P1[重建图整体偏亮或偏暗]
-        P2[鲜红色变成黄色<br/>亮度相同但色相偏移]
-        P3[饱和度丢失<br/>鲜艳颜色变灰白]
-        P4[暗红色偏橙偏棕<br/>鲜红色已修复但暗色仍偏色]
+    subgraph 曾尝试但效果有限
+        ATT1[detail_weight 扩展到 RGB 通道<br/>理论上增强颜色边缘约束]
+        ATT2[multiscale 增加原分辨率权重<br/>理论上保留高频颜色细节]
+        ATT3[CIELAB DeltaE 色差损失<br/>理论上感知式颜色约束]
+        ATT4[亮度自适应 LAB 权重<br/>理论上增强暗色区域色相梯度]
+
+        ATT1 --> RESULT1[实际: PSNR 提升微<br/>训练速度下降<br/>效果不明显]
+        ATT2 --> RESULT2[实际: 收益甚微<br/>增加计算量]
+        ATT3 --> RESULT3[实际: 权重需精心调<br/>调不好反而模糊细节]
+        ATT4 --> RESULT4[实际: 暗红色改善有限<br/>引入额外复杂度]
     end
 
-    RW3 --> P2
-    MS3 --> P3
-    L1B --> P1
-    L1B --> P4
-
-    subgraph 优化方案
-        O1[detail_weight<br/>扩展到颜色通道<br/>RGB 差异权重]
-        O2[multiscale 增加<br/>原图分辨率 L1]
-        O3[添加<br/>CIELAB 色差损失<br/>色相权重高于亮度<br/>感知式颜色约束]
+    subgraph 真正根因
+        R1[训练数据颜色分布单一<br/>程序化图文卡 + 参考图<br/>颜色种类有限]
+        R2[模型未见足够多样的<br/>真实色彩分布<br/>encoder/decoder 未学到<br/>通用颜色映射]
+        R3[InstanceNorm 统计量<br/>在新颜色分布上失配<br/>累积误差导致偏色]
+        R1 --> R2 --> R3
     end
 
-    RW3 -.-> O1
-    MS3 -.-> O2
-    L1B -.-> O3
+    subgraph 真正有效的方案
+        S1[添加真实高清多彩图片<br/>assets/hd_images/<br/>10-30 张多样内容]
+        S2[容量阶段混合训练<br/>40% 参考图 + 30% 程序图 + 30% 真实图]
+        S3[模型学到通用颜色映射<br/>encoder/decoder 见过足够多样色彩]
+        S4[颜色与亮度问题<br/>立竿见影地解决]
+        S1 --> S2 --> S3 --> S4
+    end
 
-    style RW3 fill:#fce4ec
-    style MS3 fill:#fce4ec
-    style L1B fill:#fce4ec
-    style P1 fill:#fff9c4
-    style P2 fill:#fff9c4
-    style P3 fill:#fff9c4
-    style O1 fill:#c8e6c9
-    style O2 fill:#c8e6c9
-    style O3 fill:#c8e6c9
+    P1 -.->|尝试| ATT1
+    P2 -.->|尝试| ATT3
+    P3 -.->|尝试| ATT2
+    R3 --> P1
+    R3 --> P2
+    R3 --> P3
+    S4 -.->|解决| P1
+    S4 -.->|解决| P2
+    S4 -.->|解决| P3
+
+    style P1 fill:#ffcdd2
+    style P2 fill:#ffcdd2
+    style P3 fill:#ffcdd2
+    style RESULT1 fill:#fff9c4
+    style RESULT2 fill:#fff9c4
+    style RESULT3 fill:#fff9c4
+    style RESULT4 fill:#fff9c4
+    style R1 fill:#fce4ec
+    style R3 fill:#fce4ec
+    style S4 fill:#c8e6c9
 ```
 
-#### 9.5.3 颜色损失优化方案
+#### 9.5.3 经验教训：损失函数 vs 数据质量
+
+**核心结论：对于颜色还原问题，训练数据的多样性和覆盖面远比损失函数的精细调整重要。**
 
 ```mermaid
-graph TD
-    subgraph 优化1: detail_weight 扩展到颜色
-        direction TB
-        DW_OLD[旧: 灰度梯度 only<br/>grayscale = mean R G B<br/>edge = abs diff_h + diff_v]
-        DW_NEW[新: RGB 差异权重<br/>edge_r = abs Rh + Rv<br/>edge_g = abs Gh + Gv<br/>edge_b = abs Bh + Bv<br/>edge = max R G B x 8]
-        DW_OLD -->|替换| DW_NEW
+graph LR
+    subgraph 损失函数优化路线
+        L1[增加更多损失项<br/>LAB / perceptual / detail]
+        L2[调权重 / 加自适应机制]
+        L3[训练速度下降<br/>调参成本高<br/>边际收益低]
+        L1 --> L2 --> L3
     end
 
-    subgraph 优化2: multiscale 增加原分辨率
-        direction TB
-        MS_OLD[旧: 只用 128, 64<br/>ms_loss = avg L1@128 L1@64]
-        MS_NEW[新: 增加原分辨率<br/>ms_loss = 0.5x L1@orig<br/>+ 0.25x L1@128<br/>+ 0.25x L1@64]
-        MS_OLD -->|替换| MS_NEW
+    subgraph 数据质量路线
+        D1[增加真实多样的训练图片]
+        D2[扩展颜色与纹理分布]
+        D3[模型自然学到通用映射<br/>效果立竿见影<br/>训练速度不受影响]
+        D1 --> D2 --> D3
     end
 
-    subgraph 优化3: CIELAB 颜色损失
-        direction TB
-        LAB1[RGB to CIELAB 转换]
-        LAB2[DeltaE = sqrt 0.25x DeltaL^2 + Deltaa^2 + Deltab^2]
-        LAB3[色相权重高于亮度<br/>a b 通道 1.0  L 通道 0.25]
-        LAB4[total += lambda_lab x lab_loss<br/>lambda_lab = 0.3]
-        LAB1 --> LAB2 --> LAB3 --> LAB4
+    subgraph 对比结论
+        C1[数据 > 损失函数<br/>好数据胜过精巧的损失设计]
+        C2[损失函数是放大器<br/>数据分布决定上限]
     end
 
-    subgraph 优化4: 亮度自适应 LAB 权重
-        direction TB
-        ADAPT1[问题: 暗色区域 a b 绝对值小<br/>固定权重 ΔE 信号弱<br/>暗红色色相偏移被低估]
-        ADAPT2[策略: 按目标图 L 自适应<br/>chroma_weight = 1 + 2 x 50-L / 50<br/>L≥50 → 1.0<br/>L=25 → 2.0<br/>L=0 → 3.0]
-        ADAPT3[ΔE = sqrt<br/>0.25 x ΔL^2<br/>+ w x Δa^2<br/>+ w x Δb^2]
-        ADAPT4[效果: 暗红色 ΔE 信号增强 2-3 倍<br/>与鲜红色产生同等梯度]
-        ADAPT1 --> ADAPT2 --> ADAPT3 --> ADAPT4
-    end
+    L3 -.->|对比| C1
+    D3 -.->|对比| C1
+    C1 --> C2
 
-    subgraph 效果预期
-        E1[鲜红色精确重建<br/>不再偏黄]
-        E2[饱和度保持<br/>鲜艳颜色不变灰白]
-        E3[暗红色精确重建<br/>色相不再偏橙偏棕]
-        E4[整体色彩一致<br/>大图小图表现一致]
-        E1 --> E2 --> E3 --> E4
-    end
-
-    DW_NEW -.-> E1
-    MS_NEW -.-> E2
-    LAB4 -.-> E3
-    ADAPT4 -.-> E3
-
-    style DW_NEW fill:#c8e6c9
-    style MS_NEW fill:#c8e6c9
-    style LAB4 fill:#c8e6c9
-    style ADAPT4 fill:#c8e6c9
-    style E3 fill:#fff9c4
-    style E4 fill:#fff9c4
+    style L3 fill:#fff9c4
+    style D3 fill:#c8e6c9
+    style C1 fill:#e1f5fe
+    style C2 fill:#e1f5fe
 ```
 
 ### 9.6 码率一致性检查 (rate consistency)
