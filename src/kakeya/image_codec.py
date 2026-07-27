@@ -776,14 +776,17 @@ def train_image_codec(
             else "finetune"
         )
 
-        # Stage-dependent learning rate — finetune stays high to maintain convergence speed.
-        current_lr = config.learning_rate
-        if capacity_stage or not transition_stage:
-            current_lr = max(current_lr, 1e-3)
+        # Stage-dependent learning rate (matches original VAE schedule)
+        if capacity_stage:
+            current_lr = max(config.learning_rate, 1e-3)
         elif transition_stage:
-            current_lr = max(current_lr, 5e-4)
+            current_lr = max(config.learning_rate, 5e-4)
+        else:
+            current_lr = config.learning_rate
         for group in optimizer.param_groups:
             group["lr"] = current_lr
+
+        # Rate weight and grad clip
         if capacity_stage:
             rate_weight = 0.0
             grad_clip = None
