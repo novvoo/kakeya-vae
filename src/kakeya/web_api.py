@@ -38,10 +38,8 @@ class ExperimentRequest(BaseModel):
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     beta: Annotated[float, Field(gt=0, le=100)] = 4.0
     gamma: Annotated[float, Field(ge=0, le=1000)] = 10.0
-    lambda_kakeya: Annotated[float, Field(ge=0, le=1000)] = 0.001
     num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
     k: Annotated[int, Field(ge=1, le=4096)] = 3
-    degree: Annotated[int, Field(ge=1, le=10)] = 3
     # Optional per-stage loss weight overrides.  Any subset of stages / loss
     # keys may be provided; missing entries fall back to DEFAULT_STAGE_WEIGHTS
     # in config.py.  Example:

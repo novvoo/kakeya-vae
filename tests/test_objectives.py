@@ -28,7 +28,6 @@ def test_all_objectives_are_finite() -> None:
         "beta_vae",
         "beta_tcvae",
         "factor_vae",
-        "poly_kakeya",
     )
 
     for method in methods:

@@ -970,6 +970,11 @@ def _epoch(
                 # configs saved before these losses were introduced.
                 hue_w = stage_w.get("hue", 0.0)
                 saturation_w = stage_w.get("saturation", 0.0)
+                # edge/multiscale default to current hardcoded values for
+                # backward compat with configs saved before these were
+                # added to DEFAULT_STAGE_WEIGHTS.
+                edge_w = stage_w.get("edge", 1.5)
+                multiscale_w = stage_w.get("multiscale", 0.25)
                 if kakeya_weight_override is not None:
                     kakeya_weight = kakeya_weight_override
                 else:
@@ -993,9 +998,9 @@ def _epoch(
                 total = (
                     reconstruction
                     + mse_w * mse
-                    + 1.5 * edge
+                    + edge_w * edge
                     + structural_w * structural
-                    + 0.25 * multiscale
+                    + multiscale_w * multiscale
                     + kl_contribution
                     + kakeya_contribution
                     + lab_contribution

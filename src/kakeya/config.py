@@ -14,37 +14,48 @@ SUPPORTED_METHODS = {
     "beta_tcvae",
     "factor_vae",
     "image_codec",
-    "poly_kakeya",
 }
+
 
 # Default per-stage loss weights for image_codec training.  Every loss
 # direction participates from the first epoch; stages only differ in how
 # much weight each loss carries.  Users can override any subset of these
 # via config.objective.stage_weights in YAML / API.
+#
+# Rationale:
+#   capacity   — build latent structure, light pixel constraints
+#   transition — smooth ramp to pixel accuracy after gate opens
+#   finetune   — maximize perceptual quality (SSIM, edges, color)
 DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
     "capacity": {
-        "kakeya": 0.002,
+        "kakeya": 0.01,
         "mse": 0.5,
+        "edge": 1.0,
         "structural": 0.1,
+        "multiscale": 0.1,
         "lab": 0.02,
-        "hue": 0.02,
+        "hue": 0.01,
         "saturation": 0.02,
     },
     "transition": {
-        "kakeya": 0.001,
-        "mse": 5.0,
-        "structural": 0.25,
-        "lab": 0.05,
-        "hue": 0.05,
+        "kakeya": 0.005,
+        "mse": 3.0,
+        "edge": 1.5,
+        "structural": 0.4,
+        "multiscale": 0.25,
+        "lab": 0.08,
+        "hue": 0.04,
         "saturation": 0.05,
     },
     "finetune": {
-        "kakeya": 0.0005,
+        "kakeya": 0.001,
         "mse": 5.0,
-        "structural": 0.5,
-        "lab": 0.10,
-        "hue": 0.10,
-        "saturation": 0.10,
+        "edge": 2.0,
+        "structural": 0.8,
+        "multiscale": 0.5,
+        "lab": 0.15,
+        "hue": 0.06,
+        "saturation": 0.08,
     },
 }
 

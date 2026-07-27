@@ -35,7 +35,6 @@ def test_request_builds_method_specific_objective() -> None:
     request = ExperimentRequest(
         method="image_codec",
         train_limit=32,
-        lambda_kakeya=0.025,
         num_projections=16,
         batch_size=4,
         k=10,
@@ -46,7 +45,6 @@ def test_request_builds_method_specific_objective() -> None:
     assert config["train_limit"] == 32
     assert config["test_limit"] is None
     assert config["objective"] == {
-        "lambda_kakeya": 0.025,
         "num_projections": 16,
         "k": 3,
     }

@@ -58,23 +58,6 @@ def kakeya_regularization(
     top_k = min(k, gaps.size(0))
     return -torch.topk(gaps, k=top_k, dim=0).values.mean()
 
-
-def polynomial_kakeya_regularization(
-    z: torch.Tensor, degree: int = 3, num_projections: int = 64
-) -> torch.Tensor:
-    if degree <= 0:
-        raise ValueError("degree must be positive")
-    normalized_z = F.normalize(z, dim=1)
-    directions = F.normalize(
-        torch.randn(num_projections, z.size(1), device=z.device), dim=1
-    )
-    projections = normalized_z @ directions.T
-    polynomial_features = torch.cat(
-        [projections.pow(power) for power in range(1, degree + 1)], dim=1
-    )
-    return -polynomial_features.var(dim=0, unbiased=False).mean()
-
-
 def compute_objective(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -98,13 +81,6 @@ def compute_objective(
     elif method == "factor_vae":
         # The discriminator-based TC term is added by the training engine.
         total = recon + kl
-    elif method == "poly_kakeya":
-        regularizer = polynomial_kakeya_regularization(
-            z,
-            degree=int(parameters.get("degree", 3)),
-            num_projections=int(parameters.get("num_projections", 64)),
-        )
-        total = recon + kl + float(parameters.get("lambda_kakeya", 1.0)) * regularizer
     else:
         raise ValueError(f"Unknown method: {method}")
 

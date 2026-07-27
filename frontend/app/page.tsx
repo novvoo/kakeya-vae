@@ -64,9 +64,9 @@ type Environment = {
 };
 
 type StageWeights = {
-  capacity?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
-  transition?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
-  finetune?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
+  capacity?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
+  transition?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
+  finetune?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
 };
 
 type ExperimentConfig = {
@@ -81,10 +81,8 @@ type ExperimentConfig = {
   test_limit: number;
   beta: number;
   gamma: number;
-  lambda_kakeya: number;
   num_projections: number;
   k: number;
-  degree: number;
   stage_weights?: StageWeights;
 };
 
@@ -156,14 +154,12 @@ const DEFAULT_CONFIG: ExperimentConfig = {
   test_limit: 0,
   beta: 4,
   gamma: 10,
-  lambda_kakeya: 0.001,
   num_projections: 32,
   k: 3,
-  degree: 3,
 };
 
 const METHOD_LABELS: Record<string, string> = {
-  image_codec: "256 图文 Kakeya VAE",
+  image_codec: "图文 Kakeya VAE (多尺度)",
 };
 
 const IMAGE_CODEC_REFERENCES = [
@@ -410,7 +406,6 @@ export default function Home() {
         train_limit: 128,
         test_limit: 0,
         learning_rate: 0.0005,
-        lambda_kakeya: 0.001,
         num_projections: 32,
         k: 3,
       });
@@ -998,30 +993,6 @@ function ObjectiveFields({
             onChange={(gamma) => setConfig({ ...config, gamma })}
           />
         )}
-        {config.method === "poly_kakeya" && (
-          <>
-            <NumberField
-              label="Kakeya λ"
-              value={config.lambda_kakeya}
-              min={0}
-              max={1000}
-              step={0.001}
-              onChange={(lambda_kakeya) =>
-                setConfig({ ...config, lambda_kakeya })
-              }
-            />
-            <NumberField
-              label="随机投影数"
-              value={config.num_projections}
-              min={4}
-              max={1024}
-              step={4}
-              onChange={(num_projections) =>
-                setConfig({ ...config, num_projections })
-              }
-            />
-          </>
-        )}
         {config.method === "image_codec" && (
           <>
             <NumberField
@@ -1044,16 +1015,6 @@ function ObjectiveFields({
             />
           </>
         )}
-        {config.method === "poly_kakeya" && (
-          <NumberField
-            label="多项式次数"
-            value={config.degree}
-            min={1}
-            max={10}
-            step={1}
-            onChange={(degree) => setConfig({ ...config, degree })}
-          />
-        )}
       </div>
       {config.method === "image_codec" && (
         <StageWeightsEditor config={config} setConfig={setConfig} defaultStageWeights={defaultStageWeights} />
@@ -1073,12 +1034,12 @@ function StageWeightsEditor({
 }) {
   const stages: Array<keyof StageWeights> = ["capacity", "transition", "finetune"];
   const lossKeys: Array<keyof NonNullable<StageWeights["capacity"]>> = [
-    "kakeya", "mse", "structural", "lab", "hue", "saturation",
+    "kakeya", "mse", "edge", "structural", "multiscale", "lab", "hue", "saturation",
   ];
   const stageFallback: Record<string, Record<string, number>> = {
-    capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02, hue: 0.02, saturation: 0.02 },
-    transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05, hue: 0.05, saturation: 0.05 },
-    finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10, hue: 0.10, saturation: 0.10 },
+    capacity: { kakeya: 0.01, mse: 0.5, edge: 1.0, structural: 0.1, multiscale: 0.1, lab: 0.02, hue: 0.01, saturation: 0.02 },
+    transition: { kakeya: 0.005, mse: 3.0, edge: 1.5, structural: 0.4, multiscale: 0.25, lab: 0.08, hue: 0.04, saturation: 0.05 },
+    finetune: { kakeya: 0.001, mse: 5.0, edge: 2.0, structural: 0.8, multiscale: 0.5, lab: 0.15, hue: 0.06, saturation: 0.08 },
   };
   const current = config.stage_weights ?? {};
   const update = (
@@ -1096,7 +1057,7 @@ function StageWeightsEditor({
   return (
     <div className="stage-weights-editor">
       <p>分阶段损失权重 (config.stage_weights)</p>
-      <table className="stage-weights-table">
+      <div style={{overflowX:"auto"}}><table className="stage-weights-table">
         <thead>
           <tr>
             <th>阶段</th>
@@ -1110,6 +1071,7 @@ function StageWeightsEditor({
             const stageObj = { ...(defaultStageWeights?.[stage] ?? stageFallback[stage]), ...(current[stage] ?? {}) };
             return (
               <tr key={stage}>
+                    <td>{stage}</td>
                 {lossKeys.map((key) => (
                   <td key={key}>
                     <input
@@ -1119,13 +1081,17 @@ function StageWeightsEditor({
                           ? 0.0005
                           : key === "mse"
                             ? 0.5
-                            : key === "structural"
-                              ? 0.05
-                              : key === "lab"
-                                ? 0.01
-                                : key === "hue"
-                                  ? 0.01
-                                  : 0.01
+                            : key === "edge"
+                              ? 0.25
+                              : key === "structural"
+                                ? 0.05
+                                : key === "multiscale"
+                                  ? 0.05
+                                  : key === "lab"
+                                    ? 0.01
+                                    : key === "hue"
+                                      ? 0.01
+                                      : 0.01
                       }
                       min={0}
                       value={stageObj[key]}
@@ -1139,7 +1105,7 @@ function StageWeightsEditor({
             );
           })}
         </tbody>
-      </table>
+      </table></div>
       <small>
         所有损失方向从 capacity 阶段即启用，各阶段仅权重递增。留空使用默认值。
       </small>
@@ -1358,20 +1324,20 @@ function ImagePreviewPanel({
     <section className="image-preview-panel">
       <div className="image-preview-heading">
         <p className="section-index">BUILT-IN TEST ASSET / ALWAYS VISIBLE</p>
-        <h2>256×256 图文压缩测试</h2>
+        <h2>参考图文测试卡</h2>
       </div>
       <figure className="test-image-preview">
         <a
           href={`${API_BASE}/api/test-image`}
           target="_blank"
           rel="noreferrer"
-          aria-label="打开 256×256 测试卡原图"
+          aria-label="打开测试卡原图"
         >
           {/* Dynamic local API assets should bypass framework image optimization. */}
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={`${API_BASE}/api/test-image`}
-            alt="内置 Kakeya 256×256 图文压缩测试卡"
+            alt="内置 Kakeya 参考图文测试卡"
             width={256}
             height={256}
           />
@@ -1407,7 +1373,7 @@ function ImagePreviewPanel({
           onClick={onSelect}
           disabled={selected}
         >
-          {selected ? "已选择 256 图文模型 ✓" : "使用这张图片开始图文实验"}
+          {selected ? "已选择图文模型 ✓" : "使用这张图片开始图文实验"}
         </button>
       </div>
     </section>
@@ -1750,7 +1716,7 @@ function ImageCodecResults({
       <div className="codec-summary">
         <div>
           <p className="section-index">IN-DISTRIBUTION CODEC CALIBRATION</p>
-          <h3>256×256 图文还原结果</h3>
+          <h3>图文还原结果 (多尺度)</h3>
         </div>
         <p>
           这是模型容量与复原能力测试，不是陌生图片泛化测试。模型使用{" "}
@@ -2033,7 +1999,7 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
             })}
             <tr className="highlight-row">
               <td>
-                256 图文 Kakeya VAE
+                图文 Kakeya VAE
                 <small>EntropyBottleneck · {latentShape.join("×")}</small>
               </td>
               <td>
