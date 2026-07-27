@@ -1106,7 +1106,15 @@ function StageWeightsEditor({
                   <td key={key}>
                     <input
                       type="number"
-                      step={key === "mse" ? 0.5 : 0.01}
+                      step={
+                        key === "kakeya"
+                          ? 0.0005
+                          : key === "mse"
+                            ? 0.5
+                            : key === "structural"
+                              ? 0.05
+                              : 0.01
+                      }
                       min={0}
                       value={stageObj[key]}
                       onChange={(e) =>
