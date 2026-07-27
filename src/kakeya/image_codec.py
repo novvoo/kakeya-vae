@@ -962,8 +962,10 @@ def _epoch(
                 mse_w = stage_w["mse"]
                 structural_w = stage_w["structural"]
                 lab_w = stage_w["lab"]
-                hue_w = stage_w["hue"]
-                saturation_w = stage_w["saturation"]
+                # hue/saturation default to 0 for backward compat with
+                # configs saved before these losses were introduced.
+                hue_w = stage_w.get("hue", 0.0)
+                saturation_w = stage_w.get("saturation", 0.0)
                 if kakeya_weight_override is not None:
                     kakeya_weight = kakeya_weight_override
                 else:
