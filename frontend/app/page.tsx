@@ -63,6 +63,12 @@ type Environment = {
   };
 };
 
+type StageWeights = {
+  capacity?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
+  transition?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
+  finetune?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
+};
+
 type ExperimentConfig = {
   method: string;
   epochs: number;
@@ -79,6 +85,7 @@ type ExperimentConfig = {
   num_projections: number;
   k: number;
   degree: number;
+  stage_weights?: StageWeights;
 };
 
 type ResultPayload = {
@@ -978,14 +985,14 @@ function ObjectiveFields({
             onChange={(gamma) => setConfig({ ...config, gamma })}
           />
         )}
-        {["image_codec", "poly_kakeya"].includes(config.method) && (
+        {config.method === "poly_kakeya" && (
           <>
             <NumberField
               label="Kakeya λ"
               value={config.lambda_kakeya}
               min={0}
-              max={config.method === "image_codec" ? 0.1 : 1000}
-              step={config.method === "image_codec" ? 0.001 : 0.1}
+              max={1000}
+              step={0.1}
               onChange={(lambda_kakeya) =>
                 setConfig({ ...config, lambda_kakeya })
               }
@@ -1003,14 +1010,26 @@ function ObjectiveFields({
           </>
         )}
         {config.method === "image_codec" && (
-          <NumberField
-            label="Top-k 间距"
-            value={config.k}
-            min={1}
-            max={4096}
-            step={1}
-            onChange={(k) => setConfig({ ...config, k })}
-          />
+          <>
+            <NumberField
+              label="随机投影数"
+              value={config.num_projections}
+              min={4}
+              max={1024}
+              step={4}
+              onChange={(num_projections) =>
+                setConfig({ ...config, num_projections })
+              }
+            />
+            <NumberField
+              label="Top-k 间距"
+              value={config.k}
+              min={1}
+              max={4096}
+              step={1}
+              onChange={(k) => setConfig({ ...config, k })}
+            />
+          </>
         )}
         {config.method === "poly_kakeya" && (
           <NumberField
@@ -1023,6 +1042,87 @@ function ObjectiveFields({
           />
         )}
       </div>
+      {config.method === "image_codec" && (
+        <StageWeightsEditor config={config} setConfig={setConfig} />
+      )}
+    </div>
+  );
+}
+
+const STAGE_DEFAULTS: Required<{
+  [K in keyof StageWeights]: Required<NonNullable<StageWeights[K]>>;
+}> = {
+  capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02 },
+  transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05 },
+  finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10 },
+};
+
+function StageWeightsEditor({
+  config,
+  setConfig,
+}: {
+  config: ExperimentConfig;
+  setConfig: (config: ExperimentConfig) => void;
+}) {
+  const stages: Array<keyof StageWeights> = ["capacity", "transition", "finetune"];
+  const lossKeys: Array<keyof NonNullable<StageWeights["capacity"]>> = [
+    "kakeya",
+    "mse",
+    "structural",
+    "lab",
+  ];
+  const current = config.stage_weights ?? {};
+  const update = (
+    stage: keyof StageWeights,
+    key: keyof NonNullable<StageWeights["capacity"]>,
+    value: number,
+  ) => {
+    const stageObj = { ...(current[stage] ?? {}) };
+    stageObj[key] = value;
+    setConfig({
+      ...config,
+      stage_weights: { ...current, [stage]: stageObj },
+    });
+  };
+  return (
+    <div className="stage-weights-editor">
+      <p>分阶段损失权重 (config.stage_weights)</p>
+      <table className="stage-weights-table">
+        <thead>
+          <tr>
+            <th>阶段</th>
+            {lossKeys.map((k) => (
+              <th key={k}>{k}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {stages.map((stage) => {
+            const stageObj = { ...STAGE_DEFAULTS[stage], ...(current[stage] ?? {}) };
+            return (
+              <tr key={stage}>
+                <td>{stage}</td>
+                {lossKeys.map((key) => (
+                  <td key={key}>
+                    <input
+                      type="number"
+                      step={key === "mse" ? 0.5 : 0.01}
+                      min={0}
+                      value={stageObj[key]}
+                      onChange={(e) =>
+                        update(stage, key, parseFloat(e.target.value) || 0)
+                      }
+                    />
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <small>
+        所有损失方向从 capacity 阶段即启用，各阶段仅权重递增。留空使用默认值。
+      </small>
     </div>
   );
 }

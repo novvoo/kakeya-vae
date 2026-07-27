@@ -42,6 +42,11 @@ class ExperimentRequest(BaseModel):
     num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
     k: Annotated[int, Field(ge=1, le=4096)] = 3
     degree: Annotated[int, Field(ge=1, le=10)] = 3
+    # Optional per-stage loss weight overrides.  Any subset of stages / loss
+    # keys may be provided; missing entries fall back to DEFAULT_STAGE_WEIGHTS
+    # in config.py.  Example:
+    #   {"capacity": {"mse": 1.0}, "finetune": {"lab": 0.2}}
+    stage_weights: dict[str, dict[str, float]] | None = None
 
     @model_validator(mode="after")
     def validate_device(self) -> ExperimentRequest:
@@ -63,11 +68,12 @@ class ExperimentRequest(BaseModel):
         return self
 
     def experiment_config(self) -> dict[str, Any]:
-        objective: dict[str, float | int] = {
-            "lambda_kakeya": min(self.lambda_kakeya, 0.1),
+        objective: dict[str, Any] = {
             "num_projections": min(self.num_projections, 128),
             "k": min(self.k, max(self.batch_size - 1, 1)),
         }
+        if self.stage_weights:
+            objective["stage_weights"] = self.stage_weights
         config = ExperimentConfig(
             method=self.method,
             epochs=self.epochs,

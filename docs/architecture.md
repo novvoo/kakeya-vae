@@ -130,7 +130,7 @@ graph TD
     QUANT -.->|latent| L1
 
     subgraph 损失加权
-        W[kakeya_weight<br/>lambda_kakeya = 0.001<br/>capacity_stage: override=None→0.001<br/>transition/finetune: override=None→config]
+        W[kakeya_weight<br/>来自 config.stage_weights()[stage].kakeya<br/>capacity 0.002 / transition 0.001 / finetune 0.0005<br/>rehearsal_loader override=0.0]
         KC[kakeya_contribution<br/>= kakeya_weight * coverage]
         TOTAL[total loss<br/>+= kakeya_contribution]
 
@@ -140,9 +140,9 @@ graph TD
     end
 
     subgraph 阶段策略
-        S1[Capacity Stage<br/>override=None→0.001<br/>从第1个epoch约束覆盖]
-        S2[Transition Stage<br/>override=None→0.001<br/>持续覆盖约束]
-        S3[Finetune Stage<br/>override=None→0.001<br/>持续覆盖正则]
+        S1[Capacity Stage<br/>kakeya 0.002<br/>从第1个epoch约束覆盖]
+        S2[Transition Stage<br/>kakeya 0.001<br/>持续覆盖约束]
+        S3[Finetune Stage<br/>kakeya 0.0005<br/>持续覆盖正则]
         S1 -.-> S2
         S2 -.-> S3
     end
@@ -394,15 +394,24 @@ graph LR
 
 ## 3. 损失函数组成
 
+stage 权重由 `config.stage_weights()` 提供（见 [config.py](../src/kakeya/config.py) 的 `DEFAULT_STAGE_WEIGHTS`），可在 YAML / API 通过 `objective.stage_weights` 覆盖任意子集，未覆盖项回退到默认值。代码读取逻辑见 [image_codec.py](../src/kakeya/image_codec.py) 的 `_epoch` 函数。
+
 ```mermaid
 graph TD
+    CFG[config.stage_weights<br/>DEFAULT_STAGE_WEIGHTS<br/>YAML / API 可覆盖]
+    CFG -->|stage_w = config.stage_weights()[stage]| STAGE{current stage}
+
     subgraph 分阶段损失调度
         direction LR
         S_CAP[Capacity Stage<br/>学方向覆盖]
         S_TRANS[Transition Stage<br/>平滑过渡]
         S_FT[Finetune Stage<br/>码率与感知优化]
-        S_CAP -->|逐步加入损失| S_TRANS -->|全部损失| S_FT
+        S_CAP -->|所有损失参与, 权重递增| S_TRANS -->|全部损失, 权重最高| S_FT
     end
+
+    STAGE --> S_CAP
+    STAGE --> S_TRANS
+    STAGE --> S_FT
 
     subgraph Capacity_Loss [Capacity 阶段损失]
         direction TB
@@ -410,38 +419,36 @@ graph TD
         C2[edge<br/>1.5 x L1 边缘]
         C3[multiscale<br/>0.25 x 多尺度 L1]
         C4[kl<br/>kl_weight x KL]
-        C5[kakeya<br/>0.002 x 覆盖正则]
+        C5[kakeya<br/>stage_w.kakeya x 覆盖正则<br/>默认 0.002]
+        C6[mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab<br/>默认 0.5 / 0.1 / 0.02]
     end
 
     subgraph Transition_Loss [Transition 阶段损失]
         direction TB
-        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya(0.001)]
-        T2[mse<br/>5.0 x MSE]
-        T3[lab<br/>0.05 x CIELAB ΔE]
+        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya<br/>默认 0.001]
+        T2[mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab<br/>默认 5.0 / 0.25 / 0.05]
     end
 
     subgraph Finetune_Loss [Finetune 阶段损失]
         direction TB
-        F1[reconstruction + edge + multiscale<br/>+ kl + kakeya(0.0005) + mse + lab]
-        F2[structural<br/>0.5 x 1-SSIM]
-        F3[rate<br/>rate_weight x 码率超限]
+        F1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya 默认 0.0005<br/>+ mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab 默认 5.0 / 0.5 / 0.10]
+        F2[rate<br/>rate_weight x 码率超限]
     end
 
-    S_CAP --> C1 & C2 & C3 & C4 & C5
-    S_TRANS --> T1 & T2 & T3
-    S_FT --> F1 & F2 & F3
+    S_CAP --> C1 & C2 & C3 & C4 & C5 & C6
+    S_TRANS --> T1 & T2
+    S_FT --> F1 & F2
 
     C1 --> CT[total loss<br/>stage-dependent]
     C2 --> CT
     C3 --> CT
     C4 --> CT
     C5 --> CT
+    C6 --> CT
     T1 --> CT
     T2 --> CT
-    T3 --> CT
     F1 --> CT
     F2 --> CT
-    F3 --> CT
 
     subgraph DetailWeight
         DW1[灰度边缘检测<br/>x8 梯度]
@@ -576,7 +583,7 @@ flowchart TD
     subgraph CAP [Capacity Stage 容量阶段]
         direction TB
         CAP_LR[LR: max lr, 1e-3<br/>高学习率]
-        CAP_LOSS[损失: recon + edge + multiscale<br/>+ kl + kakeya(0.002)<br/>无 mse / structural / lab]
+        CAP_LOSS[损失: 全部损失参与, 权重来自 config.stage_weights<br/>recon + edge + multiscale + kl<br/>+ kakeya(0.002) + mse(0.5)<br/>+ structural(0.1) + lab(0.02)<br/>低权重种子, 专注方向覆盖]
         CAP_REF[训练参考图<br/>capacity_loader<br/>32 steps]
         CAP_PROG[训练程序图<br/>train_loader<br/>多尺度 128-768]
         CAP_REAL[训练真实图<br/>real_loader]
@@ -591,7 +598,7 @@ flowchart TD
     subgraph TRANS [Transition Stage 过渡阶段]
         direction TB
         TRANS_LR[LR: max lr, 5e-4<br/>中等学习率]
-        TRANS_LOSS[损失: capacity 全部 + mse(5.0)<br/>+ lab(0.05)<br/>无 structural]
+        TRANS_LOSS[损失: config.stage_weights 权重递增<br/>capacity 全部 + mse(5.0)<br/>+ structural(0.25) + lab(0.05)]
         TRANS_KAKEYA[kakeya 权重: 0.001]
         TRANS_REF[训练参考图<br/>capacity_loader]
         TRANS_PROG[训练程序图<br/>train_loader]
@@ -607,7 +614,7 @@ flowchart TD
     subgraph FINETUNE [Finetune Stage 压缩微调]
         direction TB
         FT_LR[LR: config.lr<br/>0.0005]
-        FT_LOSS[损失: transition 全部<br/>+ structural(0.5) + lab(0.15) + rate<br/>全部损失项]
+        FT_LOSS[损失: config.stage_weights 权重最高<br/>transition 全部<br/>+ structural(0.5) + lab(0.10) + rate<br/>全部损失项]
         FT_KAKEYA[kakeya 权重: 0.0005]
         FT_WARMUP{gate 后<br/>≤ 10 epochs?}
         FT_WARMUP -->|是| FT_W[Warmup<br/>rate_weight=0.001<br/>grad_clip=10.0]
@@ -1063,41 +1070,41 @@ flowchart TD
 
 #### 9.5.2 失真问题的优化：分阶段损失调度
 
-训练后期出现明显失真，根因是**9 个损失项全程同时作用**——容量阶段的目标是学方向覆盖，感知损失（MSE/SSIM/lab）会干扰这个核心目标，导致梯度方向冲突、模型震荡。
+训练后期出现明显失真，根因是**部分损失项在后期才突然引入**——capacity/transition 阶段关闭 mse/structural，到 finetune 阶段才一次性启用，造成梯度方向突变、模型震荡。
 
-**解决方案：分阶段损失调度**——不同阶段启用不同的损失项，让模型先"看得宽"，再"看得清"。
+**解决方案：所有损失方向全程参与，各阶段仅权重递增**——让模型从第一轮就在所有损失方向上学习，避免后期冷启动造成的梯度突变，各阶段通过权重递进调整侧重。权重统一由 `config.stage_weights()` 管理（[config.py](../src/kakeya/config.py) `DEFAULT_STAGE_WEIGHTS`），可在 YAML / API 覆盖。
 
-| 阶段 | 启用的损失 | kakeya 权重 | 设计意图 |
-|------|-----------|-------------|----------|
-| Capacity | recon + edge + multiscale + kl + kakeya | 0.002 | 纯重建 + 正则，专注潜空间方向覆盖 |
-| Transition | capacity 全部 + mse(5.0) + lab(0.05) | 0.001 | 逐步引入感知约束，平滑过渡 |
-| Finetune | transition 全部 + structural(0.5) + lab(0.15) + rate | 0.0005 | 全部约束协同，优化最终码率与画质 |
+| 阶段 | 损失权重 (config.stage_weights) | kakeya | 设计意图 |
+|------|--------------------------------|--------|----------|
+| Capacity | mse 0.5 / structural 0.1 / lab 0.02 | 0.002 | 专注方向覆盖，mse/structural/lab 用低权重做"种子" |
+| Transition | mse 5.0 / structural 0.25 / lab 0.05 | 0.001 | 权重递增，感知约束逐步强化 |
+| Finetune | mse 5.0 / structural 0.5 / lab 0.10 + rate | 0.0005 | 全部权重最高，协同优化码率与画质 |
 
 ```mermaid
 flowchart TD
     subgraph 问题现象
         P1[训练后期失真明显<br/>细节模糊 / 色块 / 偏色]
-        P2[损失曲线震荡<br/>多个损失项梯度方向冲突]
+        P2[损失曲线震荡<br/>损失项突然加入造成梯度突变]
     end
 
     subgraph 根因分析
-        R1[9 个损失项全程同时作用]
-        R2[容量阶段目标: 学方向覆盖<br/>感知损失干扰核心目标]
-        R3[过渡不平滑<br/>损失项突然全部加入]
+        R1[部分损失项后期才启用]
+        R2[capacity/transition 关闭 mse/structural<br/>finetune 一次性启用]
+        R3[冷启动梯度方向<br/>与已学方向冲突]
         R1 --> R2 --> R3
     end
 
-    subgraph 解决方案：分阶段损失调度
-        S1[Capacity: 仅重建+正则<br/>recon + edge + multiscale<br/>+ kl + kakeya(0.002)]
-        S2[Transition: 逐步加入感知<br/>+ mse(5.0) + lab(0.05)<br/>kakeya=0.001]
-        S3[Finetune: 全部损失<br/>+ structural(0.5) + lab(0.15) + rate<br/>kakeya=0.0005]
+    subgraph 解决方案：所有损失全程参与，权重递增
+        S1[Capacity: 全部损失参与<br/>mse 0.5 / structural 0.1 / lab 0.02<br/>kakeya 0.002]
+        S2[Transition: 权重递增<br/>mse 5.0 / structural 0.25 / lab 0.05<br/>kakeya 0.001]
+        S3[Finetune: 权重最高<br/>structural 0.5 / lab 0.10 + rate<br/>kakeya 0.0005]
         S1 --> S2 --> S3
     end
 
     subgraph 效果
-        E1[容量阶段更纯粹<br/>方向覆盖更充分]
-        E2[过渡更平滑<br/>避免梯度方向突变]
-        E3[微调更精细<br/>感知质量更优]
+        E1[无冷启动<br/>所有方向从早期学习]
+        E2[过渡平滑<br/>权重递进避免梯度突变]
+        E3[微调精细<br/>感知质量更优]
         E4[整体失真明显减少]
         E1 --> E2 --> E3 --> E4
     end
@@ -1110,7 +1117,7 @@ flowchart TD
     style P1 fill:#ffcdd2
     style P2 fill:#ffcdd2
     style R1 fill:#fce4ec
-    style S4 fill:#c8e6c9
+    style S3 fill:#c8e6c9
 ```
 
 #### 9.5.3 经验教训：损失函数 vs 数据质量

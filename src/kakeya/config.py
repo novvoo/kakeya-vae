@@ -17,6 +17,31 @@ SUPPORTED_METHODS = {
     "poly_kakeya",
 }
 
+# Default per-stage loss weights for image_codec training.  Every loss
+# direction participates from the first epoch; stages only differ in how
+# much weight each loss carries.  Users can override any subset of these
+# via config.objective.stage_weights in YAML / API.
+DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
+    "capacity": {
+        "kakeya": 0.002,
+        "mse": 0.5,
+        "structural": 0.1,
+        "lab": 0.02,
+    },
+    "transition": {
+        "kakeya": 0.001,
+        "mse": 5.0,
+        "structural": 0.25,
+        "lab": 0.05,
+    },
+    "finetune": {
+        "kakeya": 0.0005,
+        "mse": 5.0,
+        "structural": 0.5,
+        "lab": 0.10,
+    },
+}
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -32,7 +57,12 @@ class ExperimentConfig:
     train_limit: int | None = None
     test_limit: int | None = None
     download: bool = True
-    objective: dict[str, float | int] = field(default_factory=dict)
+    # objective is an open map so that method-specific parameters (e.g.
+    # num_projections, k) and the nested stage_weights table can both live
+    # here without schema churn.  stage_weights, when present, must be a
+    # mapping of stage -> {loss_name: weight}; missing stages / losses fall
+    # back to DEFAULT_STAGE_WEIGHTS.
+    objective: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "data_dir", Path(self.data_dir))
@@ -51,6 +81,20 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be positive when provided")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
+
+    def stage_weights(self) -> dict[str, dict[str, float]]:
+        """Merge user-provided stage_weights over DEFAULT_STAGE_WEIGHTS."""
+        merged = {stage: dict(weights) for stage, weights in DEFAULT_STAGE_WEIGHTS.items()}
+        override = self.objective.get("stage_weights")
+        if isinstance(override, dict):
+            for stage, weights in override.items():
+                if not isinstance(weights, dict):
+                    continue
+                merged.setdefault(stage, {})
+                for key, value in weights.items():
+                    if isinstance(value, (int, float)):
+                        merged[stage][key] = float(value)
+        return merged
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)

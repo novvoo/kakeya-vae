@@ -947,27 +947,18 @@ def _epoch(
                     num_projections=int(config.objective.get("num_projections", 32)),
                     k=int(config.objective.get("k", 8)),
                 )
-                if stage == "capacity":
-                    # All loss directions are active from the very first epoch;
-                    # only their weights differ across stages.  Low weights on
-                    # mse/structural here let capacity training stay focused on
-                    # reconstruction + kakeya coverage while still seeding the
-                    # pixel-error and structure gradients so transition/finetune
-                    # don't have to cold-start them.
-                    kakeya_default = 0.002
-                    mse_w = 0.5
-                    structural_w = 0.1
-                    lab_w = 0.02
-                elif stage == "transition":
-                    kakeya_default = 0.001
-                    mse_w = 5.0
-                    structural_w = 0.25
-                    lab_w = 0.05
-                else:
-                    kakeya_default = 0.0005
-                    mse_w = 5.0
-                    structural_w = 0.5
-                    lab_w = 0.10
+                # All loss directions are active from the very first epoch;
+                # only their weights differ across stages.  Capacity keeps
+                # mse/structural/lab at low weight to stay focused on
+                # reconstruction + kakeya coverage while still seeding those
+                # gradients so transition/finetune don't cold-start them.
+                # Weights come from config.stage_weights() (overridable via
+                # config.objective.stage_weights in YAML / API).
+                stage_w = config.stage_weights()[stage]
+                kakeya_default = stage_w["kakeya"]
+                mse_w = stage_w["mse"]
+                structural_w = stage_w["structural"]
+                lab_w = stage_w["lab"]
                 if kakeya_weight_override is not None:
                     kakeya_weight = kakeya_weight_override
                 else:

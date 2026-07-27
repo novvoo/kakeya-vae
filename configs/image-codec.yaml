@@ -10,6 +10,24 @@ num_workers: 0
 train_limit: 128
 download: false
 objective:
-  lambda_kakeya: 0.001
   num_projections: 32
   k: 3
+  # Per-stage loss weights.  Every loss direction participates from the
+  # first epoch; stages only differ in weights.  Any subset may be omitted
+  # to inherit the defaults from DEFAULT_STAGE_WEIGHTS in config.py.
+  stage_weights:
+    capacity:
+      kakeya: 0.002
+      mse: 0.5
+      structural: 0.1
+      lab: 0.02
+    transition:
+      kakeya: 0.001
+      mse: 5.0
+      structural: 0.25
+      lab: 0.05
+    finetune:
+      kakeya: 0.0005
+      mse: 5.0
+      structural: 0.5
+      lab: 0.10
