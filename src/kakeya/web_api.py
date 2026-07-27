@@ -131,6 +131,13 @@ def environment() -> dict[str, Any]:
     return manager.environment()
 
 
+@app.get("/api/defaults")
+def defaults() -> dict[str, Any]:
+    from kakeya.config import DEFAULT_STAGE_WEIGHTS
+
+    return {"stage_weights": DEFAULT_STAGE_WEIGHTS}
+
+
 @app.get("/api/test-image")
 def test_image() -> FileResponse:
     return FileResponse(TEST_IMAGE, media_type="image/png", filename=TEST_IMAGE.name)

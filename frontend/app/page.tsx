@@ -257,6 +257,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [defaultStageWeights, setDefaultStageWeights] = useState<StageWeights | null>(null);
   const eventSource = useRef<EventSource | null>(null);
 
   const refreshEnvironment = useCallback(async () => {
@@ -274,11 +275,21 @@ export default function Home() {
       // The environment banner already communicates backend connectivity.
     }
   }, []);
+  
+  const refreshDefaults = useCallback(async () => {
+    try {
+      const data = await api<{ stage_weights: StageWeights }>("/api/defaults");
+      setDefaultStageWeights(data.stage_weights);
+    } catch {
+      // Backend may be older version without /api/defaults; stay with fallback.
+    }
+  }, []);
 
   useEffect(() => {
     const initial = window.setTimeout(() => {
       refreshEnvironment();
       refreshJobs();
+      refreshDefaults();
     }, 0);
     const timer = window.setInterval(() => {
       refreshEnvironment();
@@ -288,7 +299,7 @@ export default function Home() {
       window.clearTimeout(initial);
       window.clearInterval(timer);
     };
-  }, [refreshEnvironment, refreshJobs]);
+  }, [refreshEnvironment, refreshJobs, refreshDefaults]);
 
   useEffect(
     () => () => {
@@ -563,7 +574,7 @@ export default function Home() {
             </label>
           </div>
 
-          <ObjectiveFields config={config} setConfig={setConfig} />
+          <ObjectiveFields config={config} setConfig={setConfig} defaultStageWeights={defaultStageWeights} />
 
           <button
             className="primary-action"
@@ -957,9 +968,11 @@ function trainingState(
 function ObjectiveFields({
   config,
   setConfig,
+  defaultStageWeights,
 }: {
   config: ExperimentConfig;
   setConfig: (config: ExperimentConfig) => void;
+  defaultStageWeights: StageWeights | null;
 }) {
   return (
     <div className="objective-box">
@@ -1043,36 +1056,30 @@ function ObjectiveFields({
         )}
       </div>
       {config.method === "image_codec" && (
-        <StageWeightsEditor config={config} setConfig={setConfig} />
+        <StageWeightsEditor config={config} setConfig={setConfig} defaultStageWeights={defaultStageWeights} />
       )}
     </div>
   );
 }
 
-const STAGE_DEFAULTS: Required<{
-  [K in keyof StageWeights]: Required<NonNullable<StageWeights[K]>>;
-}> = {
-  capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02, hue: 0.01, saturation: 0.01 },
-  transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05, hue: 0.03, saturation: 0.03 },
-  finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10, hue: 0.06, saturation: 0.06 },
-};
-
 function StageWeightsEditor({
   config,
   setConfig,
+  defaultStageWeights,
 }: {
   config: ExperimentConfig;
   setConfig: (config: ExperimentConfig) => void;
+  defaultStageWeights: StageWeights | null;
 }) {
   const stages: Array<keyof StageWeights> = ["capacity", "transition", "finetune"];
   const lossKeys: Array<keyof NonNullable<StageWeights["capacity"]>> = [
-    "kakeya",
-    "mse",
-    "structural",
-    "lab",
-    "hue",
-    "saturation",
+    "kakeya", "mse", "structural", "lab", "hue", "saturation",
   ];
+  const stageFallback: Record<string, Record<string, number>> = {
+    capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02, hue: 0.02, saturation: 0.02 },
+    transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05, hue: 0.05, saturation: 0.05 },
+    finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10, hue: 0.10, saturation: 0.10 },
+  };
   const current = config.stage_weights ?? {};
   const update = (
     stage: keyof StageWeights,
@@ -1100,10 +1107,9 @@ function StageWeightsEditor({
         </thead>
         <tbody>
           {stages.map((stage) => {
-            const stageObj = { ...STAGE_DEFAULTS[stage], ...(current[stage] ?? {}) };
+            const stageObj = { ...(defaultStageWeights?.[stage] ?? stageFallback[stage]), ...(current[stage] ?? {}) };
             return (
               <tr key={stage}>
-                <td>{stage}</td>
                 {lossKeys.map((key) => (
                   <td key={key}>
                     <input
