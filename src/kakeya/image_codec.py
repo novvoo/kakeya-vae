@@ -776,17 +776,14 @@ def train_image_codec(
             else "finetune"
         )
 
-        # Stage-dependent learning rate
-        if capacity_stage:
-            current_lr = max(config.learning_rate, 1e-3)
+        # Stage-dependent learning rate — finetune stays high to maintain convergence speed.
+        current_lr = config.learning_rate
+        if capacity_stage or not transition_stage:
+            current_lr = max(current_lr, 1e-3)
         elif transition_stage:
-            current_lr = max(config.learning_rate, 5e-4)
-        else:
-            current_lr = config.learning_rate
+            current_lr = max(current_lr, 5e-4)
         for group in optimizer.param_groups:
             group["lr"] = current_lr
-
-        # Rate weight and grad clip
         if capacity_stage:
             rate_weight = 0.0
             grad_clip = None
@@ -828,6 +825,11 @@ def train_image_codec(
                 for key in ref_metrics
             }
         else:
+            # Finetune/transition: train on procedural + real + rehearsal (reference card)
+            ref_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=capacity_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
             prog_metrics = _hyperprior_epoch(
                 **epoch_kw, loader=train_loader, optimizer=optimizer,
                 aux_optimizer=aux_optimizer,
@@ -837,8 +839,8 @@ def train_image_codec(
                 aux_optimizer=aux_optimizer,
             )
             train_metrics = {
-                key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
-                for key in prog_metrics
+                key: 0.25 * ref_metrics[key] + 0.375 * prog_metrics[key] + 0.375 * real_metrics[key]
+                for key in ref_metrics
             }
 
         validation_metrics = _hyperprior_epoch(
