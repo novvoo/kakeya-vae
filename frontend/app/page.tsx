@@ -64,9 +64,9 @@ type Environment = {
 };
 
 type StageWeights = {
-  capacity?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
-  transition?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
-  finetune?: { kakeya?: number; mse?: number; structural?: number; lab?: number };
+  capacity?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
+  transition?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
+  finetune?: { kakeya?: number; mse?: number; structural?: number; lab?: number; hue?: number; saturation?: number };
 };
 
 type ExperimentConfig = {
@@ -1052,9 +1052,9 @@ function ObjectiveFields({
 const STAGE_DEFAULTS: Required<{
   [K in keyof StageWeights]: Required<NonNullable<StageWeights[K]>>;
 }> = {
-  capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02 },
-  transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05 },
-  finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10 },
+  capacity: { kakeya: 0.002, mse: 0.5, structural: 0.1, lab: 0.02, hue: 0.01, saturation: 0.01 },
+  transition: { kakeya: 0.001, mse: 5.0, structural: 0.25, lab: 0.05, hue: 0.03, saturation: 0.03 },
+  finetune: { kakeya: 0.0005, mse: 5.0, structural: 0.5, lab: 0.10, hue: 0.06, saturation: 0.06 },
 };
 
 function StageWeightsEditor({
@@ -1070,6 +1070,8 @@ function StageWeightsEditor({
     "mse",
     "structural",
     "lab",
+    "hue",
+    "saturation",
   ];
   const current = config.stage_weights ?? {};
   const update = (
@@ -1113,7 +1115,11 @@ function StageWeightsEditor({
                             ? 0.5
                             : key === "structural"
                               ? 0.05
-                              : 0.01
+                              : key === "lab"
+                                ? 0.01
+                                : key === "hue"
+                                  ? 0.01
+                                  : 0.01
                       }
                       min={0}
                       value={stageObj[key]}

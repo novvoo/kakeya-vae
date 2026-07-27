@@ -27,18 +27,24 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "mse": 0.5,
         "structural": 0.1,
         "lab": 0.02,
+        "hue": 0.01,
+        "saturation": 0.01,
     },
     "transition": {
         "kakeya": 0.001,
         "mse": 5.0,
         "structural": 0.25,
         "lab": 0.05,
+        "hue": 0.03,
+        "saturation": 0.03,
     },
     "finetune": {
         "kakeya": 0.0005,
         "mse": 5.0,
         "structural": 0.5,
         "lab": 0.10,
+        "hue": 0.06,
+        "saturation": 0.06,
     },
 }
 

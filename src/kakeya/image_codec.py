@@ -934,7 +934,10 @@ def _epoch(
                 edge = F.l1_loss(_edges(reconstructed), _edges(images))
                 structural = 1 - _ssim(reconstructed, images)
                 multiscale = _multiscale_l1(reconstructed, images)
-                lab = _lab_loss(reconstructed, images)
+                lab_losses = _lab_losses(reconstructed, images)
+                lab = lab_losses["delta_e"]
+                hue = lab_losses["hue"]
+                saturation = lab_losses["saturation"]
                 kl = -0.5 * (1 + log_var - mu.square() - log_var.exp()).mean()
                 latent_points = latent.permute(0, 2, 3, 1).reshape(
                     -1, latent.size(1)
@@ -959,6 +962,8 @@ def _epoch(
                 mse_w = stage_w["mse"]
                 structural_w = stage_w["structural"]
                 lab_w = stage_w["lab"]
+                hue_w = stage_w["hue"]
+                saturation_w = stage_w["saturation"]
                 if kakeya_weight_override is not None:
                     kakeya_weight = kakeya_weight_override
                 else:
@@ -966,6 +971,8 @@ def _epoch(
                 kl_contribution = kl_weight * kl
                 kakeya_contribution = kakeya_weight * coverage
                 lab_contribution = lab_w * lab
+                hue_contribution = hue_w * hue
+                saturation_contribution = saturation_w * saturation
                 rate_excess_bpp = (
                     F.relu(rate_bpp - TARGET_RATE_BPP)
                     if use_entropy
@@ -986,6 +993,8 @@ def _epoch(
                     + kl_contribution
                     + kakeya_contribution
                     + lab_contribution
+                    + hue_contribution
+                    + saturation_contribution
                     + rate_contribution
                 )
                 if optimizer is not None:
@@ -1015,9 +1024,13 @@ def _epoch(
                 ("kl", kl),
                 ("kakeya", coverage),
                 ("lab", lab),
+                ("hue", hue),
+                ("saturation", saturation),
                 ("kl_contribution", kl_contribution),
                 ("kakeya_contribution", kakeya_contribution),
                 ("lab_contribution", lab_contribution),
+                ("hue_contribution", hue_contribution),
+                ("saturation_contribution", saturation_contribution),
                 ("rate_bpp", rate_bpp),
                 ("rate_excess_bpp", rate_excess_bpp),
                 ("rate_contribution", rate_contribution),
@@ -1500,7 +1513,14 @@ def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
     return torch.cat([L, a, b], dim=1)
 
 
-def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _lab_losses(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """CIELAB-based color losses: ΔE, hue, and saturation.
+
+    All returns are normalized to ~O(1) scale so that stage weights stay
+    on the same order as other loss weights.
+    """
     rec_lab = _rgb_to_lab(reconstructed)
     tgt_lab = _rgb_to_lab(target)
     diff = rec_lab - tgt_lab
@@ -1511,13 +1531,18 @@ def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
         + chroma_weight * diff[:, 1:2, :, :].pow(2)
         + chroma_weight * diff[:, 2:3, :, :].pow(2)
         + 1e-8,
-    )
-    # Normalize ΔE (typical scale 5-10 for recon errors) down to ~O(1) so
-    # that lab_w stays on the same order as other loss weights.  Without
-    # this, lab_w=0.10 * ΔE≈7 ≈ 0.7 dominates total and makes it look like
-    # the model regressed when entering finetune, even though reconstruction
-    # is actually improving.
-    return delta_e.mean() / 7.0
+    ).mean() / 7.0
+    # Hue: 1 - cos(Δh) handles angular wraparound, range [0, 2].
+    a_rec, b_rec = rec_lab[:, 1:2, :, :], rec_lab[:, 2:3, :, :]
+    a_tgt, b_tgt = tgt_lab[:, 1:2, :, :], tgt_lab[:, 2:3, :, :]
+    h_rec = torch.atan2(b_rec, a_rec)
+    h_tgt = torch.atan2(b_tgt, a_tgt)
+    hue = (1.0 - torch.cos(h_rec - h_tgt)).mean() / 2.0
+    # Saturation: |Δchroma|, typical chroma scale 0-50.
+    C_rec = torch.sqrt(a_rec.pow(2) + b_rec.pow(2) + 1e-8)
+    C_tgt = torch.sqrt(a_tgt.pow(2) + b_tgt.pow(2) + 1e-8)
+    saturation = (C_rec - C_tgt).abs().mean() / 10.0
+    return {"delta_e": delta_e, "hue": hue, "saturation": saturation}
 
 
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:
