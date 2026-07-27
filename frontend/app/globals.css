@@ -1432,6 +1432,57 @@ button.upload-btn:disabled {
   line-height: 1.5;
 }
 
+.training-stages {
+  display: grid;
+  gap: 10px;
+}
+
+.training-stages .section-index {
+  margin: 0;
+}
+
+.stage-bar {
+  display: flex;
+  height: 60px;
+  border-radius: 8px;
+  overflow: hidden;
+  gap: 2px;
+  background: var(--border);
+}
+
+.stage-segment {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 6px 8px;
+  min-width: 0;
+  text-align: center;
+}
+
+.stage-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #1a1a1a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stage-epochs {
+  font-size: 11px;
+  color: #333;
+}
+
+.stage-desc {
+  font-size: 10px;
+  color: #555;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .codec-verdict strong {
   flex: 0 0 auto;
 }

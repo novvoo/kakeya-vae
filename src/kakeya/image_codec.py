@@ -951,7 +951,7 @@ def _epoch(
                     kakeya_default = 0.002
                     mse_w = 0.0
                     structural_w = 0.0
-                    lab_w = 0.0
+                    lab_w = 0.02
                 elif stage == "transition":
                     kakeya_default = 0.001
                     mse_w = 5.0
@@ -961,7 +961,7 @@ def _epoch(
                     kakeya_default = 0.0005
                     mse_w = 5.0
                     structural_w = 0.5
-                    lab_w = _LAMBDA_LAB
+                    lab_w = 0.10
                 if kakeya_weight_override is not None:
                     kakeya_weight = kakeya_weight_override
                 else:
@@ -1516,9 +1516,6 @@ def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
         + 1e-8,
     )
     return delta_e.mean()
-
-
-_LAMBDA_LAB = 0.15
 
 
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:

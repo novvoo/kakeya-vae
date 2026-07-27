@@ -600,6 +600,23 @@ export default function Home() {
                   </strong>
                 </div>
                 <div>
+                  <span>阶段</span>
+                  <strong>
+                    {activeJob.series.length
+                      ? (() => {
+                          const last = activeJob.series[activeJob.series.length - 1];
+                          const s = getStageFromPoint(last);
+                          const map = {
+                            capacity: "容量阶段",
+                            transition: "过渡阶段",
+                            finetune: "微调阶段",
+                          };
+                          return map[s];
+                        })()
+                      : "—"}
+                  </strong>
+                </div>
+                <div>
                   <span>进度</span>
                   <strong>{Math.round(activeJob.progress * 100)}%</strong>
                 </div>
@@ -1041,6 +1058,42 @@ function NumberField({
   );
 }
 
+function getStageFromPoint(point: SeriesPoint): "capacity" | "transition" | "finetune" {
+  const train = point.train;
+  if (train.capacity_stage >= 0.5) return "capacity";
+  if (!train.capacity_gate_passed) return "capacity";
+  const gateEpoch = train.capacity_gate_epoch ?? 0;
+  const epoch = point.epoch;
+  const epochsSinceGate = epoch - gateEpoch;
+  if (epochsSinceGate <= 5) return "transition";
+  return "finetune";
+}
+
+function getStageRanges(series: SeriesPoint[]): Array<{
+  stage: "capacity" | "transition" | "finetune";
+  startIndex: number;
+  endIndex: number;
+}> {
+  if (!series.length) return [];
+  const ranges: Array<{
+    stage: "capacity" | "transition" | "finetune";
+    startIndex: number;
+    endIndex: number;
+  }> = [];
+  let currentStage = getStageFromPoint(series[0]);
+  let startIndex = 0;
+  for (let i = 1; i < series.length; i++) {
+    const s = getStageFromPoint(series[i]);
+    if (s !== currentStage) {
+      ranges.push({ stage: currentStage, startIndex, endIndex: i - 1 });
+      currentStage = s;
+      startIndex = i;
+    }
+  }
+  ranges.push({ stage: currentStage, startIndex, endIndex: series.length - 1 });
+  return ranges;
+}
+
 function LossChart({ series }: { series: SeriesPoint[] }) {
   const hasGeneralization = series.some((point) =>
     Number.isFinite(point.validation.generalization_total),
@@ -1104,6 +1157,47 @@ function LossChart({ series }: { series: SeriesPoint[] }) {
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="训练和验证总损失曲线">
         <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} className="axis" />
         <line x1={padding} y1={padding} x2={padding} y2={height - padding} className="axis" />
+        {getStageRanges(series).map((range, i) => {
+          const xStart =
+            padding +
+            (range.startIndex / Math.max(series.length - 1, 1)) * (width - padding * 2);
+          const xEnd =
+            padding +
+            (range.endIndex / Math.max(series.length - 1, 1)) * (width - padding * 2);
+          const rectWidth = Math.max(xEnd - xStart, 1);
+          const colorMap = {
+            capacity: "rgba(187, 222, 251, 0.25)",
+            transition: "rgba(255, 224, 178, 0.25)",
+            finetune: "rgba(248, 187, 208, 0.25)",
+          };
+          const labelMap = {
+            capacity: "容量阶段",
+            transition: "过渡阶段",
+            finetune: "微调阶段",
+          };
+          return (
+            <g key={i}>
+              <rect
+                x={xStart}
+                y={padding}
+                width={rectWidth}
+                height={height - padding * 2}
+                fill={colorMap[range.stage]}
+                rx={2}
+              />
+              <text
+                x={(xStart + xEnd) / 2}
+                y={padding + 14}
+                textAnchor="middle"
+                fontSize={11}
+                fill="#555"
+                style={{ pointerEvents: "none" }}
+              >
+                {labelMap[range.stage]}
+              </text>
+            </g>
+          );
+        })}
         <polyline points={points("train")} className="loss-line train-line" />
         <polyline points={points("validation")} className="loss-line validation-line" />
         {hasGeneralization && (
@@ -1467,6 +1561,59 @@ function ImageCodecResults({
                 {training.selected_checkpoint_rate_bpp?.toFixed(3)} bpp。
               </small>
             )}
+          </div>
+        </div>
+      )}
+      {training && training.capacity_gate_passed && (
+        <div className="training-stages">
+          <p className="section-index">TRAINING STAGES</p>
+          <div className="stage-bar">
+            {(() => {
+              const gateEpoch = training.capacity_gate_epoch ?? 0;
+              const transitionEpochs = 5;
+              const finetuneEpochs = Math.max(
+                0,
+                training.compression_finetune_epochs - transitionEpochs,
+              );
+              const total = gateEpoch + transitionEpochs + finetuneEpochs;
+              const stages = [
+                {
+                  label: "容量阶段",
+                  epochs: gateEpoch,
+                  color: "#bbdefb",
+                  desc: "方向覆盖 + 基础重建",
+                },
+                {
+                  label: "过渡阶段",
+                  epochs: transitionEpochs,
+                  color: "#ffe0b2",
+                  desc: "逐步引入感知损失",
+                },
+                {
+                  label: "微调阶段",
+                  epochs: finetuneEpochs,
+                  color: "#f8bbd0",
+                  desc: "码率 + 感知质量优化",
+                },
+              ];
+              return stages.map((s, i) => {
+                const width = total > 0 ? (s.epochs / total) * 100 : 0;
+                return (
+                  <div
+                    key={i}
+                    className="stage-segment"
+                    style={{
+                      width: `${width}%`,
+                      backgroundColor: s.color,
+                    }}
+                  >
+                    <span className="stage-label">{s.label}</span>
+                    <span className="stage-epochs">{s.epochs} 轮</span>
+                    <span className="stage-desc">{s.desc}</span>
+                  </div>
+                );
+              });
+            })()}
           </div>
         </div>
       )}
