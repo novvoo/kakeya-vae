@@ -1512,7 +1512,12 @@ def _lab_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
         + chroma_weight * diff[:, 2:3, :, :].pow(2)
         + 1e-8,
     )
-    return delta_e.mean()
+    # Normalize ΔE (typical scale 5-10 for recon errors) down to ~O(1) so
+    # that lab_w stays on the same order as other loss weights.  Without
+    # this, lab_w=0.10 * ΔE≈7 ≈ 0.7 dominates total and makes it look like
+    # the model regressed when entering finetune, even though reconstruction
+    # is actually improving.
+    return delta_e.mean() / 7.0
 
 
 def _detail_weight(image: torch.Tensor) -> torch.Tensor:
