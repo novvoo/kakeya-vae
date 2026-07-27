@@ -24,9 +24,8 @@ from kakeya.job_manager import JobManager
 
 manager = JobManager()
 
-
 class ExperimentRequest(BaseModel):
-    method: Literal["image_codec"] = "image_codec"
+    method: Literal["image_codec", "hyperprior_kakeya"] = "image_codec"
     epochs: Annotated[int, Field(ge=1, le=500)] = 80
     latent_dim: Annotated[int, Field(ge=2, le=256)] = 16
     batch_size: Annotated[int, Field(ge=1, le=2048)] = 4
@@ -40,11 +39,8 @@ class ExperimentRequest(BaseModel):
     gamma: Annotated[float, Field(ge=0, le=1000)] = 10.0
     num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
     k: Annotated[int, Field(ge=1, le=4096)] = 3
-    # Optional per-stage loss weight overrides.  Any subset of stages / loss
-    # keys may be provided; missing entries fall back to DEFAULT_STAGE_WEIGHTS
-    # in config.py.  Example:
-    #   {"capacity": {"mse": 1.0}, "finetune": {"lab": 0.2}}
-    stage_weights: dict[str, dict[str, float]] | None = None
+    lambda_rate: Annotated[float, Field(gt=0, le=100)] = 1.0
+    lambda_kakeya: Annotated[float, Field(ge=0, le=10)] = 0.001
 
     @model_validator(mode="after")
     def validate_device(self) -> ExperimentRequest:
@@ -69,9 +65,9 @@ class ExperimentRequest(BaseModel):
         objective: dict[str, Any] = {
             "num_projections": min(self.num_projections, 128),
             "k": min(self.k, max(self.batch_size - 1, 1)),
+            "lambda_rate": self.lambda_rate,
+            "lambda_kakeya": self.lambda_kakeya,
         }
-        if self.stage_weights:
-            objective["stage_weights"] = self.stage_weights
         config = ExperimentConfig(
             method=self.method,
             epochs=self.epochs,
@@ -89,13 +85,11 @@ class ExperimentRequest(BaseModel):
         )
         return config.to_dict()
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
     yield
     manager.shutdown()
-
 
 app = FastAPI(
     title="Kakeya Lab API",
@@ -118,45 +112,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-
 
 @app.get("/api/environment")
 def environment() -> dict[str, Any]:
     return manager.environment()
 
-
 @app.get("/api/defaults")
 def defaults() -> dict[str, Any]:
     from kakeya.config import DEFAULT_STAGE_WEIGHTS
 
-    return {"stage_weights": DEFAULT_STAGE_WEIGHTS}
-
-
 @app.get("/api/test-image")
 def test_image() -> FileResponse:
     return FileResponse(TEST_IMAGE, media_type="image/png", filename=TEST_IMAGE.name)
-
 
 @app.post("/api/environment/install", status_code=202)
 def install_dependencies() -> dict[str, str]:
     manager.install_dependencies()
     return {"status": "accepted"}
 
-
 @app.get("/api/experiments")
 def list_experiments() -> list[dict[str, Any]]:
     return manager.list()
-
 
 @app.post("/api/experiments", status_code=202)
 def create_experiment(request: ExperimentRequest) -> dict[str, Any]:
     record = manager.create(request.experiment_config(), request.device)
     return record.public()
-
 
 @app.get("/api/experiments/{job_id}")
 def get_experiment(job_id: str) -> dict[str, Any]:
@@ -165,14 +149,12 @@ def get_experiment(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="实验不存在")
     return record.public()
 
-
 @app.post("/api/experiments/{job_id}/stop", status_code=202)
 def stop_experiment(job_id: str) -> dict[str, Any]:
     record = manager.get(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="实验不存在")
     return manager.stop(job_id).public()
-
 
 @app.get("/api/experiments/{job_id}/result")
 def experiment_result(job_id: str) -> dict[str, Any]:
@@ -183,7 +165,6 @@ def experiment_result(job_id: str) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=409, detail="实验结果尚未生成")
     return result
-
 
 @app.get("/api/experiments/{job_id}/image/{kind}")
 def experiment_image(
@@ -207,7 +188,6 @@ def experiment_image(
         raise HTTPException(status_code=404, detail="图像结果不存在")
     return FileResponse(image_path, media_type="image/png")
 
-
 @app.get("/api/experiments/{job_id}/artifact/bitstream")
 def experiment_bitstream(job_id: str) -> FileResponse:
     record = manager.get(job_id)
@@ -230,7 +210,6 @@ def experiment_bitstream(job_id: str) -> FileResponse:
         filename=bitstream.get("filename", "reconstruction.kky"),
     )
 
-
 @app.get("/api/experiments/{job_id}/artifact/checkpoint")
 def experiment_checkpoint(job_id: str) -> FileResponse:
     record = manager.get(job_id)
@@ -251,7 +230,6 @@ def experiment_checkpoint(job_id: str) -> FileResponse:
         filename="final.pt",
     )
 
-
 @app.post("/api/experiments/{job_id}/reconstruct")
 async def reconstruct_uploaded(
     job_id: str, file: Annotated[UploadFile, File(...)]
@@ -265,7 +243,6 @@ async def reconstruct_uploaded(
         raise HTTPException(status_code=404, detail="模型检查点不存在")
     image_bytes = await file.read()
     return _do_reconstruct(checkpoint_path, image_bytes)
-
 
 @app.post("/api/reconstruct-custom")
 async def reconstruct_custom_checkpoint(
@@ -287,7 +264,6 @@ async def reconstruct_custom_checkpoint(
         except OSError:
             pass
 
-
 def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]:
     import base64
     import io
@@ -297,7 +273,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     import torch
     import torch.nn.functional as F
 
-    from kakeya.image_codec import ImageCodecVAE, migrate_legacy_state_dict
+    from kakeya.image_codec import KakeyaHyperpriorCodec
 
     try:
         source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -406,7 +382,6 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
         },
     }
 
-
 def _ssim_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     import torch.nn.functional as F
 
@@ -420,7 +395,6 @@ def _ssim_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2))
         / ((mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2))
     ).mean()
-
 
 @app.post("/api/experiments/{job_id}/artifact/open-checkpoint-dir")
 def open_checkpoint_dir(job_id: str) -> dict[str, Any]:
@@ -441,7 +415,6 @@ def open_checkpoint_dir(job_id: str) -> dict[str, Any]:
     else:
         raise HTTPException(status_code=400, detail="不支持的操作系统")
     return {"ok": True, "path": str(checkpoints_dir)}
-
 
 @app.get("/api/experiments/{job_id}/events")
 async def experiment_events(job_id: str, request: Request) -> StreamingResponse:
@@ -472,7 +445,6 @@ async def experiment_events(job_id: str, request: Request) -> StreamingResponse:
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
-
 def main() -> None:
     uvicorn.run(
         "kakeya.web_api:app",
@@ -480,7 +452,6 @@ def main() -> None:
         port=int(os.environ.get("KAKEYA_API_PORT", "8000")),
         reload=False,
     )
-
 
 if __name__ == "__main__":
     main()

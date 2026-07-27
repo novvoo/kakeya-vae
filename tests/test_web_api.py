@@ -47,6 +47,8 @@ def test_request_builds_method_specific_objective() -> None:
     assert config["objective"] == {
         "num_projections": 16,
         "k": 3,
+        "lambda_rate": 1.0,
+        "lambda_kakeya": 0.001,
     }
 
 

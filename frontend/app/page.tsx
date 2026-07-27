@@ -63,12 +63,6 @@ type Environment = {
   };
 };
 
-type StageWeights = {
-  capacity?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
-  transition?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
-  finetune?: { kakeya?: number; mse?: number; structural?: number; edge?: number; multiscale?: number; lab?: number; hue?: number; saturation?: number };
-};
-
 type ExperimentConfig = {
   method: string;
   epochs: number;
@@ -83,7 +77,8 @@ type ExperimentConfig = {
   gamma: number;
   num_projections: number;
   k: number;
-  stage_weights?: StageWeights;
+  lambda_rate: number;
+  lambda_kakeya: number;
 };
 
 type ResultPayload = {
@@ -156,10 +151,12 @@ const DEFAULT_CONFIG: ExperimentConfig = {
   gamma: 10,
   num_projections: 32,
   k: 3,
+  lambda_rate: 1.0,
+  lambda_kakeya: 0.001,
 };
 
 const METHOD_LABELS: Record<string, string> = {
-  image_codec: "图文 Kakeya VAE (多尺度)",
+  image_codec: "Kakeya VAE (超先验 + 挂谷)",
 };
 
 const IMAGE_CODEC_REFERENCES = [
@@ -253,8 +250,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
-  const [defaultStageWeights, setDefaultStageWeights] = useState<StageWeights | null>(null);
-  const eventSource = useRef<EventSource | null>(null);
+    const eventSource = useRef<EventSource | null>(null);
 
   const refreshEnvironment = useCallback(async () => {
     try {
@@ -273,12 +269,7 @@ export default function Home() {
   }, []);
   
   const refreshDefaults = useCallback(async () => {
-    try {
-      const data = await api<{ stage_weights: StageWeights }>("/api/defaults");
-      setDefaultStageWeights(data.stage_weights);
-    } catch {
-      // Backend may be older version without /api/defaults; stay with fallback.
-    }
+    
   }, []);
 
   useEffect(() => {
@@ -396,22 +387,7 @@ export default function Home() {
     ["queued", "running", "evaluating", "stopping"].includes(activeJob.status);
 
   function changeMethod(method: string) {
-    if (method === "image_codec") {
-      setConfig({
-        ...config,
-        method,
-        epochs: 80,
-        latent_dim: 16,
-        batch_size: 4,
-        train_limit: 128,
-        test_limit: 0,
-        learning_rate: 0.0005,
-        num_projections: 32,
-        k: 3,
-      });
-      return;
-    }
-    if (config.method === "image_codec") {
+    if (["beta_vae", "beta_tcvae", "factor_vae"].includes(method)) {
       setConfig({ ...DEFAULT_CONFIG, method });
       return;
     }
@@ -569,7 +545,7 @@ export default function Home() {
             </label>
           </div>
 
-          <ObjectiveFields config={config} setConfig={setConfig} defaultStageWeights={defaultStageWeights} />
+          <ObjectiveFields config={config} setConfig={setConfig} />
 
           <button
             className="primary-action"
@@ -963,11 +939,9 @@ function trainingState(
 function ObjectiveFields({
   config,
   setConfig,
-  defaultStageWeights,
 }: {
   config: ExperimentConfig;
   setConfig: (config: ExperimentConfig) => void;
-  defaultStageWeights: StageWeights | null;
 }) {
   return (
     <div className="objective-box">
@@ -996,6 +970,26 @@ function ObjectiveFields({
         {config.method === "image_codec" && (
           <>
             <NumberField
+              label="率失真 λ"
+              value={config.lambda_rate}
+              min={0.001}
+              max={100}
+              step={0.001}
+              onChange={(lambda_rate) =>
+                setConfig({ ...config, lambda_rate })
+              }
+            />
+            <NumberField
+              label="挂谷 λₖ"
+              value={config.lambda_kakeya}
+              min={0}
+              max={10}
+              step={0.001}
+              onChange={(lambda_kakeya) =>
+                setConfig({ ...config, lambda_kakeya })
+              }
+            />
+            <NumberField
               label="随机投影数"
               value={config.num_projections}
               min={4}
@@ -1017,98 +1011,8 @@ function ObjectiveFields({
         )}
       </div>
       {config.method === "image_codec" && (
-        <StageWeightsEditor config={config} setConfig={setConfig} defaultStageWeights={defaultStageWeights} />
-      )}
-    </div>
-  );
-}
-
-function StageWeightsEditor({
-  config,
-  setConfig,
-  defaultStageWeights,
-}: {
-  config: ExperimentConfig;
-  setConfig: (config: ExperimentConfig) => void;
-  defaultStageWeights: StageWeights | null;
-}) {
-  const stages: Array<keyof StageWeights> = ["capacity", "transition", "finetune"];
-  const lossKeys: Array<keyof NonNullable<StageWeights["capacity"]>> = [
-    "kakeya", "mse", "edge", "structural", "multiscale", "lab", "hue", "saturation",
-  ];
-  const stageFallback: Record<string, Record<string, number>> = {
-    capacity: { kakeya: 0.01, mse: 0.5, edge: 1.0, structural: 0.1, multiscale: 0.1, lab: 0.02, hue: 0.01, saturation: 0.02 },
-    transition: { kakeya: 0.005, mse: 3.0, edge: 1.5, structural: 0.4, multiscale: 0.25, lab: 0.08, hue: 0.04, saturation: 0.05 },
-    finetune: { kakeya: 0.001, mse: 5.0, edge: 2.0, structural: 0.8, multiscale: 0.5, lab: 0.15, hue: 0.06, saturation: 0.08 },
-  };
-  const current = config.stage_weights ?? {};
-  const update = (
-    stage: keyof StageWeights,
-    key: keyof NonNullable<StageWeights["capacity"]>,
-    value: number,
-  ) => {
-    const stageObj = { ...(current[stage] ?? {}) };
-    stageObj[key] = value;
-    setConfig({
-      ...config,
-      stage_weights: { ...current, [stage]: stageObj },
-    });
-  };
-  return (
-    <div className="stage-weights-editor">
-      <p>分阶段损失权重 (config.stage_weights)</p>
-      <div style={{overflowX:"auto"}}><table className="stage-weights-table">
-        <thead>
-          <tr>
-            <th>阶段</th>
-            {lossKeys.map((k) => (
-              <th key={k}>{k}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {stages.map((stage) => {
-            const stageObj = { ...(defaultStageWeights?.[stage] ?? stageFallback[stage]), ...(current[stage] ?? {}) };
-            return (
-              <tr key={stage}>
-                    <td>{stage}</td>
-                {lossKeys.map((key) => (
-                  <td key={key}>
-                    <input
-                      type="number"
-                      step={
-                        key === "kakeya"
-                          ? 0.0005
-                          : key === "mse"
-                            ? 0.5
-                            : key === "edge"
-                              ? 0.25
-                              : key === "structural"
-                                ? 0.05
-                                : key === "multiscale"
-                                  ? 0.05
-                                  : key === "lab"
-                                    ? 0.01
-                                    : key === "hue"
-                                      ? 0.01
-                                      : 0.01
-                      }
-                      min={0}
-                      value={stageObj[key]}
-                      onChange={(e) =>
-                        update(stage, key, parseFloat(e.target.value) || 0)
-                      }
-                    />
-                  </td>
-                ))}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table></div>
-      <small>
-        所有损失方向从 capacity 阶段即启用，各阶段仅权重递增。留空使用默认值。
-      </small>
+          <p className="objective-note">单阶段端到端训练, 损失 = MSE + λ·rate + λₖ·kakeya</p>
+        )}
     </div>
   );
 }

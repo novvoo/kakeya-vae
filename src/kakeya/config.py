@@ -13,6 +13,7 @@ SUPPORTED_METHODS = {
     "beta_vae",
     "beta_tcvae",
     "factor_vae",
+    "hyperprior_kakeya",
     "image_codec",
 }
 
@@ -26,40 +27,6 @@ SUPPORTED_METHODS = {
 #   capacity   — build latent structure, light pixel constraints
 #   transition — smooth ramp to pixel accuracy after gate opens
 #   finetune   — maximize perceptual quality (SSIM, edges, color)
-DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
-    "capacity": {
-        "kakeya": 0.01,
-        "mse": 0.5,
-        "edge": 1.0,
-        "structural": 0.1,
-        "multiscale": 0.1,
-        "lab": 0.02,
-        "hue": 0.01,
-        "saturation": 0.02,
-    },
-    "transition": {
-        "kakeya": 0.005,
-        "mse": 3.0,
-        "edge": 1.5,
-        "structural": 0.4,
-        "multiscale": 0.25,
-        "lab": 0.08,
-        "hue": 0.04,
-        "saturation": 0.05,
-    },
-    "finetune": {
-        "kakeya": 0.001,
-        "mse": 5.0,
-        "edge": 2.0,
-        "structural": 0.8,
-        "multiscale": 0.5,
-        "lab": 0.15,
-        "hue": 0.06,
-        "saturation": 0.08,
-    },
-}
-
-
 @dataclass(frozen=True)
 class ExperimentConfig:
     method: str
@@ -98,20 +65,6 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be positive when provided")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
-
-    def stage_weights(self) -> dict[str, dict[str, float]]:
-        """Merge user-provided stage_weights over DEFAULT_STAGE_WEIGHTS."""
-        merged = {stage: dict(weights) for stage, weights in DEFAULT_STAGE_WEIGHTS.items()}
-        override = self.objective.get("stage_weights")
-        if isinstance(override, dict):
-            for stage, weights in override.items():
-                if not isinstance(weights, dict):
-                    continue
-                merged.setdefault(stage, {})
-                for key, value in weights.items():
-                    if isinstance(value, (int, float)):
-                        merged[stage][key] = float(value)
-        return merged
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)

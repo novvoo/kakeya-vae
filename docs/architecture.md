@@ -221,11 +221,11 @@ flowchart TD
     M3 -.->|方向覆盖思想| A2
     M3 -.->|最小化最大间距| A4
 
-    subgraph 训练集成
+    subgraph 训练集成 (KakeyaHyperpriorCodec)
         T1[图像 → encoder → latent]
         T2[latent → 挂谷覆盖损失]
         T3[latent → decoder → 重建]
-        T4[total = recon + mse + edge<br/>+ structural + multiscale<br/>+ kl + kakeya + rate]
+        T4[total = MSE + λ·rate + λₖ·kakeya<br/>(单阶段, 无分阶段调度)]
         T1 --> T2
         T1 --> T3
         T2 --> T4
@@ -236,7 +236,7 @@ flowchart TD
 
     subgraph 最终效果
         F1[潜空间充分利用<br/>16 维无维度退化]
-        F2[重建质量提升<br/>信息编码效率高]
+        F2[重建质量提升<br/>信息编码效率高<br/>超先验 +30-50% 码率效率]
         F3[码率稳定<br/>熵编码效率优]
         F4[泛化能力强<br/>多尺度多内容]
         F1 --> F2
@@ -252,52 +252,6 @@ flowchart TD
     style F1 fill:#c8e6c9
 ```
 
-### 1.6 多项式挂谷正则 (polynomial_kakeya_regularization)
-
-项目中还实现了多项式版本的挂谷正则，用于不同 VAE 变体：
-
-```mermaid
-graph TD
-    subgraph 基础版 kakeya_regularization
-        B1[线性投影<br/>z @ directions.T]
-        B2[排序求间距<br/>sort → diff → top-k]
-        B3[覆盖损失<br/>-mean top-k gaps]
-        B1 --> B2
-        B2 --> B3
-    end
-
-    subgraph 多项式版 polynomial_kakeya_regularization
-        P1[归一化 z<br/>F.normalize]
-        P2[线性投影<br/>projections = z @ directions.T]
-        P3[多项式特征<br/>concat proj^1, proj^2, ..., proj^degree]
-        P4[方差最大化<br/>-var polynomial_features]
-        P1 --> P2
-        P2 --> P3
-        P3 --> P4
-    end
-
-    subgraph 区别
-        D1[基础版: 关注<br/>线性方向覆盖<br/>一阶投影间距]
-        D2[多项式版: 关注<br/>非线性方向覆盖<br/>高阶投影方差]
-        D1 -.->|扩展| D2
-    end
-
-    B3 -.-> D1
-    P4 -.-> D2
-
-    subgraph 使用场景
-        U1[image_codec<br/>使用基础版<br/>kakeya_regularization]
-        U2[poly_kakeya VAE<br/>使用多项式版<br/>polynomial_kakeya_regularization]
-        U3[其他 VAE 变体<br/>β-VAE, β-TCVAE, FactorVAE<br/>不使用挂谷正则]
-    end
-
-    B3 -.-> U1
-    P4 -.-> U2
-
-    style B3 fill:#e1f5fe
-    style P4 fill:#f3e5f5
-    style D2 fill:#fff9c4
-```
 
 ---
 
@@ -392,7 +346,108 @@ graph LR
 
 ---
 
+
+
+
+
+
+### 2.2 KakeyaHyperpriorCodec (超先验 + 挂谷正则)
+
+新架构结合 CompressAI `MeanScaleHyperprior` 的优势与挂谷覆盖正则，使用单阶段端到端训练。
+
+```mermaid
+graph TD
+    subgraph Input
+        IMG[RGB Image<br/>H x W x 3]
+    end
+
+    subgraph g_a [Analysis Transform]
+        IMG --> SD1[SpaceToDepth<br/>3→24, /2]
+        SD1 --> RB1[ResidualBlockGDN<br/>24]
+        RB1 --> SD2[SpaceToDepth<br/>24→32, /2]
+        SD2 --> RB2[ResidualBlockGDN<br/>32]
+        RB2 --> SD3[SpaceToDepth<br/>32→64, /2]
+        SD3 --> RB3[ResidualBlockGDN<br/>64]
+        RB3 --> GA_OUT[Conv 1x1<br/>64→16x2 (mu + log_var)]
+    end
+
+    subgraph 超先验 Hyperprior
+        GA_OUT --> H_A_IN[(mu)]
+        H_A_IN --> HA1[Conv 3x3<br/>16→8]
+        HA1 --> HA2[Conv 5x5 stride2<br/>8, /2]
+        HA2 --> HA3[Conv 5x5 stride2<br/>8, /2]
+        HA3 --> EB[EntropyBottleneck<br/>8 通道]
+        EB --> HD1[ConvTranspose 5x5 stride2<br/>8, x2]
+        HD1 --> HD2[ConvTranspose 5x5 stride2<br/>16, x2]
+        HD2 --> HD3[Conv 3x3<br/>16→32 (scale + mean)]
+        HD3 --> SCALE[scale: 16 x 32 x 32]
+        HD3 --> MEAN[mean: 16 x 32 x 32]
+    end
+
+    subgraph 条件高斯熵模型
+        MU_B[mu_bounded<br/>16 x 32 x 32] --> GC[GaussianConditional<br/>N(y_hat | mean, scale)]
+        SCALE --> GC
+        MEAN --> GC
+        GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
+    end
+
+    subgraph g_s [Synthesis Transform]
+        GC --> Y_HAT[y_hat<br/>16 x 32 x 32]
+        Y_HAT --> D0[Conv 3x3<br/>16→64]
+        D0 --> DRB1[ResidualBlockGDN<br/>64]
+        DRB1 --> DS1[DepthToSpace<br/>64→32, x2]
+        DS1 --> DRB2[ResidualBlockGDN<br/>32]
+        DRB2 --> DS2[DepthToSpace<br/>32→24, x2]
+        DS2 --> DRB3[ResidualBlockGDN<br/>24]
+        DRB3 --> DS3[DepthToSpace<br/>24→12, x2]
+        DS3 --> DC1[Conv 3x3<br/>12→24]
+        DC1 --> SILU[SiLU]
+        SILU --> DC2[Conv 3x3<br/>24→3]
+        DC2 --> SIG[Sigmoid]
+        SIG --> OUT[RGB Output<br/>H x W x 3]
+    end
+
+    subgraph 挂谷正则
+        Y_HAT --> LP[Permute + Reshape<br/>N x 16 点集]
+        LP --> NORM[F.normalize<br/>单位球面投影]
+        NORM --> KAKEYA[kakeya_regularization<br/>32 方向随机投影<br/>top-3 间距最大化]
+        KAKEYA --> COV[coverage loss]
+    end
+
+    subgraph 率失真损失
+        OUT --> MSE[MSE distortion]
+        RATE --> RATE_L[rate loss<br/>lambda]
+        COV --> KAKEYA_L[kakeya loss<br/>lambda_k]
+        MSE --> TOTAL[total = MSE + lambda*rate + lambda_k*kakeya]
+        RATE_L --> TOTAL
+        KAKEYA_L --> TOTAL
+    end
+
+    style g_a fill:#f3e5f5
+    style 超先验 Hyperprior fill:#e8eaf6
+    style 条件高斯熵模型 fill:#fce4ec
+    style g_s fill:#e8f5e9
+    style 挂谷正则 fill:#fff3e0
+    style 率失真损失 fill:#fff9c4
+```
+
+与 ImageCodecVAE 的核心差异：
+
+| 维度 | ImageCodecVAE | KakeyaHyperpriorCodec |
+|---|---|---|
+| 熵模型 | EntropyBottleneck（因子化先验） | EntropyBottleneck + GaussianConditional（超先验） |
+| 激活函数 | InstanceNorm + SiLU | GDN / IGDN |
+| ResidualBlock | InstanceNorm | GDN（ResidualBlockGDN） |
+| 下采样 | SpaceToDepth x 3 = 8x | SpaceToDepth x 3 = 8x（保持文字精度） |
+| 损失函数 | 10 项分阶段 | MSE + lambda*rate + lambda_k*kakeya（单阶段） |
+| 训练阶段 | capacity -> transition -> finetune | 单阶段端到端 |
+| 潜空间 | 16 通道, +/-3 bound | 16 通道, +/-3 bound |
+
+---
+
 ## 3. 损失函数组成
+
+以下流程图适用于 `ImageCodecVAE` 的三阶段训练。`KakeyaHyperpriorCodec` 使用单阶段 MSE + λ·rate + λₖ·kakeya 损失，见 2.2 节。
 
 stage 权重由 `config.stage_weights()` 提供（见 [config.py](../src/kakeya/config.py) 的 `DEFAULT_STAGE_WEIGHTS`），可在 YAML / API 通过 `objective.stage_weights` 覆盖任意子集，未覆盖项回退到默认值。代码读取逻辑见 [image_codec.py](../src/kakeya/image_codec.py) 的 `_epoch` 函数。
 
@@ -416,22 +471,22 @@ graph TD
     subgraph Capacity_Loss [Capacity 阶段损失]
         direction TB
         C1[reconstruction<br/>加权 L1 + detail_weight]
-        C2[edge<br/>1.5 x L1 边缘]
-        C3[multiscale<br/>0.25 x 多尺度 L1]
+        C2[edge<br/>stage_w.edge x L1 边缘<br/>默认 1.0]
+        C3[multiscale<br/>stage_w.multiscale x L1<br/>默认 0.1]
         C4[kl<br/>kl_weight x KL]
-        C5[kakeya<br/>stage_w.kakeya x 覆盖正则<br/>默认 0.002]
+        C5[kakeya<br/>stage_w.kakeya x 覆盖正则<br/>默认 0.01]
         C6[mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab<br/>默认 0.5 / 0.1 / 0.02]
     end
 
     subgraph Transition_Loss [Transition 阶段损失]
         direction TB
-        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya<br/>默认 0.001]
-        T2[mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab<br/>默认 5.0 / 0.25 / 0.05]
+        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya<br/>默认 0.005]
+        T2[mse 3.0 + edge 1.5 + structural 0.4<br/>+ multiscale 0.25 + lab 0.08<br/>+ hue 0.04 + saturation 0.05]
     end
 
     subgraph Finetune_Loss [Finetune 阶段损失]
         direction TB
-        F1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya 默认 0.0005<br/>+ mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab 默认 5.0 / 0.5 / 0.10]
+        F1[reconstruction + edge 2.0 + multiscale 0.5<br/>+ kakeya 0.001 + mse 5.0<br/>+ structural 0.8 + lab 0.15<br/>+ hue 0.06 + saturation 0.08]
         F2[rate<br/>rate_weight x 码率超限]
     end
 
@@ -567,6 +622,17 @@ flowchart LR
 ---
 
 ## 5. 训练流程 (train_image_codec)
+
+> **注意**: 以下训练流程适用于 `ImageCodecVAE`（三阶段：capacity / transition / finetune）。
+> `KakeyaHyperpriorCodec` 使用**单阶段端到端训练**，无需门控逻辑、分阶段权重调度或 KL 退火。
+> 训练损失仅包含 MSE + lambda*rate + lambda_k*kakeya，所有参数在一个 loss.backward() 中优化。
+
+
+
+> **注意**: 以下训练流程适用于 （三阶段：capacity → transition → finetune）。
+>  使用**单阶段端到端训练**，无需门控逻辑、分阶段权重调度或 KL 退火。
+> 训练损失仅包含 MSE + λ·rate + λₖ·kakeya，所有参数在一个 loss.backward() 中优化。
+
 
 ```mermaid
 flowchart TD

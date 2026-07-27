@@ -24,8 +24,8 @@ VAE 实验工程。支持：
 - β-VAE
 - β-TCVAE
 - FactorVAE
-- Polynomial Kakeya VAE
-- 256×256 RGB 图文 Kakeya VAE（网页默认）
+- 超先验 Kakeya VAE（GDN + Hyperprior，单阶段训练）
+- 图文 Kakeya VAE（多尺度 128²–768²，网页默认）
 
 网页实验台不使用 Baseline VAE 作为最终报告对照。Baseline 仅保留在命令行配置
 中，用于必要的消融实验。
@@ -151,10 +151,10 @@ python start_lab.py --timeout 180
 |---|---|---|
 | β | β-VAE、β-TCVAE | 控制 KL 或总相关惩罚强度 |
 | γ | FactorVAE | 控制判别器估计的总相关惩罚 |
-| Kakeya λ | 图文模型、Polynomial Kakeya | 控制挂谷正则权重 |
-| 随机投影数 | 图文模型、Polynomial Kakeya | 每批次采样的投影方向数量 |
-| Top-k 间距 | 256 图文模型 | 用于覆盖正则的投影间距数量 |
-| 多项式次数 | Polynomial Kakeya | 多项式投影特征最高次数 |
+| 随机投影数 | 图文模型、超先验 Kakeya | 每批次采样的投影方向数量 |
+| Top-k 间距 | 图文模型 | 用于覆盖正则的投影间距数量 |
+| 率失真 λ | 超先验 Kakeya VAE | 控制码率与失真的权衡 |
+| 挂谷 λₖ | 超先验 Kakeya VAE | 控制挂谷覆盖正则强度 |
 
 首次确认流程时，可以使用：
 
@@ -340,11 +340,14 @@ WebP/JPEG 则基于大规模自然图像库长期调优，mbt2018 也是在 Koda
    mbt2018 训练分布之外的图像类型，提升泛化画质；
 2. **感知损失升级**：用 LPIPS / DISTS 等感知指标替换或加权 MSE，让模型在
    相同 bpp 下更贴近人眼画质判断；
-3. **熵模型增强**：从基础 EntropyBottleneck 升级到超先验或上下文模型
-  （如 CompressAI 的 MeanScaleHyperprior / JointAutoregressiveHierarchicalPriors），
-   更精确地捕捉潜变量空间相关性，进一步压低 bpp；
-4. **两阶段策略细化**：容量阶段引入更多分辨率与字体样式，压缩微调阶段
-   增大 quality rehearsal 比例与步数，缓解阶段切换的画质回退。
+3. **熵模型增强**：已完成超先验（`KakeyaHyperpriorCodec`），使用
+  CompressAI `MeanScaleHyperprior` 架构 + 条件高斯熵模型 + GDN/IGDN 激活，
+  在相同通道数下比 `EntropyBottleneck` 更精确地捕捉潜变量空间相关性。
+  下一阶段可引入上下文模型（`JointAutoregressiveHierarchicalPriors`），
+  进一步压低 bpp；
+4. **训练策略**：超先验模型使用单阶段端到端训练（不再分 capacity/finetune），
+  损失仅含 MSE + lambda*rate + lambda_k*kakeya。传统 `ImageCodecVAE` 的三阶段
+  策略可进一步扩大多尺度训练范围与 quality rehearsal 比例。
 
 ## 使用训练好的模型压缩 / 解压图片
 
@@ -387,7 +390,7 @@ python scripts/codec_cli.py decode \
 | `reports/reconstruction.kky` | 单张测试卡的压缩码流 | 约 11 KB |
 | `reports/reconstruction.png` | 从 `.kky` 解码还原的图片 | 约 125 KB |
 
-## 256×256 图文测试
+## 图文测试卡与训练配置
 
 网页默认选择"256 图文 Kakeya VAE"，并使用适合 Mac MPS 的起始参数
 （最大 80 轮、128 张训练卡、batch size 4、空间潜在通道 16），首页直接显示
@@ -428,7 +431,8 @@ python scripts/codec_cli.py decode \
 如果 `assets/hd_images/` 目录为空，训练会自动 fallback 到参考图文卡，
 但颜色与细节泛化效果会受限。
 
-图文模型采用容量闸门控制的两阶段训练。开始时关闭 KL 和 Kakeya，使用
+传统图文模型（`ImageCodecVAE`）采用容量闸门控制的两阶段训练。
+超先验模型（`KakeyaHyperpriorCodec`）使用单阶段端到端训练，无需容量闸门或阶段切换。开始时关闭 KL 和 Kakeya，使用
 CompressAI EntropyBottleneck 的同一套中心量化路径做 straight-through 训练，
 让训练、验证和最终 `.kky` 解码看到一致的离散潜变量，并只优化文字加权重建、
 MSE、边缘、结构与多尺度损失；量化测试卡达到 PSNR 30 且结构保真 97% 后，
@@ -450,7 +454,10 @@ rehearsal，降低从容量阶段切到程序化图文阶段时的画质坍塌�
 
 该模式使用程序生成的 RGB 图文卡片训练，并把网页测试卡作为明确标注的
 同分布校准样本。模型采用
-32×32 空间潜变量、残差卷积块和 PixelUnshuffle / PixelShuffle 空间重排，
+32×32 空间潜变量、残差卷积块和 PixelUnshuffle / PixelShuffle 空间重排。
+超先验版本（`KakeyaHyperpriorCodec`）额外使用 GDN/IGDN 激活函数
+（替代 InstanceNorm）和超先验熵模型（EntropyBottleneck +
+GaussianConditional），支持单阶段端到端率失真训练。，
 在降采样时先把像素无损搬到通道维再做特征混合，减少细字和一像素线条被步幅
 卷积提前抹掉的风险。训练结束后会自动对包含
 中英文、街景、细线、灰阶和色块的测试卡执行确定性编码和还原，并展示：
@@ -512,7 +519,7 @@ kakeya-run \
   configs/beta-vae.yaml \
   configs/beta-tcvae.yaml \
   configs/factor-vae.yaml \
-  configs/poly-kakeya.yaml
+  #  poly-kakeya.yaml 已移除（旧多项式方法）
 ```
 
 兼容入口：

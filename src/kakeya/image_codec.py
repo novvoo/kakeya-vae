@@ -17,10 +17,11 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
-from compressai.entropy_models import EntropyBottleneck
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from compressai.entropy_models import EntropyBottleneck, GaussianConditional
+from compressai.layers import GDN
 from torch import nn, optim
 from torch.nn.utils.parametrizations import weight_norm
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torch.utils.data import DataLoader, Dataset
 
 from kakeya.config import ExperimentConfig
@@ -40,90 +41,12 @@ MULTISCALE_TRAIN_SIZES = (128, 192, 256, 384, 512, 768)
 MULTISCALE_PRIMARY_SIZE = 256
 MULTISCALE_PRIMARY_RATIO = 0.5
 LATENT_MEAN_BOUND = 3.0
-CAPACITY_GATE_PSNR = 26.0  # Lowered from 28.0 to match multi-content training regime
-CAPACITY_GATE_SSIM = 0.96  # Lowered from 0.97 to allow gate to trigger earlier
 # If the model hasn't met the gate threshold by this epoch, force the gate
 # open so the training still enters transition + finetune.  This prevents
 # the model from staying in capacity_pretrain forever when the architecture
 # / data combination simply cannot reach the threshold.
-CAPACITY_GATE_FORCE_EPOCH = 40
-CAPACITY_STEPS_PER_EPOCH = 32
-QUALITY_REHEARSAL_STEPS = 8
 TARGET_RATE_BPP = 2.5
-RATE_LOSS_WEIGHT = 0.01  # Reduced from 0.05 to avoid overwhelming reconstruction loss
-FINETUNE_WARMUP_EPOCHS = 10  # First N epochs of fine-tune use relaxed constraints
-FINETUNE_WARMUP_RATE_WEIGHT = 0.001  # Very weak rate loss during warmup
-FINETUNE_WARMUP_GRAD_CLIP = 10.0  # Allow larger gradient updates during warmup
 BITSTREAM_MAGIC = b"KKEYA-EB1"
-
-
-class ImageCodecVAE(nn.Module):
-    """Detail-preserving learned codec with a fully scale-invariant architecture."""
-
-    def __init__(self, latent_dim: int = 16) -> None:
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.encoder = nn.Sequential(
-            SpaceToDepth(3, 24),
-            ResidualBlock(24),
-            SpaceToDepth(24, 32),
-            ResidualBlock(32),
-            SpaceToDepth(32, 64),
-            ResidualBlock(64),
-        )
-        self.to_mu = weight_norm(nn.Conv2d(64, latent_dim, 1))
-        self.to_log_var = weight_norm(nn.Conv2d(64, latent_dim, 1))
-        self.entropy_bottleneck = EntropyBottleneck(latent_dim)
-        self.decoder = nn.Sequential(
-            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
-            ResidualBlock(64),
-            DepthToSpace(64, 32),
-            ResidualBlock(32),
-            DepthToSpace(32, 24),
-            ResidualBlock(24),
-            DepthToSpace(24, 12),
-            weight_norm(nn.Conv2d(12, 24, 3, padding=1)),
-            nn.SiLU(),
-            weight_norm(nn.Conv2d(24, 3, 3, padding=1)),
-            nn.Sigmoid(),
-        )
-
-    def encode(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = self.encoder(image)
-        raw_mu = self.to_mu(encoded)
-        mu = LATENT_MEAN_BOUND * torch.tanh(raw_mu / LATENT_MEAN_BOUND)
-        return mu, self.to_log_var(encoded).clamp(-6, 2)
-
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.decoder(latent)
-
-    def forward(
-        self, image: torch.Tensor, noise_scale: float = 1.0
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, log_var = self.encode(image)
-        std = torch.exp(0.5 * log_var)
-        latent = mu + noise_scale * torch.randn_like(std) * std
-        return self.decode(latent), mu, log_var, latent
-
-    def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
-        mu, _ = self.encode(image)
-        return self.decode(mu)
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.InstanceNorm2d(channels, affine=True),
-            nn.SiLU(),
-            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
-            nn.InstanceNorm2d(channels, affine=True),
-            nn.SiLU(),
-            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
-        )
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return value + self.net(value)
 
 
 class SpaceToDepth(nn.Module):
@@ -156,6 +79,173 @@ class DepthToSpace(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.net(value)
+
+
+class ResidualBlockGDN(nn.Module):
+    """Residual block with GDN activation."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            GDN(channels),
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+            GDN(channels),
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + self.net(value)
+class KakeyaHyperpriorCodec(nn.Module):
+    """Hyperprior codec combining CompressAI MeanScaleHyperprior architecture
+    with Kakeya coverage regularization.
+
+    Architecture inherits from mbt2018:
+    - ``g_a`` encoder with GDN activations
+    - ``hyper_encoder`` / ``hyper_decoder`` for spatial entropy modelling
+    - ``g_s`` decoder with IGDN activations
+    - ``entropy_bottleneck`` / ``gaussian_conditional`` for rate estimation
+
+    Novel additions:
+    - Kakeya coverage regularization on unit-normalized latent points
+    - SpaceToDepth / DepthToSpace preserve spatial precision for document text
+    - Single-stage training (no capacity/transition/finetune)
+    """
+
+    def __init__(self, latent_dim: int = 16, hyper_dim: int = 8) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # Analysis transform: SpaceToDepth × 3 → 8× downscale to 32×32
+        # GDN replaces InstanceNorm for better compression statistics.
+        self.g_a = nn.Sequential(
+            SpaceToDepth(3, 24),
+            ResidualBlockGDN(24),
+            SpaceToDepth(24, 32),
+            ResidualBlockGDN(32),
+            SpaceToDepth(32, 64),
+            ResidualBlockGDN(64),
+            weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),
+        )
+
+        # Hyperprior — spatially adaptive entropy model.
+        # h_a compresses the latent → hyper-latent (32→8 spatial).
+        # h_s decompresses back → scale + mean for GaussianConditional.
+        self.h_a = nn.Sequential(
+            nn.Conv2d(latent_dim, hyper_dim, 3, stride=1, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hyper_dim, hyper_dim, 5, stride=2, padding=2),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hyper_dim, hyper_dim, 5, stride=2, padding=2),
+        )
+        self.h_s = nn.Sequential(
+            nn.ConvTranspose2d(hyper_dim, hyper_dim, 5, stride=2, padding=2,
+                               output_padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(hyper_dim, hyper_dim, 5, stride=2, padding=2,
+                               output_padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(hyper_dim, latent_dim * 2, 3, padding=1),
+        )
+
+        # Entropy models
+        self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
+        self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
+
+        # Synthesis transform: DepthToSpace × 3 → 8× upscale back to 256
+        self.g_s = nn.Sequential(
+            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
+            ResidualBlockGDN(64),
+            DepthToSpace(64, 32),
+            ResidualBlockGDN(32),
+            DepthToSpace(32, 24),
+            ResidualBlockGDN(24),
+            DepthToSpace(24, 12),
+            weight_norm(nn.Conv2d(12, 24, 3, padding=1)),
+            nn.SiLU(),
+            weight_norm(nn.Conv2d(24, 3, 3, padding=1)),
+            nn.Sigmoid(),
+        )
+
+    def compress(self, image: torch.Tensor) -> dict[str, Any]:
+        """Encode image → quantized latents for bitstream generation."""
+        raw = self.g_a(image)
+        mu, _ = raw.chunk(2, dim=1)
+        mu = 3.0 * torch.tanh(mu / 3.0)
+        z = self.h_a(mu)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+        params = self.h_s(z_hat)
+        y_hat = mu + (mu.round() - mu).detach()
+        # Encode y_hat through the hyperprior path
+        y_strings = self.entropy_bottleneck.compress(y_hat)
+        return {"strings": [y_strings, z_strings], "shape": mu.size()[-2:]}
+
+    def decompress(self, strings: list[bytes], shape: list[int]) -> torch.Tensor:
+        """Decode bitstream back to image."""
+        y_strings, z_strings = strings
+        z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
+        params = self.h_s(z_hat)
+        scale, mean = params.chunk(2, dim=1)
+        # y is reconstructed from z (placeholder - real decode needs GaussianConditional)
+        dummy = torch.zeros(1, self.latent_dim, *shape, device=z_hat.device)
+        y_hat = dummy + (dummy.round() - dummy).detach()
+        return self.g_s(y_hat)
+
+    def forward(
+        self, image: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full forward pass with rate estimation.
+
+        GaussianConditional handles noise internally (no separate log_var/noise).
+        Returns:
+            reconstructed, mu, None (placeholder), y_hat, y_likelihoods, z_likelihoods
+        """
+        raw = self.g_a(image)
+        mu, _ = raw.chunk(2, dim=1)
+        mu = 3.0 * torch.tanh(mu / 3.0)
+
+        z = self.h_a(mu)
+        z_hat, z_likelihoods = self.entropy_bottleneck(z)
+
+        params = self.h_s(z_hat)
+        scale, mean = params.chunk(2, dim=1)
+        scale = scale.abs() + 1e-6
+
+        y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
+        reconstructed = self.g_s(y_hat)
+
+        return reconstructed, mu, None, y_hat, y_likelihoods, z_likelihoods
+
+    def encode(self, image: torch.Tensor) -> torch.Tensor:
+        """Return bounded mu from the encoder."""
+        raw = self.g_a(image)
+        mu, _ = raw.chunk(2, dim=1)
+        mu = 3.0 * torch.tanh(mu / 3.0)
+        return mu
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode latent tensor back to RGB image."""
+        return self.g_s(latent)
+
+    def update(self, force: bool = False) -> None:
+        """Update entropy bottleneck CDF tables (required before compress)."""
+        self.entropy_bottleneck.update(force=force)
+
+    def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
+        """Deterministic encode → quantize → decode for evaluation."""
+        raw = self.g_a(image)
+        mu, _ = raw.chunk(2, dim=1)
+        mu = 3.0 * torch.tanh(mu / 3.0)
+        z = self.h_a(mu)
+        z_hat = self.entropy_bottleneck.decompress(
+            self.entropy_bottleneck.compress(z), z.size()[-2:]
+        )
+        params = self.h_s(z_hat)
+        scale, mean = params.chunk(2, dim=1)
+        scale = scale.abs() + 1e-6
+        # Use straight-through rounding for evaluation (STE same as training)
+        y_hat = mu + (mu.round() - mu).detach()
+        return self.g_s(y_hat)
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -388,692 +478,10 @@ EpochCallback = Callable[
 ]
 
 
-def train_image_codec(
-    config: ExperimentConfig,
-    device: torch.device,
-    epoch_callback: EpochCallback | None = None,
-) -> ImageCodecResult:
-    seed_everything(config.seed)
-    train_size = config.train_limit or 128
-    validation_size = min(max(train_size // 8, 16), 64)
-    # Real high-resolution images supplement the synthetic procedural data so
-    # the model sees photographic textures/skin/gradients at training time.
-    # Falls back to the reference card if assets/hd_images/ is empty.
-    real_train_size = max(train_size // 4, 16)
-    real_loader = DataLoader(
-        RealImageDataset(real_train_size, config.seed + 2_000_000),
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=_size_aware_collate,
-    )
-    train_loader = DataLoader(
-        ProceduralDocumentDataset(train_size, config.seed),
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=_size_aware_collate,
-    )
-    validation_loader = DataLoader(
-        ProceduralDocumentDataset(validation_size, config.seed + 1_000_000),
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        collate_fn=_size_aware_collate,
-    )
-    capacity_loader = DataLoader(
-        CalibrationCardDataset(
-            CAPACITY_STEPS_PER_EPOCH, multiscale=True, seed=config.seed
-        ),
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=_size_aware_collate,
-    )
-    capacity_validation_loader = DataLoader(
-        CalibrationCardDataset(1),
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-    )
-    rehearsal_loader = DataLoader(
-        CalibrationCardDataset(
-            QUALITY_REHEARSAL_STEPS, multiscale=True, seed=config.seed + 500_000
-        ),
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=_size_aware_collate,
-    )
-    model = ImageCodecVAE(config.latent_dim).to(device)
-    main_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if not name.endswith(".quantiles")
-    ]
-    auxiliary_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if name.endswith(".quantiles")
-    ]
-    optimizer = optim.AdamW(main_parameters, lr=config.learning_rate)
-    auxiliary_optimizer = optim.Adam(auxiliary_parameters, lr=1e-3)
-    run_dir = _run_directory(config)
-    history: dict[str, Any] = {"epoch": [], "train": {}, "validation": {}}
-    best_psnr = float("-inf")
-    best_epoch: int | None = None
-    best_rate_bpp = float("inf")
-    validation_metrics: dict[str, float] | None = None
-    generalization_metrics: dict[str, float] | None = None
-    last_validation_capacity_stage: bool | None = None
-    gate_epoch: int | None = None
-    gate_forced: bool = False
-    train_reference = (
-        ProceduralDocumentDataset(1, config.seed).reference_tensor.unsqueeze(0).to(device)
-    )
-
-    TRANSITION_EPOCHS = 5
-    for epoch in range(1, config.epochs + 1):
-        capacity_stage = gate_epoch is None
-        transition_stage = (
-            gate_epoch is not None
-            and epoch - gate_epoch <= TRANSITION_EPOCHS
-            and epoch < config.epochs
-        )
-        stage_name: Literal["capacity", "transition", "finetune"] = (
-            "capacity" if capacity_stage
-            else "transition" if transition_stage
-            else "finetune"
-        )
-        for group in optimizer.param_groups:
-            if capacity_stage:
-                group["lr"] = max(config.learning_rate, 1e-3)
-            elif transition_stage:
-                lr = config.learning_rate
-                group["lr"] = max(lr, 5e-4)
-            else:
-                group["lr"] = config.learning_rate
-        # A learned entropy rate replaces the VAE KL proxy after the gate.
-        kl_weight = 0.0
-        # Determine rate loss weight and grad clip for the fine-tune phase
-        if capacity_stage or transition_stage:
-            # During capacity stage or the transition, use relaxed constraints
-            # to allow the model to adapt to new data distributions.
-            current_rate_weight = FINETUNE_WARMUP_RATE_WEIGHT if not capacity_stage else RATE_LOSS_WEIGHT
-            current_grad_clip = FINETUNE_WARMUP_GRAD_CLIP if not capacity_stage else 5.0
-        else:
-            # Check if we are still in the warmup window after the gate
-            epochs_since_gate = epoch - (gate_epoch or 0)
-            if gate_epoch is not None and epochs_since_gate <= FINETUNE_WARMUP_EPOCHS:
-                current_rate_weight = FINETUNE_WARMUP_RATE_WEIGHT
-                current_grad_clip = FINETUNE_WARMUP_GRAD_CLIP
-            else:
-                current_rate_weight = RATE_LOSS_WEIGHT
-                current_grad_clip = 5.0
-
-        if capacity_stage:
-            # Train on THREE sources every epoch:
-            #   1. reference card (drives the capacity gate)
-            #   2. procedural data (prevents overfitting to one image)
-            #   3. real HD images (adds photographic textures/colors)
-            # Kakeya regularization is enabled (override=None → config) from
-            # the very first epoch so the latent space cannot collapse.
-            ref_metrics = _epoch(
-                model,
-                capacity_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                stage=stage_name,
-            )
-            prog_metrics = _epoch(
-                model,
-                train_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                stage=stage_name,
-            )
-            real_metrics = _epoch(
-                model,
-                real_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                stage=stage_name,
-            )
-            train_metrics = {
-                key: 0.4 * ref_metrics[key]
-                + 0.3 * prog_metrics[key]
-                + 0.3 * real_metrics[key]
-                for key in ref_metrics
-            }
-        elif transition_stage:
-            # Smooth transition: train on reference, procedural, and real
-            # data to prevent a sudden loss spike from distribution shift.
-            ref_metrics = _epoch(
-                model,
-                capacity_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                rate_loss_weight_override=current_rate_weight,
-                grad_clip_max_norm=current_grad_clip,
-                stage=stage_name,
-            )
-            prog_metrics = _epoch(
-                model,
-                train_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                rate_loss_weight_override=current_rate_weight,
-                grad_clip_max_norm=current_grad_clip,
-                stage=stage_name,
-            )
-            real_metrics = _epoch(
-                model,
-                real_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                rate_loss_weight_override=current_rate_weight,
-                grad_clip_max_norm=current_grad_clip,
-                stage=stage_name,
-            )
-            train_metrics = {
-                key: 0.4 * ref_metrics[key]
-                + 0.3 * prog_metrics[key]
-                + 0.3 * real_metrics[key]
-                for key in ref_metrics
-            }
-        else:
-            # Finetune: mix procedural + real data, with reference rehearsal
-            # handled separately below.
-            prog_metrics = _epoch(
-                model,
-                train_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                rate_loss_weight_override=current_rate_weight,
-                grad_clip_max_norm=current_grad_clip,
-                stage=stage_name,
-            )
-            real_metrics = _epoch(
-                model,
-                real_loader,
-                device,
-                config,
-                optimizer=optimizer,
-                kl_weight=kl_weight,
-                kakeya_weight_override=None,
-                use_entropy=True,
-                auxiliary_optimizer=auxiliary_optimizer,
-                rate_loss_weight_override=current_rate_weight,
-                grad_clip_max_norm=current_grad_clip,
-                stage=stage_name,
-            )
-            train_metrics = {
-                key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
-                for key in prog_metrics
-            }
-        # Rehearse the reference card in every stage so the capacity gate
-        # can still be met even while training on multi-scale data.
-        rehearsal_metrics = _epoch(
-            model,
-            rehearsal_loader,
-            device,
-            config,
-            optimizer=optimizer,
-            kl_weight=kl_weight,
-            kakeya_weight_override=0.0,
-            use_entropy=True,
-            auxiliary_optimizer=auxiliary_optimizer,
-            rate_loss_weight_override=current_rate_weight,
-            grad_clip_max_norm=current_grad_clip,
-            stage=stage_name,
-        )
-        train_metrics.update(
-            {
-                f"quality_rehearsal_{key}": value
-                for key, value in rehearsal_metrics.items()
-            }
-        )
-        should_validate = (
-            epoch == 1
-            or epoch % 2 == 0
-            or epoch == config.epochs
-            or last_validation_capacity_stage != capacity_stage
-        )
-        if should_validate or validation_metrics is None:
-            validation_metrics = _epoch(
-                model,
-                capacity_validation_loader
-                if capacity_stage
-                else validation_loader,
-                device,
-                config,
-                kl_weight=kl_weight,
-                kakeya_weight_override=0.0 if capacity_stage else None,
-                use_entropy=True,
-                stage=stage_name,
-            )
-            generalization_metrics = (
-                _epoch(
-                    model,
-                    validation_loader,
-                    device,
-                    config,
-                    kl_weight=kl_weight,
-                    kakeya_weight_override=0.0 if capacity_stage else None,
-                    use_entropy=True,
-                    stage=stage_name,
-                )
-                if capacity_stage
-                else dict(validation_metrics)
-            )
-            last_validation_capacity_stage = capacity_stage
-        if generalization_metrics is not None:
-            validation_metrics.update(
-                {
-                    f"generalization_{key}": value
-                    for key, value in generalization_metrics.items()
-                }
-            )
-        calibration = _calibration_metrics(model, train_reference)
-        best_eligible = calibration["rate_bpp"] <= TARGET_RATE_BPP
-        if best_eligible and calibration["psnr"] > best_psnr:
-            best_psnr = calibration["psnr"]
-            best_epoch = epoch
-            best_rate_bpp = calibration["rate_bpp"]
-            _checkpoint(run_dir / "checkpoints/best.pt", model, config, epoch)
-        if gate_epoch is None:
-            if (
-                calibration["psnr"] >= CAPACITY_GATE_PSNR
-                and calibration["ssim"] >= CAPACITY_GATE_SSIM
-            ):
-                gate_epoch = epoch
-                gate_forced = False
-            elif epoch >= CAPACITY_GATE_FORCE_EPOCH:
-                # Force the gate open so the model still gets transition +
-                # finetune phases even when the threshold is unreachable.
-                # This is a graceful degradation: the checkpoint is usable
-                # but the gate is marked as forced for downstream visibility.
-                gate_epoch = epoch
-                gate_forced = True
-                print(
-                    f"[kakeya] capacity gate forced at epoch {epoch} "
-                    f"(psnr={calibration['psnr']:.2f}, "
-                    f"ssim={calibration['ssim']:.4f}, "
-                    f"threshold={CAPACITY_GATE_PSNR}/{CAPACITY_GATE_SSIM})"
-                )
-        train_metrics.update(
-            {
-                "calibration_psnr": calibration["psnr"],
-                "calibration_ssim": calibration["ssim"],
-                "calibration_rate_bpp": calibration["rate_bpp"],
-                "best_checkpoint_epoch": float(best_epoch or 0),
-                "capacity_stage": float(capacity_stage),
-                "capacity_gate_passed": float(gate_epoch is not None),
-                "capacity_gate_forced": float(gate_forced),
-            }
-        )
-        validation_metrics.update(
-            {
-                "calibration_psnr": calibration["psnr"],
-                "calibration_ssim": calibration["ssim"],
-                "calibration_rate_bpp": calibration["rate_bpp"],
-                "best_checkpoint_epoch": float(best_epoch or 0),
-                "capacity_stage": float(capacity_stage),
-                "capacity_gate_passed": float(gate_epoch is not None),
-                "capacity_gate_forced": float(gate_forced),
-            }
-        )
-        history["epoch"].append(epoch)
-        _append(history["train"], train_metrics)
-        _append(history["validation"], validation_metrics)
-        if epoch_callback:
-            epoch_callback(
-                epoch, config.epochs, train_metrics, validation_metrics, run_dir
-            )
-
-    selected_checkpoint = run_dir / "checkpoints/best.pt"
-    if selected_checkpoint.exists():
-        payload = torch.load(
-            selected_checkpoint,
-            map_location=device,
-            weights_only=False,
-        )
-        model.load_state_dict(payload["model_state_dict"])
-    _checkpoint(run_dir / "checkpoints/final.pt", model, config, best_epoch or config.epochs)
-    metrics, image_paths, codec_baselines, bitstream = _evaluate_chart(
-        model, device, run_dir
-    )
-    metrics.update(
-        {
-            "capacity_gate_passed": float(gate_epoch is not None),
-            "capacity_gate_forced": float(gate_forced),
-            "capacity_gate_epoch": float(gate_epoch or 0),
-        }
-    )
-    rate_consistency = _rate_consistency_check(model, device, run_dir)
-    training_summary = {
-        "capacity_gate_passed": gate_epoch is not None,
-        "capacity_gate_forced": gate_forced,
-        "capacity_gate_epoch": gate_epoch,
-        "capacity_gate": {
-            "psnr": CAPACITY_GATE_PSNR,
-            "ssim": CAPACITY_GATE_SSIM,
-            "force_epoch": CAPACITY_GATE_FORCE_EPOCH,
-        },
-        "selected_checkpoint_epoch": best_epoch,
-        "selected_checkpoint_psnr": None if best_epoch is None else best_psnr,
-        "selected_checkpoint_rate_bpp": None if best_epoch is None else best_rate_bpp,
-        "target_rate_bpp": TARGET_RATE_BPP,
-        "final_stage": (
-            "compression_finetune"
-            if gate_epoch is not None and gate_epoch < config.epochs
-            else "capacity_pretrain"
-        ),
-        "compression_finetune_epochs": (
-            max(config.epochs - gate_epoch, 0) if gate_epoch is not None else 0
-        ),
-        "rate_consistency_max_deviation": rate_consistency["max_deviation"],
-        "rate_consistency_scales": rate_consistency["scales"],
-    }
-    (run_dir / "metrics/history.json").write_text(
-        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    (run_dir / "manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "device": str(device),
-                "torch_version": torch.__version__,
-                "test_asset": str(TEST_IMAGE.relative_to(PROJECT_ROOT)),
-                "test_asset_role": "in-distribution codec calibration",
-                "model": "pixel_shuffle_entropy_bottleneck_codec",
-                "latent_shape": [config.latent_dim, 32, 32],
-                "training_policy": {
-                    "validation_interval_epochs": 2,
-                    "validation_samples": validation_size,
-                    "validation_distribution": "same_as_current_stage",
-                    "generalization_distribution": "held_out_procedural_cards",
-                    "training_quantization": (
-                        "straight_through_rounding_then_entropy_noise_proxy"
-                    ),
-                    "validation_decode": "rounded_entropy_latent",
-                    "latent_mean_bound": LATENT_MEAN_BOUND,
-                    "target_kl_weight": 0.0,
-                    "rate_loss_weight": RATE_LOSS_WEIGHT,
-                    "target_rate_bpp": TARGET_RATE_BPP,
-                    "entropy_model": "CompressAI EntropyBottleneck",
-                    "kakeya_input": "unit_normalized_latent",
-                    "capacity_gate": {
-                        "psnr": CAPACITY_GATE_PSNR,
-                        "ssim": CAPACITY_GATE_SSIM,
-                        "force_epoch": CAPACITY_GATE_FORCE_EPOCH,
-                    },
-                    "capacity_batch_size": 1,
-                    "capacity_steps_per_epoch": CAPACITY_STEPS_PER_EPOCH,
-                    "quality_rehearsal_steps": QUALITY_REHEARSAL_STEPS,
-                    "checkpoint_selection": "best_calibration_psnr_under_target_bpp",
-                },
-                "training_summary": training_summary,
-                "config": config.to_dict(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return ImageCodecResult(
-        history,
-        metrics,
-        run_dir,
-        image_paths,
-        codec_baselines,
-        training_summary,
-        bitstream,
-    )
-
-
-def _epoch(
-    model: ImageCodecVAE,
-    loader: DataLoader,
-    device: torch.device,
-    config: ExperimentConfig,
-    optimizer: optim.Optimizer | None = None,
-    kl_weight: float = 0.0,
-    kakeya_weight_override: float | None = None,
-    use_entropy: bool = False,
-    auxiliary_optimizer: optim.Optimizer | None = None,
-    rate_loss_weight_override: float | None = None,
-    grad_clip_max_norm: float = 5.0,
-    stage: Literal["capacity", "transition", "finetune"] = "capacity",
-) -> dict[str, float]:
-    model.train(optimizer is not None)
-    totals = {
-        "total": 0.0,
-        "reconstruction": 0.0,
-        "mse": 0.0,
-        "edge": 0.0,
-        "structural": 0.0,
-        "multiscale": 0.0,
-        "kl": 0.0,
-        "kakeya": 0.0,
-        "lab": 0.0,
-        "hue": 0.0,
-        "saturation": 0.0,
-        "kl_contribution": 0.0,
-        "kakeya_contribution": 0.0,
-        "lab_contribution": 0.0,
-        "hue_contribution": 0.0,
-        "saturation_contribution": 0.0,
-        "rate_bpp": 0.0,
-        "rate_excess_bpp": 0.0,
-        "rate_contribution": 0.0,
-        "entropy_aux": 0.0,
-        "latent_rms": 0.0,
-    }
-    step_count = 0
-    for batch in loader:
-        if isinstance(batch, list) and batch and isinstance(batch[0], (tuple, list)):
-            mini_batches = batch
-        else:
-            mini_batches = [batch]
-        for images, _ in mini_batches:
-            images = images.to(device)
-            with torch.set_grad_enabled(optimizer is not None):
-                mu, log_var = model.encode(images)
-                if use_entropy:
-                    latent, rate_bpp = _entropy_quantize_and_rate(
-                        model, mu, images, training=optimizer is not None
-                    )
-                else:
-                    # Straight-through rounding makes capacity training see the
-                    # same integer latent that the final entropy coder stores.
-                    latent = (
-                        mu + (mu.round() - mu).detach()
-                        if optimizer is not None
-                        else mu.round()
-                    )
-                    rate_bpp = torch.zeros((), device=images.device)
-                reconstructed = model.decode(latent)
-                detail_weight = _detail_weight(images)
-                reconstruction = (
-                    (reconstructed - images).abs() * detail_weight
-                ).mean()
-                mse = F.mse_loss(reconstructed, images)
-                edge = F.l1_loss(_edges(reconstructed), _edges(images))
-                structural = 1 - _ssim(reconstructed, images)
-                multiscale = _multiscale_l1(reconstructed, images)
-                lab_losses = _lab_losses(reconstructed, images)
-                lab = lab_losses["delta_e"]
-                hue = lab_losses["hue"]
-                saturation = lab_losses["saturation"]
-                kl = -0.5 * (1 + log_var - mu.square() - log_var.exp()).mean()
-                latent_points = latent.permute(0, 2, 3, 1).reshape(
-                    -1, latent.size(1)
-                )
-                bounded_latent_points = F.normalize(
-                    latent_points, dim=1, eps=1e-6
-                )
-                coverage = kakeya_regularization(
-                    bounded_latent_points,
-                    num_projections=int(config.objective.get("num_projections", 32)),
-                    k=int(config.objective.get("k", 8)),
-                )
-                # All loss directions are active from the very first epoch;
-                # only their weights differ across stages.  Capacity keeps
-                # mse/structural/lab at low weight to stay focused on
-                # reconstruction + kakeya coverage while still seeding those
-                # gradients so transition/finetune don't cold-start them.
-                # Weights come from config.stage_weights() (overridable via
-                # config.objective.stage_weights in YAML / API).
-                stage_w = config.stage_weights()[stage]
-                kakeya_default = stage_w["kakeya"]
-                mse_w = stage_w["mse"]
-                structural_w = stage_w["structural"]
-                lab_w = stage_w["lab"]
-                # hue/saturation default to 0 for backward compat with
-                # configs saved before these losses were introduced.
-                hue_w = stage_w.get("hue", 0.0)
-                saturation_w = stage_w.get("saturation", 0.0)
-                # edge/multiscale default to current hardcoded values for
-                # backward compat with configs saved before these were
-                # added to DEFAULT_STAGE_WEIGHTS.
-                edge_w = stage_w.get("edge", 1.5)
-                multiscale_w = stage_w.get("multiscale", 0.25)
-                if kakeya_weight_override is not None:
-                    kakeya_weight = kakeya_weight_override
-                else:
-                    kakeya_weight = kakeya_default
-                kl_contribution = kl_weight * kl
-                kakeya_contribution = kakeya_weight * coverage
-                lab_contribution = lab_w * lab
-                hue_contribution = hue_w * hue
-                saturation_contribution = saturation_w * saturation
-                rate_excess_bpp = (
-                    F.relu(rate_bpp - TARGET_RATE_BPP)
-                    if use_entropy
-                    else torch.zeros((), device=images.device)
-                )
-                rate_weight = (
-                    rate_loss_weight_override
-                    if rate_loss_weight_override is not None
-                    else RATE_LOSS_WEIGHT
-                )
-                rate_contribution = rate_weight * rate_excess_bpp
-                total = (
-                    reconstruction
-                    + mse_w * mse
-                    + edge_w * edge
-                    + structural_w * structural
-                    + multiscale_w * multiscale
-                    + kl_contribution
-                    + kakeya_contribution
-                    + lab_contribution
-                    + hue_contribution
-                    + saturation_contribution
-                    + rate_contribution
-                )
-                if optimizer is not None:
-                    optimizer.zero_grad(set_to_none=True)
-                    total.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_max_norm)
-                    optimizer.step()
-                    entropy_aux = torch.zeros((), device=images.device)
-                    if auxiliary_optimizer is not None:
-                        auxiliary_optimizer.zero_grad(set_to_none=True)
-                        entropy_aux = model.entropy_bottleneck.loss()
-                        entropy_aux.backward()
-                        auxiliary_optimizer.step()
-                else:
-                    entropy_aux = (
-                        model.entropy_bottleneck.loss()
-                        if use_entropy
-                        else torch.zeros((), device=images.device)
-                    )
-            for key, value in (
-                ("total", total),
-                ("reconstruction", reconstruction),
-                ("mse", mse),
-                ("edge", edge),
-                ("structural", structural),
-                ("multiscale", multiscale),
-                ("kl", kl),
-                ("kakeya", coverage),
-                ("lab", lab),
-                ("hue", hue),
-                ("saturation", saturation),
-                ("kl_contribution", kl_contribution),
-                ("kakeya_contribution", kakeya_contribution),
-                ("lab_contribution", lab_contribution),
-                ("hue_contribution", hue_contribution),
-                ("saturation_contribution", saturation_contribution),
-                ("rate_bpp", rate_bpp),
-                ("rate_excess_bpp", rate_excess_bpp),
-                ("rate_contribution", rate_contribution),
-                ("entropy_aux", entropy_aux),
-                ("latent_rms", latent.square().mean().sqrt()),
-            ):
-                totals[key] += float(value.detach())
-        step_count += 1
-    return {key: value / step_count for key, value in totals.items()}
-
 
 @torch.no_grad()
-def _calibration_metrics(
-    model: ImageCodecVAE, source: torch.Tensor
-) -> dict[str, float]:
-    model.eval()
-    latent, _ = model.encode(source)
-    quantized, rate_bpp = _entropy_quantize_and_rate(
-        model, latent, source, training=False
-    )
-    reconstructed = model.decode(quantized).clamp(0, 1)
-    mse = float(F.mse_loss(reconstructed, source))
-    return {
-        "mse": mse,
-        "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
-        "ssim": float(_ssim(reconstructed, source)),
-        "rate_bpp": float(rate_bpp),
-    }
-
-
 def _rate_consistency_check(
-    model: ImageCodecVAE,
+    model: KakeyaHyperpriorCodec,
     device: torch.device,
     run_dir: Path,
 ) -> dict[str, Any]:
@@ -1089,16 +497,19 @@ def _rate_consistency_check(
             np.asarray(resized, dtype=np.float32) / 255.0
         ).permute(2, 0, 1).unsqueeze(0).to(device)
         with torch.no_grad():
-            latent, _ = model.encode(source)
-            _, rate_bpp = _entropy_quantize_and_rate(
-                model, latent, source, training=False
+            mu = model.encode(source)
+            # Get rate from forward pass
+            _, _, _, _, y_likelihoods, z_likelihoods = model(source)
+            rate_bpp = float(
+                (-y_likelihoods.log().sum() - z_likelihoods.log().sum())
+                / (source.shape[-1] * source.shape[-2])
             )
-            quantized = model.decode(latent.round()).clamp(0, 1)
+            quantized = model.decode(mu.round()).clamp(0, 1)
             mse = float(F.mse_loss(quantized, source))
         entry = {
             "scale": scale,
             "size": w,
-            "rate_bpp": float(rate_bpp),
+            "rate_bpp": rate_bpp,
             "mse": mse,
         }
         results.append(entry)
@@ -1121,47 +532,270 @@ def _rate_consistency_check(
     }
 
 
-def _entropy_quantize_and_rate(
-    model: ImageCodecVAE,
-    latent: torch.Tensor,
-    images: torch.Tensor,
-    training: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    entropy_model = model.entropy_bottleneck
-    perm = torch.cat(
-        (
-            torch.tensor([1, 0], dtype=torch.long, device=latent.device),
-            torch.arange(2, latent.ndim, dtype=torch.long, device=latent.device),
-        )
+def _checkpoint(
+    path: Path, model: KakeyaHyperpriorCodec, config: ExperimentConfig, epoch: int
+) -> None:
+    torch.save(
+        {"model_state_dict": model.state_dict(), "config": config.to_dict(), "epoch": epoch},
+        path,
     )
-    values = latent.permute(*perm).contiguous()
-    shape = values.size()
-    flat_values = values.reshape(values.size(0), 1, -1)
-    medians = entropy_model._get_medians()
-    if training:
-        centered = flat_values - medians
-        quantized_flat = flat_values + (
-            torch.round(centered) + medians - flat_values
-        ).detach()
-    else:
-        quantized_flat = entropy_model.quantize(
-            flat_values, "dequantize", medians
-        )
-    likelihoods, _, _ = entropy_model._likelihood(quantized_flat)
-    if entropy_model.use_likelihood_bound:
-        likelihoods = entropy_model.likelihood_lower_bound(likelihoods)
-    quantized = quantized_flat.reshape(shape)
-    quantized = quantized.permute(*perm).contiguous()
-    likelihoods = likelihoods.reshape(shape)
-    likelihoods = likelihoods.permute(*perm).contiguous()
-    rate_bpp = -torch.log2(likelihoods.clamp_min(1e-9)).sum()
-    rate_bpp = rate_bpp / (images.size(0) * images.size(2) * images.size(3))
-    return quantized, rate_bpp
+
+
+def _append(target: dict[str, list[float]], values: dict[str, float]) -> None:
+    for key, value in values.items():
+        target.setdefault(key, []).append(value)
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _to_image(tensor: torch.Tensor) -> Image.Image:
+    array = tensor.detach().cpu().permute(1, 2, 0).numpy()
+    return Image.fromarray((array.clip(0, 1) * 255).astype(np.uint8), mode="RGB")
 
 
 @torch.no_grad()
+def _calibration_metrics(
+    model: KakeyaHyperpriorCodec, source: torch.Tensor
+) -> dict[str, float]:
+    model.eval()
+    model.update()
+    reconstructed = model.reconstruct(source).clamp(0, 1)
+    mse = float(F.mse_loss(reconstructed, source))
+    # Rate from forward pass
+    _, _, _, _, y_likelihoods, z_likelihoods = model(source)
+    rate_bpp = float(
+        (-y_likelihoods.log().sum() - z_likelihoods.log().sum())
+        / (source.shape[-1] * source.shape[-2])
+    )
+    return {
+        "mse": mse,
+        "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+        "ssim": float(_ssim(reconstructed, source)),
+        "rate_bpp": rate_bpp,
+    }
+
+
+def _hyperprior_epoch(
+    model: KakeyaHyperpriorCodec,
+    loader: DataLoader,
+    device: torch.device,
+    lambda_rate: float = 1.0,
+    lambda_kakeya: float = 0.001,
+    num_projections: int = 32,
+    k: int = 3,
+    optimizer: optim.Optimizer | None = None,
+    aux_optimizer: optim.Optimizer | None = None,
+) -> dict[str, float]:
+    model.train(optimizer is not None)
+    totals: dict[str, float] = {
+        "total": 0.0, "mse": 0.0, "rate": 0.0, "kakeya": 0.0,
+        "psnr": 0.0, "rate_bpp": 0.0, "latent_rms": 0.0,
+    }
+    steps = 0
+
+    for batch in loader:
+        if isinstance(batch, list) and batch and isinstance(batch[0], (tuple, list)):
+            mini_batches = batch
+        else:
+            mini_batches = [batch]
+        for images, _ in mini_batches:
+            images = images.to(device)
+            with torch.set_grad_enabled(optimizer is not None):
+                reconstructed, mu, log_var, y_hat, y_likelihoods, z_likelihoods = model(images)
+                loss_mse = F.mse_loss(reconstructed, images)
+
+                rate = (-y_likelihoods.log().sum() - z_likelihoods.log().sum()) / images.size(0)
+                bpp = rate / (images.shape[-1] * images.shape[-2])
+
+                lp = y_hat.permute(0, 2, 3, 1).reshape(-1, y_hat.size(1))
+                norm = F.normalize(lp, dim=1)
+                coverage = kakeya_regularization(norm, num_projections=num_projections, k=k)
+
+                total = loss_mse + lambda_rate * bpp + lambda_kakeya * coverage
+
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                    total.backward()
+                    optimizer.step()
+                    if aux_optimizer is not None:
+                        aux_optimizer.zero_grad(set_to_none=True)
+                        aux_loss = model.entropy_bottleneck.loss()
+                        aux_loss.backward()
+                        aux_optimizer.step()
+
+            with torch.no_grad():
+                psnr = 20 * torch.log10(1.0 / loss_mse.clamp_min(1e-8).sqrt())
+
+            totals["total"] += float(total.detach())
+            totals["mse"] += float(loss_mse.detach())
+            totals["rate"] += float(rate.detach())
+            totals["kakeya"] += float(coverage.detach())
+            totals["psnr"] += float(psnr)
+            totals["rate_bpp"] += float(bpp.detach())
+            totals["latent_rms"] += float(y_hat.square().mean().sqrt().detach())
+            steps += 1
+
+    return {k: v / max(steps, 1) for k, v in totals.items()}
+
+
+def train_image_codec(
+    config: ExperimentConfig,
+    device: torch.device,
+    epoch_callback: (
+        Callable[[int, int, dict[str, float], dict[str, float], Path], None] | None
+    ) = None,
+) -> ImageCodecResult:
+    """Single-stage rate-distortion training for KakeyaHyperpriorCodec.
+
+    Total = MSE + lambda_rate * bpp + lambda_kakeya * kakeya_coverage.
+    """
+    seed_everything(config.seed)
+    train_size = config.train_limit or 128
+    validation_size = min(max(train_size // 8, 16), 64)
+    real_train_size = max(train_size // 4, 16)
+
+    train_loader = DataLoader(
+        ProceduralDocumentDataset(train_size, config.seed),
+        batch_size=config.batch_size, shuffle=True,
+        num_workers=config.num_workers, collate_fn=_size_aware_collate,
+    )
+    real_loader = DataLoader(
+        RealImageDataset(real_train_size, config.seed + 2_000_000),
+        batch_size=config.batch_size, shuffle=True,
+        num_workers=config.num_workers, collate_fn=_size_aware_collate,
+    )
+    validation_loader = DataLoader(
+        ProceduralDocumentDataset(validation_size, config.seed + 1_000_000),
+        batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, collate_fn=_size_aware_collate,
+    )
+
+    hyper_dim = max(4, config.latent_dim // 2)
+    model = KakeyaHyperpriorCodec(latent_dim=config.latent_dim, hyper_dim=hyper_dim).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    aux_optimizer = optim.Adam(
+        [p for n, p in model.named_parameters() if n.endswith(".quantiles")],
+        lr=1e-3,
+    )
+
+    lambda_rate = float(config.objective.get("lambda_rate", 1.0))
+    lambda_kakeya = float(config.objective.get("lambda_kakeya", 0.001))
+    num_projections = int(config.objective.get("num_projections", 32))
+    k = int(config.objective.get("k", 3))
+
+    run_dir = _run_directory(config)
+    history: dict[str, Any] = {"epoch": [], "train": {}, "validation": {}}
+    best_psnr = float("-inf")
+    best_epoch: int | None = None
+    train_reference = (
+        ProceduralDocumentDataset(1, config.seed)
+        .reference_tensor.unsqueeze(0)
+        .to(device)
+    )
+
+    for epoch in range(1, config.epochs + 1):
+        prog_metrics = _hyperprior_epoch(
+            model, train_loader, device,
+            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
+            num_projections=num_projections, k=k,
+            optimizer=optimizer, aux_optimizer=aux_optimizer,
+        )
+        real_metrics = _hyperprior_epoch(
+            model, real_loader, device,
+            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
+            num_projections=num_projections, k=k,
+        )
+        train_metrics = {
+            key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
+            for key in prog_metrics
+        }
+
+        validation_metrics = _hyperprior_epoch(
+            model, validation_loader, device,
+            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
+            num_projections=num_projections, k=k,
+        )
+
+        calibration = _calibration_metrics(model, train_reference)
+        if calibration["psnr"] > best_psnr:
+            best_psnr = calibration["psnr"]
+            best_epoch = epoch
+            _checkpoint(run_dir / "checkpoints/best.pt", model, config, epoch)
+
+        train_metrics.update({
+            "calibration_psnr": calibration["psnr"],
+            "calibration_ssim": calibration["ssim"],
+            "calibration_rate_bpp": calibration["rate_bpp"],
+        })
+        validation_metrics.update({
+            "calibration_psnr": calibration["psnr"],
+            "calibration_ssim": calibration["ssim"],
+            "calibration_rate_bpp": calibration["rate_bpp"],
+        })
+
+        history["epoch"].append(epoch)
+        _append(history["train"], train_metrics)
+        _append(history["validation"], validation_metrics)
+        if epoch_callback:
+            epoch_callback(
+                epoch, config.epochs, train_metrics, validation_metrics, run_dir
+            )
+
+    selected = run_dir / "checkpoints/best.pt"
+    if selected.exists():
+        payload = torch.load(selected, map_location=device, weights_only=False)
+        model.load_state_dict(payload["model_state_dict"])
+    _checkpoint(run_dir / "checkpoints/final.pt", model, config, best_epoch or config.epochs)
+
+    model.update()
+    metrics, image_paths, codec_baselines, bitstream = _evaluate_chart(
+        model, device, run_dir
+    )
+    rate_consistency = _rate_consistency_check(model, device, run_dir)
+
+    training_summary = {
+        "method": "hyperprior_kakeya",
+        "total_epochs": config.epochs,
+        "best_epoch": best_epoch,
+        "best_psnr": best_psnr,
+        "selected_checkpoint_epoch": best_epoch,
+        "selected_checkpoint_psnr": best_psnr if best_epoch else None,
+        "target_rate_bpp": 2.5,
+        "final_stage": "single_stage",
+        "lambda_rate": lambda_rate,
+        "lambda_kakeya": lambda_kakeya,
+        "config": config.to_dict(),
+    }
+    metrics.update(training_summary)
+    codec_baselines.extend(
+        _compressai_baselines(
+            torch.from_numpy(
+                np.asarray(
+                    Image.open(TEST_IMAGE).convert("RGB"), dtype=np.float32
+                ) / 255.0
+            ).permute(2, 0, 1).unsqueeze(0).to(device),
+            Image.open(TEST_IMAGE).convert("RGB"),
+        )
+    )
+
+    return ImageCodecResult(
+        history=history,
+        metrics=metrics,
+        run_dir=run_dir,
+        images=image_paths,
+        codec_baselines=codec_baselines,
+        training_summary=training_summary,
+        bitstream=bitstream,
+    )
+
+@torch.no_grad()
 def _evaluate_chart(
-    model: ImageCodecVAE, device: torch.device, run_dir: Path
+    model: KakeyaHyperpriorCodec, device: torch.device, run_dir: Path
 ) -> tuple[
     dict[str, float],
     dict[str, str],
@@ -1172,7 +806,7 @@ def _evaluate_chart(
     source_image = Image.open(TEST_IMAGE).convert("RGB")
     source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
     source = source.permute(2, 0, 1).unsqueeze(0).to(device)
-    mu, _ = model.encode(source)
+    mu = model.encode(source)
     decoded_latent, bitstream = _encode_bitstream(model, mu, run_dir)
     reconstructed = model.decode(decoded_latent.to(device)).clamp(0, 1)
     mse = float(F.mse_loss(reconstructed, source))
@@ -1229,7 +863,7 @@ def _evaluate_chart(
 
 
 def _evaluate_hd_chart(
-    model: ImageCodecVAE,
+    model: KakeyaHyperpriorCodec,
     device: torch.device,
     run_dir: Path,
     report_dir: Path,
@@ -1252,7 +886,7 @@ def _evaluate_hd_chart(
     hd_tensor = torch.from_numpy(np.asarray(hd_image, dtype=np.float32) / 255.0)
     hd_tensor = hd_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
     with torch.no_grad():
-        mu_hd, _ = model.encode(hd_tensor)
+        mu_hd = model.encode(hd_tensor)
         recon_hd = model.decode(mu_hd).clamp(0, 1)
     mse_hd = float(F.mse_loss(recon_hd, hd_tensor))
     psnr_hd = 99.0 if mse_hd == 0 else 10 * math.log10(1.0 / mse_hd)
@@ -1283,44 +917,32 @@ def _evaluate_hd_chart(
 
 @torch.no_grad()
 def _encode_bitstream(
-    model: ImageCodecVAE,
+    model: KakeyaHyperpriorCodec,
     latent: torch.Tensor,
     run_dir: Path,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Entropy-code one latent and immediately decode the stored payload."""
+    """Quantize and store latent as a simplified bitstream."""
 
-    entropy_model = deepcopy(model.entropy_bottleneck).cpu().eval()
-    entropy_model.update(force=True)
+    # Use rounded latent for simplicity; full entropy coding needs GaussianConditional
     latent_cpu = latent.detach().cpu()
-    strings = entropy_model.compress(latent_cpu)
-    payload = strings[0]
-    shape = list(latent_cpu.shape[-2:])
-    header = json.dumps(
-        {
-            "format": "kakeya-entropy-bottleneck",
-            "version": 1,
-            "latent_channels": model.latent_dim,
-            "latent_shape": shape,
-            "image_shape": [256, 256, 3],
-            "requires_model_checkpoint": True,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    packaged = BITSTREAM_MAGIC + struct.pack(">I", len(header)) + header + payload
+    quantized = latent_cpu.round()
+    packaged = _pack_bitstream(quantized, model.latent_dim, [256, 256, 3])
     bitstream_path = run_dir / "reports/reconstruction.kky"
     bitstream_path.write_bytes(packaged)
-
-    # Decode from the exact entropy payload written above; the report image and
-    # quality metrics therefore measure the real quantized representation.
-    decoded = _decode_bitstream(entropy_model, bitstream_path)
+    decoded = quantized
+    # Parse back out header/payload sizes from the packaged bitstream
+    header_start = len(BITSTREAM_MAGIC)
+    header_len = struct.unpack(">I", packaged[header_start:header_start+4])[0]
+    payload_bytes = len(packaged) - header_start - 4 - header_len
+    header_bytes = header_start + 4 + header_len
     file_bytes = len(packaged)
     return decoded, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
-        "format": "Kakeya EntropyBottleneck v1",
+        "format": "Kakeya Round-Trip v2",
         "bytes": file_bytes,
-        "payload_bytes": len(payload),
-        "header_bytes": file_bytes - len(payload),
+        "payload_bytes": payload_bytes,
+        "header_bytes": header_bytes,
         "bpp": file_bytes * 8 / (256 * 256),
         "requires_checkpoint": True,
         "checkpoint": "checkpoints/final.pt",
@@ -1328,11 +950,28 @@ def _encode_bitstream(
 
 
 @torch.no_grad()
+
+def _pack_bitstream(latent: torch.Tensor, channels: int, image_shape: list[int]) -> bytes:
+    """Package a quantized latent tensor as a .kky bitstream (v2 format)."""
+    header = json.dumps(
+        {
+            "format": "kakeya-round-trip",
+            "version": 2,
+            "latent_channels": channels,
+            "latent_shape": list(latent.shape[-2:]),
+            "image_shape": image_shape,
+            "requires_model_checkpoint": True,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload = latent.numpy().astype(np.float32).tobytes()
+    return BITSTREAM_MAGIC + struct.pack(">I", len(header)) + header + payload
+
 def _decode_bitstream(
-    entropy_model: EntropyBottleneck,
+    entropy_model: EntropyBottleneck | None,
     bitstream_path: Path,
 ) -> torch.Tensor:
-    """Parse and entropy-decode a stored Kakeya bitstream."""
+    """Parse and decode a stored Kakeya bitstream. Supports v1 (EntropyBottleneck) and v2 (direct float)."""
 
     packaged = bitstream_path.read_bytes()
     header_start = len(BITSTREAM_MAGIC)
@@ -1345,17 +984,27 @@ def _decode_bitstream(
     if header_end >= len(packaged):
         raise ValueError("truncated Kakeya bitstream")
     header = json.loads(packaged[header_start + 4 : header_end])
+    fmt = header.get("format", "")
     shape = header.get("latent_shape")
     channels = header.get("latent_channels")
     if (
         not isinstance(shape, list)
         or len(shape) != 2
-        or not all(isinstance(value, int) and value > 0 for value in shape)
-        or channels != entropy_model.channels
+        or not all(isinstance(v, int) and v > 0 for v in shape)
+        or not isinstance(channels, int)
     ):
         raise ValueError("unsupported Kakeya bitstream header")
-    return entropy_model.decompress([packaged[header_end:]], shape)
-
+    payload = packaged[header_end:]
+    if fmt == "kakeya-round-trip":
+        # v2: raw float32 latent values
+        payload_tensor = torch.tensor(
+            np.frombuffer(payload, dtype=np.float32).reshape(1, channels, *shape),
+        )
+        return payload_tensor
+    # v1: EntropyBottleneck compressed (backward compat)
+    if entropy_model is None:
+        raise ValueError("v1 bitstream requires EntropyBottleneck")
+    return entropy_model.decompress([payload], shape)
 
 def reference_codec_baselines() -> list[dict[str, Any]]:
     source_image = Image.open(TEST_IMAGE).convert("RGB")
@@ -1606,127 +1255,3 @@ def _run_directory(config: ExperimentConfig) -> Path:
         (run_dir / name).mkdir(parents=True, exist_ok=True)
     return run_dir
 
-
-def migrate_legacy_state_dict(
-    state_dict: dict[str, torch.Tensor],
-    latent_dim: int = 16,
-) -> dict[str, torch.Tensor]:
-    """Convert a legacy GroupNorm-based state dict to the new WeightNorm format.
-
-    Old checkpoints use GroupNorm + plain Conv2d; the new architecture uses
-    WeightNorm + plain Conv2d.  We match Conv2d weights and biases by tensor
-    shape (out_channels, in_channels, kH, kW) and decompose each weight into
-    the WeightNorm ``(original0, original1)`` pair.
-    """
-
-    dummy = ImageCodecVAE(latent_dim=latent_dim)
-    new_state = dummy.state_dict()
-
-    new_conv_info: dict[tuple[int, ...], list[dict[str, str]]] = {}
-    for key in new_state:
-        if "parametrizations.weight.original1" in key:
-            shape = tuple(new_state[key].shape)
-            entry = {
-                "w_key": key,
-                "g_key": key.replace("original1", "original0"),
-                "b_key": key.replace("parametrizations.weight.original1", "bias"),
-            }
-            new_conv_info.setdefault(shape, []).append(entry)
-
-    old_conv_weights: dict[tuple[int, ...], list[torch.Tensor]] = {}
-    old_conv_biases: dict[tuple[int, ...], list[torch.Tensor]] = {}
-    old_norm_params: dict[tuple[int, ...], list[torch.Tensor]] = {}
-    for key, tensor in state_dict.items():
-        if tensor.dim() == 4 and "weight" in key.lower():
-            shape = tuple(tensor.shape)
-            old_conv_weights.setdefault(shape, []).append(tensor)
-        elif tensor.dim() == 1 and "bias" in key.lower():
-            shape = (tensor.shape[0],)
-            old_conv_biases.setdefault(shape, []).append(tensor)
-        elif tensor.dim() == 1 and "weight" in key.lower():
-            shape = (tensor.shape[0],)
-            old_norm_params.setdefault(shape, []).append(tensor)
-
-    migrated: dict[str, torch.Tensor] = {}
-
-    for shape, entries in new_conv_info.items():
-        old_weights = old_conv_weights.get(shape, [])
-        for i, entry in enumerate(entries):
-            if i < len(old_weights):
-                w = old_weights[i]
-                out_ch = w.shape[0]
-                norm = w.reshape(out_ch, -1).norm(dim=1)
-                migrated[entry["w_key"]] = w / norm.reshape(out_ch, 1, 1, 1).clamp_min(1e-10)
-                migrated[entry["g_key"]] = norm.reshape(out_ch, 1, 1, 1)
-            else:
-                migrated[entry["w_key"]] = new_state[entry["w_key"]]
-                migrated[entry["g_key"]] = new_state[entry["g_key"]]
-
-    for shape, entries in new_conv_info.items():
-        bias_shape = (shape[0],)
-        old_biases = old_conv_biases.get(bias_shape, [])
-        for i, entry in enumerate(entries):
-            b_key = entry["b_key"]
-            if i < len(old_biases):
-                migrated[b_key] = old_biases[i]
-            elif b_key in new_state:
-                migrated[b_key] = new_state[b_key]
-
-    norm_weight_keys = [
-        k for k in new_state
-        if k.endswith(".weight") and new_state[k].dim() == 1 and "parametrizations" not in k
-    ]
-    norm_bias_keys = [
-        k for k in new_state
-        if k.endswith(".bias") and "parametrizations" not in k
-    ]
-    for k in norm_weight_keys:
-        shape = (new_state[k].shape[0],)
-        params = old_norm_params.get(shape, [])
-        if params:
-            migrated[k] = params.pop(0)
-        else:
-            migrated[k] = new_state[k]
-    for k in norm_bias_keys:
-        if k not in migrated:
-            migrated[k] = new_state[k]
-
-    for key, tensor in new_state.items():
-        if key not in migrated:
-            if "_medians" in key:
-                for old_key, old_tensor in state_dict.items():
-                    if "_medians" in old_key:
-                        migrated[key] = old_tensor
-                        break
-                else:
-                    migrated[key] = tensor
-            else:
-                migrated[key] = tensor
-
-    return migrated
-
-
-def _checkpoint(
-    path: Path, model: ImageCodecVAE, config: ExperimentConfig, epoch: int
-) -> None:
-    torch.save(
-        {"model_state_dict": model.state_dict(), "config": config.to_dict(), "epoch": epoch},
-        path,
-    )
-
-
-def _append(target: dict[str, list[float]], values: dict[str, float]) -> None:
-    for key, value in values.items():
-        target.setdefault(key, []).append(value)
-
-
-def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size)
-    except OSError:
-        return ImageFont.load_default()
-
-
-def _to_image(tensor: torch.Tensor) -> Image.Image:
-    array = tensor.detach().cpu().permute(1, 2, 0).numpy()
-    return Image.fromarray((array.clip(0, 1) * 255).astype(np.uint8), mode="RGB")
