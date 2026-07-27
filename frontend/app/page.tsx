@@ -515,7 +515,7 @@ export default function Home() {
             <NumberField
               label="学习率"
               value={config.learning_rate}
-              min={0.000001}
+              min={0}
               max={1}
               step={0.0001}
               onChange={(learning_rate) =>
@@ -969,7 +969,7 @@ function ObjectiveFields({
           <NumberField
             label="β 权重"
             value={config.beta}
-            min={0.01}
+            min={0}
             max={100}
             step={0.1}
             onChange={(beta) => setConfig({ ...config, beta })}
@@ -992,7 +992,7 @@ function ObjectiveFields({
               value={config.lambda_kakeya}
               min={0}
               max={1000}
-              step={0.1}
+              step={0.001}
               onChange={(lambda_kakeya) =>
                 setConfig({ ...config, lambda_kakeya })
               }
