@@ -948,14 +948,20 @@ def _epoch(
                     k=int(config.objective.get("k", 8)),
                 )
                 if stage == "capacity":
+                    # All loss directions are active from the very first epoch;
+                    # only their weights differ across stages.  Low weights on
+                    # mse/structural here let capacity training stay focused on
+                    # reconstruction + kakeya coverage while still seeding the
+                    # pixel-error and structure gradients so transition/finetune
+                    # don't have to cold-start them.
                     kakeya_default = 0.002
-                    mse_w = 0.0
-                    structural_w = 0.0
+                    mse_w = 0.5
+                    structural_w = 0.1
                     lab_w = 0.02
                 elif stage == "transition":
                     kakeya_default = 0.001
                     mse_w = 5.0
-                    structural_w = 0.0
+                    structural_w = 0.25
                     lab_w = 0.05
                 else:
                     kakeya_default = 0.0005
