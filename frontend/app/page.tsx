@@ -79,8 +79,8 @@ type ExperimentConfig = {
   k: number;
   lambda_rate: number;
   lambda_kakeya: number;
+  stage_weights?: Record<string, Record<string, number>>;
 };
-
 type ResultPayload = {
   config: ExperimentConfig;
   history: {
@@ -1011,8 +1011,72 @@ function ObjectiveFields({
         )}
       </div>
       {config.method === "image_codec" && (
-          <p className="objective-note">单阶段端到端训练, 损失 = MSE + λ·rate + λₖ·kakeya</p>
-        )}
+        <StageWeightsEditor config={config} setConfig={setConfig} />
+      )}
+    </div>
+  );
+}
+
+const STAGE_LOSS_KEYS = ["mse", "edge", "structural", "multiscale", "lab", "hue", "saturation", "kakeya"];
+
+const STAGE_DEFAULTS: Record<string, Record<string, number>> = {
+  capacity:  { mse: 1.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, kakeya: 0.002 },
+  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, kakeya: 0.001 },
+  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, kakeya: 0.0005 },
+};
+function StageWeightsEditor({
+  config, setConfig,
+}: {
+  config: ExperimentConfig;
+  setConfig: (config: ExperimentConfig) => void;
+}) {
+  const stages = ["capacity", "transition", "finetune"] as const;
+  const current = config.stage_weights ?? {};
+  const update = (stage: string, key: string, value: number) => {
+    const stageObj = { ...(current[stage] ?? {}) };
+    stageObj[key] = value;
+    setConfig({
+      ...config,
+      stage_weights: { ...current, [stage]: stageObj },
+    });
+  };
+  const stepForKey = (key: string) =>
+    key === "kakeya" ? 0.0005 : key === "mse" ? 0.5 : key === "structural" ? 0.05 : 0.01;
+  return (
+    <div className="stage-weights-editor">
+      <p>分阶段损失权重</p>
+      <table className="stage-weights-table">
+        <thead>
+          <tr>
+            <th>阶段</th>
+            {STAGE_LOSS_KEYS.map((k) => (
+              <th key={k}>{k}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {stages.map((stage) => {
+            const stageObj = { ...STAGE_DEFAULTS[stage], ...(current[stage] ?? {}) };
+            return (
+              <tr key={stage}>
+                <td>{stage}</td>
+                {STAGE_LOSS_KEYS.map((key) => (
+                  <td key={key}>
+                    <input
+                      type="number"
+                      step={stepForKey(key)}
+                      min={0}
+                      value={stageObj[key]}
+                      onChange={(e) => update(stage, key, parseFloat(e.target.value) || 0)}
+                    />
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <small>所有损失方向从 capacity 阶段即启用，各阶段仅权重递增。留空使用默认值。</small>
     </div>
   );
 }

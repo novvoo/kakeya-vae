@@ -569,7 +569,7 @@ def _calibration_metrics(
     # Rate from forward pass
     _, _, _, _, y_likelihoods, z_likelihoods = model(source)
     rate_bpp = float(
-        (-y_likelihoods.log().sum() - z_likelihoods.log().sum())
+        (-y_likelihoods.log2().sum() - z_likelihoods.log2().sum())
         / (source.shape[-1] * source.shape[-2])
     )
     return {
@@ -590,11 +590,21 @@ def _hyperprior_epoch(
     k: int = 3,
     optimizer: optim.Optimizer | None = None,
     aux_optimizer: optim.Optimizer | None = None,
+    stage_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
+    """Single-epoch training with perceptual losses and per-stage weight scheduling.
+
+    When stage_weights is provided, the loss is a weighted sum of MSE, edge,
+    structural (1-SSIM), multiscale L1, LAB color (delta_e, hue, saturation),
+    kakeya coverage, and rate.  Without stage_weights, falls back to basic
+    MSE + lambda_rate*bpp + lambda_kakeya*coverage.
+    """
     model.train(optimizer is not None)
     totals: dict[str, float] = {
-        "total": 0.0, "mse": 0.0, "rate": 0.0, "kakeya": 0.0,
-        "psnr": 0.0, "rate_bpp": 0.0, "latent_rms": 0.0,
+        "total": 0.0, "mse": 0.0, "edge": 0.0, "structural": 0.0,
+        "multiscale": 0.0, "lab": 0.0, "hue": 0.0, "saturation": 0.0,
+        "kakeya": 0.0, "rate": 0.0, "psnr": 0.0, "rate_bpp": 0.0,
+        "latent_rms": 0.0,
     }
     steps = 0
 
@@ -608,15 +618,44 @@ def _hyperprior_epoch(
             with torch.set_grad_enabled(optimizer is not None):
                 reconstructed, mu, log_var, y_hat, y_likelihoods, z_likelihoods = model(images)
                 loss_mse = F.mse_loss(reconstructed, images)
-
-                rate = (-y_likelihoods.log().sum() - z_likelihoods.log().sum()) / images.size(0)
-                bpp = rate / (images.shape[-1] * images.shape[-2])
+                rate = (-y_likelihoods.log2().sum() - z_likelihoods.log2().sum()) / images.size(0)
+                bpp_bits = rate / (images.shape[-1] * images.shape[-2])
 
                 lp = y_hat.permute(0, 2, 3, 1).reshape(-1, y_hat.size(1))
                 norm = F.normalize(lp, dim=1)
                 coverage = kakeya_regularization(norm, num_projections=num_projections, k=k)
 
-                total = loss_mse + lambda_rate * bpp + lambda_kakeya * coverage
+                if stage_weights is not None:
+                    sw = stage_weights
+                    edge = F.l1_loss(_edges(reconstructed), _edges(images))
+                    structural = 1.0 - _ssim(reconstructed, images)
+                    multiscale = _multiscale_l1(reconstructed, images)
+                    lab_losses = _lab_losses(reconstructed, images)
+                    lab = lab_losses["delta_e"]
+                    hue = lab_losses["hue"]
+                    sat = lab_losses["saturation"]
+                    rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
+
+                    total = (
+                        sw["mse"] * loss_mse
+                        + sw["edge"] * edge
+                        + sw["structural"] * structural
+                        + sw["multiscale"] * multiscale
+                        + sw["lab"] * lab
+                        + sw["hue"] * hue
+                        + sw["saturation"] * sat
+                        + sw["kakeya"] * coverage
+                        + lambda_rate * rate_penalty
+                    )
+                else:
+                    edge = torch.zeros_like(loss_mse)
+                    structural = torch.zeros_like(loss_mse)
+                    multiscale = torch.zeros_like(loss_mse)
+                    lab = torch.zeros_like(loss_mse)
+                    hue = torch.zeros_like(loss_mse)
+                    sat = torch.zeros_like(loss_mse)
+                    rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
+                    total = loss_mse + lambda_rate * rate_penalty + lambda_kakeya * coverage
 
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
@@ -633,22 +672,39 @@ def _hyperprior_epoch(
 
             totals["total"] += float(total.detach())
             totals["mse"] += float(loss_mse.detach())
-            totals["rate"] += float(rate.detach())
+            totals["edge"] += float(edge.detach())
+            totals["structural"] += float(structural.detach())
+            totals["multiscale"] += float(multiscale.detach())
+            totals["lab"] += float(lab.detach())
+            totals["hue"] += float(hue.detach())
+            totals["saturation"] += float(sat.detach())
             totals["kakeya"] += float(coverage.detach())
+            totals["rate"] += float(rate.detach())
             totals["psnr"] += float(psnr)
-            totals["rate_bpp"] += float(bpp.detach())
+            totals["rate_bpp"] += float(bpp_bits.detach())
             totals["latent_rms"] += float(y_hat.square().mean().sqrt().detach())
             steps += 1
 
     return {k: v / max(steps, 1) for k, v in totals.items()}
+# Stage training constants
+CAPACITY_GATE_PSNR = 26.0
+CAPACITY_GATE_SSIM = 0.96
+CAPACITY_GATE_FORCE_EPOCH = 40
+CAPACITY_STEPS_PER_EPOCH = 32
+QUALITY_REHEARSAL_STEPS = 8
 
-
+TRANSITION_EPOCHS = 5
+RATE_LOSS_WEIGHT = 0.01
+FINETUNE_WARMUP_EPOCHS = 10
+FINETUNE_WARMUP_RATE_WEIGHT = 0.001
+FINETUNE_WARMUP_GRAD_CLIP = 10.0
 def train_image_codec(
     config: ExperimentConfig,
     device: torch.device,
     epoch_callback: (
         Callable[[int, int, dict[str, float], dict[str, float], Path], None] | None
     ) = None,
+    run_dir: Path | None = None,
 ) -> ImageCodecResult:
     """Single-stage rate-distortion training for KakeyaHyperpriorCodec.
 
@@ -683,15 +739,24 @@ def train_image_codec(
         lr=1e-3,
     )
 
-    lambda_rate = float(config.objective.get("lambda_rate", 1.0))
+    lambda_rate = float(config.objective.get("lambda_rate", RATE_LOSS_WEIGHT))
     lambda_kakeya = float(config.objective.get("lambda_kakeya", 0.001))
     num_projections = int(config.objective.get("num_projections", 32))
     k = int(config.objective.get("k", 3))
+    stage_weights_map = config.stage_weights()
 
-    run_dir = _run_directory(config)
+    # Capacity gate dataloaders
+    capacity_loader = DataLoader(
+        CalibrationCardDataset(CAPACITY_STEPS_PER_EPOCH, multiscale=True, seed=config.seed),
+        batch_size=1, shuffle=False, num_workers=0, collate_fn=_size_aware_collate,
+    )
+
+    run_dir = run_dir or _run_directory(config)
     history: dict[str, Any] = {"epoch": [], "train": {}, "validation": {}}
     best_psnr = float("-inf")
     best_epoch: int | None = None
+    gate_epoch: int | None = None
+    gate_forced: bool = False
     train_reference = (
         ProceduralDocumentDataset(1, config.seed)
         .reference_tensor.unsqueeze(0)
@@ -699,40 +764,116 @@ def train_image_codec(
     )
 
     for epoch in range(1, config.epochs + 1):
-        prog_metrics = _hyperprior_epoch(
-            model, train_loader, device,
-            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
-            num_projections=num_projections, k=k,
-            optimizer=optimizer, aux_optimizer=aux_optimizer,
+        capacity_stage = gate_epoch is None
+        transition_stage = (
+            gate_epoch is not None
+            and epoch - gate_epoch <= TRANSITION_EPOCHS
+            and epoch < config.epochs
         )
-        real_metrics = _hyperprior_epoch(
-            model, real_loader, device,
-            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
-            num_projections=num_projections, k=k,
+        stage: Literal["capacity", "transition", "finetune"] = (
+            "capacity" if capacity_stage
+            else "transition" if transition_stage
+            else "finetune"
         )
-        train_metrics = {
-            key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
-            for key in prog_metrics
-        }
+
+        # Stage-dependent learning rate
+        if capacity_stage:
+            current_lr = max(config.learning_rate, 1e-3)
+        elif transition_stage:
+            current_lr = max(config.learning_rate, 5e-4)
+        else:
+            current_lr = config.learning_rate
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
+
+        # Rate weight and grad clip
+        if capacity_stage:
+            rate_weight = 0.0
+            grad_clip = None
+        elif transition_stage:
+            rate_weight = FINETUNE_WARMUP_RATE_WEIGHT
+            grad_clip = FINETUNE_WARMUP_GRAD_CLIP
+        else:
+            epochs_since_gate = epoch - (gate_epoch or 0)
+            if epochs_since_gate <= FINETUNE_WARMUP_EPOCHS:
+                rate_weight = FINETUNE_WARMUP_RATE_WEIGHT
+                grad_clip = FINETUNE_WARMUP_GRAD_CLIP
+            else:
+                rate_weight = lambda_rate
+                grad_clip = None
+
+        sw = stage_weights_map[stage]
+        epoch_kw = dict(
+            model=model, device=device, lambda_rate=rate_weight,
+            lambda_kakeya=lambda_kakeya, num_projections=num_projections, k=k,
+            stage_weights=sw,
+        )
+
+        if capacity_stage:
+            # Capacity stage: train on reference card, procedural, real images
+            ref_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=capacity_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
+            prog_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=train_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
+            real_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=real_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
+            train_metrics = {
+                key: 0.4 * ref_metrics[key] + 0.3 * prog_metrics[key] + 0.3 * real_metrics[key]
+                for key in ref_metrics
+            }
+        else:
+            prog_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=train_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
+            real_metrics = _hyperprior_epoch(
+                **epoch_kw, loader=real_loader, optimizer=optimizer,
+                aux_optimizer=aux_optimizer,
+            )
+            train_metrics = {
+                key: 0.5 * prog_metrics[key] + 0.5 * real_metrics[key]
+                for key in prog_metrics
+            }
 
         validation_metrics = _hyperprior_epoch(
-            model, validation_loader, device,
-            lambda_rate=lambda_rate, lambda_kakeya=lambda_kakeya,
-            num_projections=num_projections, k=k,
+            **epoch_kw, loader=validation_loader,
         )
 
         calibration = _calibration_metrics(model, train_reference)
-        if calibration["psnr"] > best_psnr:
+
+        # Capacity gate check (only when still in capacity stage)
+        if capacity_stage:
+            if calibration["psnr"] >= CAPACITY_GATE_PSNR and calibration["ssim"] >= CAPACITY_GATE_SSIM:
+                gate_epoch = epoch
+            elif epoch >= CAPACITY_GATE_FORCE_EPOCH:
+                gate_epoch = epoch
+                gate_forced = True
+
+        if calibration["psnr"] > best_psnr and (gate_epoch is not None or calibration["rate_bpp"] <= TARGET_RATE_BPP):
             best_psnr = calibration["psnr"]
             best_epoch = epoch
             _checkpoint(run_dir / "checkpoints/best.pt", model, config, epoch)
 
         train_metrics.update({
+            "stage": {"capacity": 1, "transition": 2, "finetune": 3}[stage],
+            "capacity_stage": float(capacity_stage),
+            "capacity_gate_passed": gate_epoch is not None,
+            "capacity_gate_epoch": float(gate_epoch or 0),
             "calibration_psnr": calibration["psnr"],
             "calibration_ssim": calibration["ssim"],
             "calibration_rate_bpp": calibration["rate_bpp"],
         })
         validation_metrics.update({
+            "stage": {"capacity": 1, "transition": 2, "finetune": 3}[stage],
+            "capacity_stage": float(capacity_stage),
+            "capacity_gate_passed": gate_epoch is not None,
+            "capacity_gate_epoch": float(gate_epoch or 0),
             "calibration_psnr": calibration["psnr"],
             "calibration_ssim": calibration["ssim"],
             "calibration_rate_bpp": calibration["rate_bpp"],
@@ -758,6 +899,7 @@ def train_image_codec(
     )
     rate_consistency = _rate_consistency_check(model, device, run_dir)
 
+    finetune_stage_epochs = max(0, (config.epochs - (gate_epoch or 0) - TRANSITION_EPOCHS))
     training_summary = {
         "method": "hyperprior_kakeya",
         "total_epochs": config.epochs,
@@ -765,23 +907,20 @@ def train_image_codec(
         "best_psnr": best_psnr,
         "selected_checkpoint_epoch": best_epoch,
         "selected_checkpoint_psnr": best_psnr if best_epoch else None,
-        "target_rate_bpp": 2.5,
-        "final_stage": "single_stage",
+        "target_rate_bpp": TARGET_RATE_BPP,
+        "final_stage": "finetune" if gate_epoch else "capacity",
         "lambda_rate": lambda_rate,
         "lambda_kakeya": lambda_kakeya,
         "config": config.to_dict(),
+        "capacity_gate_passed": gate_epoch is not None,
+        "capacity_gate_forced": gate_forced,
+        "capacity_gate_epoch": gate_epoch,
+        "capacity_gate": {"psnr": CAPACITY_GATE_PSNR, "ssim": CAPACITY_GATE_SSIM},
+        "transition_epochs": TRANSITION_EPOCHS,
+        "compression_finetune_epochs": finetune_stage_epochs,
     }
     metrics.update(training_summary)
-    codec_baselines.extend(
-        _compressai_baselines(
-            torch.from_numpy(
-                np.asarray(
-                    Image.open(TEST_IMAGE).convert("RGB"), dtype=np.float32
-                ) / 255.0
-            ).permute(2, 0, 1).unsqueeze(0).to(device),
-            Image.open(TEST_IMAGE).convert("RGB"),
-        )
-    )
+    # _evaluate_chart already includes CompressAI baselines via reference_codec_baselines().
 
     return ImageCodecResult(
         history=history,
@@ -1073,6 +1212,7 @@ def _compressai_baselines(
             except Exception:
                 continue
             net.eval()
+            net = net.to(source.device)
             with torch.no_grad():
                 compressed = net.compress(source)
                 strings = compressed["strings"]

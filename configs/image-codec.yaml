@@ -12,6 +12,7 @@ download: false
 objective:
   num_projections: 32
   k: 3
+  lambda_rate: 0.01
   # Per-stage loss weights.  Every loss direction participates from the
   # first epoch; stages only differ in weights.  Any subset may be omitted
   # to inherit the defaults from DEFAULT_STAGE_WEIGHTS in config.py.

@@ -7,6 +7,39 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
+    "capacity": {
+        "mse": 1.0,
+        "edge": 1.0,
+        "structural": 0.2,
+        "multiscale": 0.2,
+        "lab": 0.05,
+        "hue": 0.05,
+        "saturation": 0.05,
+        "kakeya": 0.002,
+    },
+    "transition": {
+        "mse": 2.0,
+        "edge": 1.5,
+        "structural": 0.4,
+        "multiscale": 0.3,
+        "lab": 0.08,
+        "hue": 0.08,
+        "saturation": 0.08,
+        "kakeya": 0.001,
+    },
+    "finetune": {
+        "mse": 3.0,
+        "edge": 2.0,
+        "structural": 0.6,
+        "multiscale": 0.4,
+        "lab": 0.12,
+        "hue": 0.06,
+        "saturation": 0.08,
+        "kakeya": 0.0005,
+    },
+}
+
 
 SUPPORTED_METHODS = {
     "baseline",
@@ -71,6 +104,15 @@ class ExperimentConfig:
         values["data_dir"] = str(self.data_dir)
         values["output_dir"] = str(self.output_dir)
         return values
+
+    def stage_weights(self) -> dict[str, dict[str, float]]:
+        """Return per-stage loss weights, merging user overrides from config.objective.stage_weights."""
+        user_overrides = self.objective.get("stage_weights", {})
+        merged: dict[str, dict[str, float]] = {}
+        for stage, defaults in DEFAULT_STAGE_WEIGHTS.items():
+            overrides = user_overrides.get(stage, {})
+            merged[stage] = {**defaults, **overrides}
+        return merged
 
 
 def load_config(path: str | Path) -> ExperimentConfig:

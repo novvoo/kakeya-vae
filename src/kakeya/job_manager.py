@@ -345,15 +345,17 @@ class JobManager:
                     for index, epoch in enumerate(epochs)
                 ]
                 run_dir = dashboard_path.parents[1]
+                has_error = bool(payload.get("error"))
                 record = JobRecord(
                     id=f"saved-{run_dir.parent.name}-{run_dir.name}",
                     config=config,
                     device="saved",
-                    status="completed",
+                    status="failed" if has_error else "completed",
                     epoch=len(epochs),
                     total_epochs=int(config.get("epochs", len(epochs))),
-                    progress=1.0,
-                    message="已从磁盘加载实验结果",
+                    progress=1.0 if not has_error else 0.0,
+                    message=payload.get("error", "已从磁盘加载实验结果"),
+                    error=payload.get("error") if has_error else None,
                     run_dir=str(run_dir.relative_to(PROJECT_ROOT)),
                     result_path=str(dashboard_path),
                     metrics=payload.get("metrics"),
@@ -365,7 +367,7 @@ class JobManager:
                         dashboard_path.stat().st_mtime, timezone.utc
                     ).isoformat(),
                 )
-                record.logs.append("已从磁盘加载实验结果")
+                record.logs.append("已从磁盘加载实验结果" if not has_error else "训练失败记录加载")
                 self._jobs[record.id] = record
             except (KeyError, IndexError, OSError, ValueError, json.JSONDecodeError):
                 continue

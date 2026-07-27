@@ -130,34 +130,14 @@ graph TD
     QUANT -.->|latent| L1
 
     subgraph 损失加权
-        W[kakeya_weight<br/>来自 config.stage_weights()[stage].kakeya<br/>capacity 0.002 / transition 0.001 / finetune 0.0005<br/>rehearsal_loader override=0.0]
-        KC[kakeya_contribution<br/>= kakeya_weight * coverage]
-        TOTAL[total loss<br/>+= kakeya_contribution]
+        KW[kakeya_weight = config.lambda_kakeya<br/>默认 0.001]
+        KC[kakeya_contribution<br/>= lambda_kakeya * coverage]
+        TOTAL[total loss<br/>= MSE + lambda·rate + lambda_k·kakeya]
 
         L6 --> KC
-        W --> KC
+        KW --> KC
         KC --> TOTAL
     end
-
-    subgraph 阶段策略
-        S1[Capacity Stage<br/>kakeya 0.002<br/>从第1个epoch约束覆盖]
-        S2[Transition Stage<br/>kakeya 0.001<br/>持续覆盖约束]
-        S3[Finetune Stage<br/>kakeya 0.0005<br/>持续覆盖正则]
-        S1 -.-> S2
-        S2 -.-> S3
-    end
-
-    subgraph Rehearsal例外
-        R1[rehearsal_loader<br/>所有阶段 override=0.0<br/>参考图不需挂谷正则]
-    end
-
-    style L6 fill:#e1f5fe
-    style KC fill:#fff3e0
-    style TOTAL fill:#fff9c4
-    style S1 fill:#c8e6c9
-    style S2 fill:#c8e6c9
-    style S3 fill:#c8e6c9
-    style R1 fill:#fff3e0
 ```
 
 ### 1.4 挂谷正则对潜空间的影响
@@ -255,7 +235,7 @@ flowchart TD
 
 ---
 
-## 2. 模型结构 (ImageCodecVAE)
+## 2. 模型结构 (KakeyaHyperpriorCodec — 超先验 + 挂谷正则)
 
 ```mermaid
 graph TD
@@ -263,52 +243,56 @@ graph TD
         IMG[RGB Image<br/>H x W x 3]
     end
 
-    subgraph Encoder
+    subgraph g_a — 分析变换
         IMG --> S2D1[SpaceToDepth<br/>3→24, /2]
-        S2D1 --> RB1[ResidualBlock<br/>24]
+        S2D1 --> RB1[ResidualBlockGDN<br/>24]
         RB1 --> S2D2[SpaceToDepth<br/>24→32, /2]
-        S2D2 --> RB2[ResidualBlock<br/>32]
+        S2D2 --> RB2[ResidualBlockGDN<br/>32]
         RB2 --> S2D3[SpaceToDepth<br/>32→64, /2]
-        S2D3 --> RB3[ResidualBlock<br/>64]
+        S2D3 --> RB3[ResidualBlockGDN<br/>64]
+        RB3 --> CONV[weight_norm Conv 1x1<br/>64→32]
+        CONV --> SPLIT[chunk 2 dim=1<br/>→ mu + log_var]
     end
 
-    subgraph Latent
-        RB3 --> MU[to_mu<br/>Conv 1x1, 64→16]
-        RB3 --> LV[to_log_var<br/>Conv 1x1, 64→16]
-        MU --> TANH[tanh bound<br/>±3.0]
-        TANH --> MU_B[mu_bounded<br/>16 x H/8 x W/8]
-        LV --> CLAMP[clamp -6, 2]
-        CLAMP --> LV_B[log_var<br/>16 x H/8 x W/8]
+    subgraph 超先验 Hyperprior
+        SPLIT -->|mu| TANH[tanh bound ±3<br/>mu_bounded 16×32×32]
+        TANH --> HA1[Conv 3x3 stride1<br/>16→8]
+        HA1 --> HA2[Conv 5x5 stride2<br/>8, 下采样 /2]
+        HA2 --> HA3[Conv 5x5 stride2<br/>8, 下采样 /2]
+        HA3 --> EB[EntropyBottleneck<br/>8 通道]
+        EB --> HD1[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
+        HD1 --> HD2[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
+        HD2 --> HD3[Conv 3x3<br/>8→32]
+        HD3 --> H_SPLIT[chunk 2 dim=1<br/>→ scale + mean]
     end
 
-    subgraph EntropyBottleneck
-        MU_B --> EB[EntropyBottleneck<br/>16 channels]
-        EB --> Q[Quantize<br/>round / dequantize]
-        EB --> COMP[compress<br/>bitstream]
-        COMP --> DECOMP[decompress<br/>latent]
-        Q --> RATE[rate_bpp<br/>likelihoods]
+    subgraph 条件高斯熵模型
+        TANH --> GC[GaussianConditional<br/>N(y_hat | mean, scale)]
+        H_SPLIT -->|scale, mean| GC
+        GC --> Y_HAT[y_hat<br/>量化潜变量]
+        GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
     end
 
-    subgraph Decoder
-        Q --> D0[Conv 1x1<br/>16→64]
-        D0 --> DRB1[ResidualBlock<br/>64]
+    subgraph g_s — 综合变换
+        Y_HAT --> D0[weight_norm Conv 3x3<br/>16→64]
+        D0 --> DRB1[ResidualBlockGDN<br/>64]
         DRB1 --> D2S1[DepthToSpace<br/>64→32, x2]
-        D2S1 --> DRB2[ResidualBlock<br/>32]
+        D2S1 --> DRB2[ResidualBlockGDN<br/>32]
         DRB2 --> D2S2[DepthToSpace<br/>32→24, x2]
-        D2S2 --> DRB3[ResidualBlock<br/>24]
+        D2S2 --> DRB3[ResidualBlockGDN<br/>24]
         DRB3 --> D2S3[DepthToSpace<br/>24→12, x2]
-        D2S3 --> DC1[Conv 3x3<br/>12→24]
+        D2S3 --> DC1[weight_norm Conv 3x3<br/>12→24]
         DC1 --> SILU[SiLU]
-        SILU --> DC2[Conv 3x3<br/>24→3]
+        SILU --> DC2[weight_norm Conv 3x3<br/>24→3]
         DC2 --> SIG[Sigmoid]
         SIG --> OUT[RGB Output<br/>H x W x 3]
     end
 
     style Input fill:#e1f5fe
-    style Encoder fill:#f3e5f5
-    style Latent fill:#fff3e0
-    style EntropyBottleneck fill:#fce4ec
-    style Decoder fill:#e8f5e9
+    style g_a fill:#f3e5f5
+    style 超先验 Hyperprior fill:#e8eaf6
+    style 条件高斯熵模型 fill:#fce4ec
+    style g_s fill:#e8f5e9
 ```
 
 ### 关键组件细节
@@ -318,233 +302,60 @@ graph LR
     subgraph SpaceToDepth
         A[Input<br/>C x H x W] --> PU[PixelUnshuffle 2<br/>4C x H/2 x W/2]
         PU --> C1[Conv 3x3<br/>4C→C_out]
-        C1 --> IN1[InstanceNorm2d]
-        IN1 --> AC1[SiLU]
-        AC1 --> OUT1[C_out x H/2 x W/2]
+        C1 --> GDN1[GDN]
+        GDN1 --> OUT1[C_out x H/2 x W/2]
     end
 
     subgraph DepthToSpace
         B[Input<br/>C x H x W] --> C2[Conv 3x3<br/>C→4*C_out]
         C2 --> PS[PixelShuffle 2<br/>C_out x H*2 x W*2]
-        PS --> IN2[InstanceNorm2d]
-        IN2 --> AC2[SiLU]
-        AC2 --> OUT2[C_out x H*2 x W*2]
+        PS --> IGDN[IGDN]
+        IGDN --> OUT2[C_out x H*2 x W*2]
     end
 
-    subgraph ResidualBlock
-        C[Input] --> IN3[InstanceNorm2d]
-        IN3 --> AC3[SiLU]
-        AC3 --> C3[Conv 3x3]
-        C3 --> IN4[InstanceNorm2d]
-        IN4 --> AC4[SiLU]
-        AC4 --> C4[Conv 3x3]
+    subgraph ResidualBlockGDN
+        C[Input] --> C3[Conv 3x3]
+        C3 --> GDN2[GDN]
+        GDN2 --> C4[Conv 3x3]
         C4 --> ADD[+]
         C --> ADD
         ADD --> OUT3[Output]
     end
 ```
 
----
+### 核心架构特征
 
-
-
-
-
-
-### 2.2 KakeyaHyperpriorCodec (超先验 + 挂谷正则)
-
-新架构结合 CompressAI `MeanScaleHyperprior` 的优势与挂谷覆盖正则，使用单阶段端到端训练。
-
-```mermaid
-graph TD
-    subgraph Input
-        IMG[RGB Image<br/>H x W x 3]
-    end
-
-    subgraph g_a [Analysis Transform]
-        IMG --> SD1[SpaceToDepth<br/>3→24, /2]
-        SD1 --> RB1[ResidualBlockGDN<br/>24]
-        RB1 --> SD2[SpaceToDepth<br/>24→32, /2]
-        SD2 --> RB2[ResidualBlockGDN<br/>32]
-        RB2 --> SD3[SpaceToDepth<br/>32→64, /2]
-        SD3 --> RB3[ResidualBlockGDN<br/>64]
-        RB3 --> GA_OUT[Conv 1x1<br/>64→16x2 (mu + log_var)]
-    end
-
-    subgraph 超先验 Hyperprior
-        GA_OUT --> H_A_IN[(mu)]
-        H_A_IN --> HA1[Conv 3x3<br/>16→8]
-        HA1 --> HA2[Conv 5x5 stride2<br/>8, /2]
-        HA2 --> HA3[Conv 5x5 stride2<br/>8, /2]
-        HA3 --> EB[EntropyBottleneck<br/>8 通道]
-        EB --> HD1[ConvTranspose 5x5 stride2<br/>8, x2]
-        HD1 --> HD2[ConvTranspose 5x5 stride2<br/>16, x2]
-        HD2 --> HD3[Conv 3x3<br/>16→32 (scale + mean)]
-        HD3 --> SCALE[scale: 16 x 32 x 32]
-        HD3 --> MEAN[mean: 16 x 32 x 32]
-    end
-
-    subgraph 条件高斯熵模型
-        MU_B[mu_bounded<br/>16 x 32 x 32] --> GC[GaussianConditional<br/>N(y_hat | mean, scale)]
-        SCALE --> GC
-        MEAN --> GC
-        GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
-    end
-
-    subgraph g_s [Synthesis Transform]
-        GC --> Y_HAT[y_hat<br/>16 x 32 x 32]
-        Y_HAT --> D0[Conv 3x3<br/>16→64]
-        D0 --> DRB1[ResidualBlockGDN<br/>64]
-        DRB1 --> DS1[DepthToSpace<br/>64→32, x2]
-        DS1 --> DRB2[ResidualBlockGDN<br/>32]
-        DRB2 --> DS2[DepthToSpace<br/>32→24, x2]
-        DS2 --> DRB3[ResidualBlockGDN<br/>24]
-        DRB3 --> DS3[DepthToSpace<br/>24→12, x2]
-        DS3 --> DC1[Conv 3x3<br/>12→24]
-        DC1 --> SILU[SiLU]
-        SILU --> DC2[Conv 3x3<br/>24→3]
-        DC2 --> SIG[Sigmoid]
-        SIG --> OUT[RGB Output<br/>H x W x 3]
-    end
-
-    subgraph 挂谷正则
-        Y_HAT --> LP[Permute + Reshape<br/>N x 16 点集]
-        LP --> NORM[F.normalize<br/>单位球面投影]
-        NORM --> KAKEYA[kakeya_regularization<br/>32 方向随机投影<br/>top-3 间距最大化]
-        KAKEYA --> COV[coverage loss]
-    end
-
-    subgraph 率失真损失
-        OUT --> MSE[MSE distortion]
-        RATE --> RATE_L[rate loss<br/>lambda]
-        COV --> KAKEYA_L[kakeya loss<br/>lambda_k]
-        MSE --> TOTAL[total = MSE + lambda*rate + lambda_k*kakeya]
-        RATE_L --> TOTAL
-        KAKEYA_L --> TOTAL
-    end
-
-    style g_a fill:#f3e5f5
-    style 超先验 Hyperprior fill:#e8eaf6
-    style 条件高斯熵模型 fill:#fce4ec
-    style g_s fill:#e8f5e9
-    style 挂谷正则 fill:#fff3e0
-    style 率失真损失 fill:#fff9c4
-```
-
-与 ImageCodecVAE 的核心差异：
-
-| 维度 | ImageCodecVAE | KakeyaHyperpriorCodec |
-|---|---|---|
-| 熵模型 | EntropyBottleneck（因子化先验） | EntropyBottleneck + GaussianConditional（超先验） |
-| 激活函数 | InstanceNorm + SiLU | GDN / IGDN |
-| ResidualBlock | InstanceNorm | GDN（ResidualBlockGDN） |
-| 下采样 | SpaceToDepth x 3 = 8x | SpaceToDepth x 3 = 8x（保持文字精度） |
-| 损失函数 | 10 项分阶段 | MSE + lambda*rate + lambda_k*kakeya（单阶段） |
-| 训练阶段 | capacity -> transition -> finetune | 单阶段端到端 |
-| 潜空间 | 16 通道, +/-3 bound | 16 通道, +/-3 bound |
+| 维度 | 说明 |
+|---|---|
+| 熵模型 | EntropyBottleneck（超先验 z）+ GaussianConditional（条件高斯 y） |
+| 激活函数 | GDN / IGDN（压缩专用归一化） |
+| ResidualBlock | GDN 替代 InstanceNorm + SiLU |
+| 下采样 | SpaceToDepth x 3 = 8x（保持文字精度） |
+| 损失函数 | MSE + lambda·rate + lambdaₖ·kakeya（单阶段） |
+| 训练阶段 | 单阶段端到端 |
+| 潜空间 | 16 通道, ±3 bound |
 
 ---
 
 ## 3. 损失函数组成
 
-以下流程图适用于 `ImageCodecVAE` 的三阶段训练。`KakeyaHyperpriorCodec` 使用单阶段 MSE + λ·rate + λₖ·kakeya 损失，见 2.2 节。
+当前 KakeyaHyperpriorCodec 使用三阶段 MSE + edge + structural + multiscale + lab + hue + sat + λₖ·kakeya + λ·rate 损失：
 
-stage 权重由 `config.stage_weights()` 提供（见 [config.py](../src/kakeya/config.py) 的 `DEFAULT_STAGE_WEIGHTS`），可在 YAML / API 通过 `objective.stage_weights` 覆盖任意子集，未覆盖项回退到默认值。代码读取逻辑见 [image_codec.py](../src/kakeya/image_codec.py) 的 `_epoch` 函数。
-
-```mermaid
-graph TD
-    CFG[config.stage_weights<br/>DEFAULT_STAGE_WEIGHTS<br/>YAML / API 可覆盖]
-    CFG -->|stage_w = config.stage_weights()[stage]| STAGE{current stage}
-
-    subgraph 分阶段损失调度
-        direction LR
-        S_CAP[Capacity Stage<br/>学方向覆盖]
-        S_TRANS[Transition Stage<br/>平滑过渡]
-        S_FT[Finetune Stage<br/>码率与感知优化]
-        S_CAP -->|所有损失参与, 权重递增| S_TRANS -->|全部损失, 权重最高| S_FT
-    end
-
-    STAGE --> S_CAP
-    STAGE --> S_TRANS
-    STAGE --> S_FT
-
-    subgraph Capacity_Loss [Capacity 阶段损失]
-        direction TB
-        C1[reconstruction<br/>加权 L1 + detail_weight]
-        C2[edge<br/>stage_w.edge x L1 边缘<br/>默认 1.0]
-        C3[multiscale<br/>stage_w.multiscale x L1<br/>默认 0.1]
-        C4[kl<br/>kl_weight x KL]
-        C5[kakeya<br/>stage_w.kakeya x 覆盖正则<br/>默认 0.01]
-        C6[mse stage_w.mse + structural stage_w.structural<br/>+ lab stage_w.lab<br/>默认 0.5 / 0.1 / 0.02]
-    end
-
-    subgraph Transition_Loss [Transition 阶段损失]
-        direction TB
-        T1[reconstruction + edge + multiscale<br/>+ kl + kakeya stage_w.kakeya<br/>默认 0.005]
-        T2[mse 3.0 + edge 1.5 + structural 0.4<br/>+ multiscale 0.25 + lab 0.08<br/>+ hue 0.04 + saturation 0.05]
-    end
-
-    subgraph Finetune_Loss [Finetune 阶段损失]
-        direction TB
-        F1[reconstruction + edge 2.0 + multiscale 0.5<br/>+ kakeya 0.001 + mse 5.0<br/>+ structural 0.8 + lab 0.15<br/>+ hue 0.06 + saturation 0.08]
-        F2[rate<br/>rate_weight x 码率超限]
-    end
-
-    S_CAP --> C1 & C2 & C3 & C4 & C5 & C6
-    S_TRANS --> T1 & T2
-    S_FT --> F1 & F2
-
-    C1 --> CT[total loss<br/>stage-dependent]
-    C2 --> CT
-    C3 --> CT
-    C4 --> CT
-    C5 --> CT
-    C6 --> CT
-    T1 --> CT
-    T2 --> CT
-    F1 --> CT
-    F2 --> CT
-
-    subgraph DetailWeight
-        DW1[灰度边缘检测<br/>x8 梯度]
-        DW2[暗色前景<br/>0.75-gray x2]
-        DW3[max edge, dark<br/>1 + 3x]
-        DW1 --> DW3
-        DW2 --> DW3
-        DW3 --> DW[detail_weight<br/>1-4x]
-        DW --> C1
-    end
-
-    subgraph MultiscaleLoss
-        MS0[原分辨率<br/>L1 权重 0.5]
-        MS1[128x128 bilinear<br/>L1 权重 0.25]
-        MS2[64x64 bilinear<br/>L1 权重 0.25]
-        MS0 --> MS_AVG[加权平均]
-        MS1 --> MS_AVG
-        MS2 --> MS_AVG
-        MS_AVG --> C3
-    end
-
-    subgraph RateLoss
-        RL1[EntropyBottleneck<br/>likelihoods]
-        RL2[-log2 likelihood<br/>→ bits]
-        RL3[bpp = bits / pixels]
-        RL4[ReLU bpp - 2.5<br/>超限惩罚]
-        RL1 --> RL2
-        RL2 --> RL3
-        RL3 --> RL4
-        RL4 --> F3
-    end
-
-    style CT fill:#fff9c4
-    style DW fill:#e3f2fd
-    style MS_AVG fill:#f3e5f5
-    style RL4 fill:#fce4ec
-    style C5 fill:#e1f5fe
-    style Capacity_Loss fill:#e3f2fd
-    style Transition_Loss fill:#fff3e0
-    style Finetune_Loss fill:#fce4ec
+```math
+L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_m·MultiL1 + w_l·ΔE + w_h·Hue + w_s·Sat + λₖ·Kakeya + λ·max(0, bpp - 2.5)
 ```
+
+- MSE: 重建像素误差
+- Edge: 梯度 L1 边缘损失
+- Structural: 1 - SSIM 结构相似性
+- Multiscale: 多尺度 L1（256/128/64 加权）
+- LAB: CIELAB ΔE 色差 + 色相 + 饱和度
+- Kakeya: 潜空间方向覆盖正则化
+- Rate: 熵编码码率（`log2`），超出 2.5 bpp 的部分产生惩罚
+- λ = 0.01（默认），λₖ = 0.001（默认）
+- 各阶段权重由 `config.stage_weights()` 管理
+---
+---
 
 ---
 
@@ -603,206 +414,61 @@ flowchart LR
     BATCH3 --> LOADERS
 
     subgraph Loaders
-        L1[capacity_loader<br/>32 steps, multiscale 参考图]
-        L2[train_loader<br/>程序图 128+ 样本]
-        L3[validation_loader<br/>16-64 样本]
-        L4[rehearsal_loader<br/>8 steps, multiscale 参考图]
-        L5[capacity_validation_loader<br/>1 样本, 固定 256]
-        L6[real_loader<br/>真实图 train_size/4 样本]
+        L1[train_loader<br/>ProceduralDocumentDataset<br/>程序图 128+ 样本]
+        L2[real_loader<br/>RealImageDataset<br/>真实高清图 16+ 样本]
+        L3[validation_loader<br/>ProceduralDocumentDataset<br/>16-64 样本]
     end
 
-    BATCH1 --> L1
-    BATCH2 --> L4
-    BATCH3 --> L2
-    BATCH3 --> L3
-    BATCH3 --> L6
-    BATCH1 --> L5
-```
+    COLLATE --> L1
+    COLLATE --> L2
+    COLLATE --> L3
 
 ---
 
-## 5. 训练流程 (train_image_codec)
+## 5. 训练流程 (train_image_codec / _hyperprior_epoch)
 
-> **注意**: 以下训练流程适用于 `ImageCodecVAE`（三阶段：capacity / transition / finetune）。
-> `KakeyaHyperpriorCodec` 使用**单阶段端到端训练**，无需门控逻辑、分阶段权重调度或 KL 退火。
-> 训练损失仅包含 MSE + lambda*rate + lambda_k*kakeya，所有参数在一个 loss.backward() 中优化。
-
-
-
-> **注意**: 以下训练流程适用于 （三阶段：capacity → transition → finetune）。
->  使用**单阶段端到端训练**，无需门控逻辑、分阶段权重调度或 KL 退火。
-> 训练损失仅包含 MSE + λ·rate + λₖ·kakeya，所有参数在一个 loss.backward() 中优化。
-
+KakeyaHyperpriorCodec 使用**单阶段端到端训练**。损失仅包含 MSE + λ·rate + λₖ·kakeya，所有参数在一个 `loss.backward()` 中优化。
 
 ```mermaid
 flowchart TD
-    START([开始训练]) --> INIT[初始化模型<br/>ImageCodecVAE]
-    INIT --> LOADERS[创建 DataLoaders]
+    START([开始训练]) --> INIT[初始化 KakeyaHyperpriorCodec<br/>model.to(device)]
+    INIT --> LOADERS[创建 DataLoaders<br/>ProceduralDocument + RealImage + Validation]
     LOADERS --> LOOP{每个 epoch<br/>1 → config.epochs}
 
-    LOOP --> CHECK{gate_epoch<br/>已设置?}
-    CHECK -->|否| CAP[Capacity Stage<br/>gate_epoch = None]
-    CHECK -->|是| CHECK2{epoch - gate_epoch<br/>≤ 5?}
-    CHECK2 -->|是| TRANS[Transition Stage<br/>过渡阶段]
-    CHECK2 -->|否| FINETUNE[Finetune Stage<br/>压缩微调]
+    LOOP -->|是| PROC[_hyperprior_epoch<br/>Procedural 数据<br/>train=True]
+    PROC --> REAL[_hyperprior_epoch<br/>RealImage 数据<br/>train=True]
+    REAL --> VALID[_hyperprior_epoch<br/>验证集<br/>train=False]
+    VALID --> CALIB[_calibration_metrics<br/>参考图 PSNR/SSIM/bpp]
+    CALIB --> CKPT{PSNR 创新高?}
+    CKPT -->|是| SAVE[保存 best.pt]
+    SAVE --> LOOP
+    CKPT -->|否| LOOP
 
-    subgraph CAP [Capacity Stage 容量阶段]
-        direction TB
-        CAP_LR[LR: max lr, 1e-3<br/>高学习率]
-        CAP_LOSS[损失: 全部损失参与, 权重来自 config.stage_weights<br/>recon + edge + multiscale + kl<br/>+ kakeya(0.002) + mse(0.5)<br/>+ structural(0.1) + lab(0.02)<br/>低权重种子, 专注方向覆盖]
-        CAP_REF[训练参考图<br/>capacity_loader<br/>32 steps]
-        CAP_PROG[训练程序图<br/>train_loader<br/>多尺度 128-768]
-        CAP_REAL[训练真实图<br/>real_loader]
-        CAP_REH[Rehearsal<br/>rehearsal_loader<br/>8 steps 参考图]
-        CAP_LR --> CAP_LOSS --> CAP_REF
-        CAP_REF --> CAP_MERGE[合并指标<br/>0.4 ref + 0.3 prog + 0.3 real]
-        CAP_PROG --> CAP_MERGE
-        CAP_REAL --> CAP_MERGE
-        CAP_MERGE --> CAP_REH
-    end
-
-    subgraph TRANS [Transition Stage 过渡阶段]
-        direction TB
-        TRANS_LR[LR: max lr, 5e-4<br/>中等学习率]
-        TRANS_LOSS[损失: config.stage_weights 权重递增<br/>capacity 全部 + mse(5.0)<br/>+ structural(0.25) + lab(0.05)]
-        TRANS_KAKEYA[kakeya 权重: 0.001]
-        TRANS_REF[训练参考图<br/>capacity_loader]
-        TRANS_PROG[训练程序图<br/>train_loader]
-        TRANS_REAL[训练真实图<br/>real_loader]
-        TRANS_REH[Rehearsal<br/>rehearsal_loader]
-        TRANS_LR --> TRANS_LOSS --> TRANS_KAKEYA --> TRANS_REF
-        TRANS_REF --> TRANS_MERGE[合并指标<br/>0.4 ref + 0.3 prog + 0.3 real]
-        TRANS_PROG --> TRANS_MERGE
-        TRANS_REAL --> TRANS_MERGE
-        TRANS_MERGE --> TRANS_REH
-    end
-
-    subgraph FINETUNE [Finetune Stage 压缩微调]
-        direction TB
-        FT_LR[LR: config.lr<br/>0.0005]
-        FT_LOSS[损失: config.stage_weights 权重最高<br/>transition 全部<br/>+ structural(0.5) + lab(0.10) + rate<br/>全部损失项]
-        FT_KAKEYA[kakeya 权重: 0.0005]
-        FT_WARMUP{gate 后<br/>≤ 10 epochs?}
-        FT_WARMUP -->|是| FT_W[Warmup<br/>rate_weight=0.001<br/>grad_clip=10.0]
-        FT_WARMUP -->|否| FT_FULL[Full finetune<br/>rate_weight=0.01<br/>grad_clip=5.0]
-        FT_W --> FT_TRAIN[训练 train_loader + real_loader<br/>0.5 prog + 0.5 real]
-        FT_FULL --> FT_TRAIN
-        FT_LR --> FT_LOSS --> FT_KAKEYA --> FT_WARMUP
-        FT_TRAIN --> FT_REH[Rehearsal<br/>rehearsal_loader]
-    end
-
-    CAP --> VALID
-    TRANS --> VALID
-    FINETUNE --> VALID
-
-    subgraph VALID [验证与校准]
-        direction TB
-        V1[Validation<br/>capacity_validation_loader<br/>或 validation_loader]
-        V2[Generalization<br/>validation_loader<br/>泛化测试]
-        V3[Calibration<br/>_calibration_metrics<br/>参考图 PSNR/SSIM/bpp]
-        V1 --> V3
-        V2 --> V3
-    end
-
-    VALID --> GATE_CHK{Calibration<br/>PSNR≥26<br/>SSIM≥0.96<br/>且 gate_epoch=None?}
-    GATE_CHK -->|是| SET_GATE[gate_epoch = epoch<br/>闸门通过<br/>gate_forced=False]
-    GATE_CHK -->|否| FORCE_CHK{epoch≥40?}
-    FORCE_CHK -->|是| FORCE_GATE[gate_epoch = epoch<br/>强制过闸<br/>gate_forced=True<br/>log 警告]
-    FORCE_CHK -->|否| CKPT_CHK
-    SET_GATE --> CKPT_CHK
-    FORCE_GATE --> CKPT_CHK
-
-    CKPT_CHK{bpp≤2.5<br/>且 PSNR > best?}
-    CKPT_CHK -->|是| SAVE_BEST[保存 best.pt]
-    CKPT_CHK -->|否| NEXT
-
-    SAVE_BEST --> NEXT[记录 history]
-    NEXT --> LOOP
-
-    LOOP -->|训练结束| LOAD_BEST[加载 best.pt]
-    LOAD_BEST --> EVAL[评估 _evaluate_chart<br/>参考图重建]
-    EVAL --> RATE_CHK[rate_consistency_check<br/>多尺度码率一致性]
-    RATE_CHK --> SAVE_FINAL[保存 final.pt<br/>manifest.json]
-    SAVE_FINAL --> DONE([训练完成])
-
-    style CAP fill:#e3f2fd
-    style TRANS fill:#fff3e0
-    style FINETUNE fill:#fce4ec
-    style VALID fill:#e8f5e9
-    style GATE_CHK fill:#fff9c4
-    style SET_GATE fill:#c8e6c9
-    style FORCE_CHK fill:#ffe0b2
-    style FORCE_GATE fill:#ffccbc
+    LOOP -->|否| FINAL[保存 final.pt]
+    FINAL --> UPDATE[model.update<br/>熵模型 CDF 表]
+    UPDATE --> EVAL[_evaluate_chart<br/>还原图 / 码流]
+    EVAL --> RATE_CK[_rate_consistency_check]
+    RATE_CK --> BASELINE[_compressai_baselines<br/>对比 JPEG/WebP/CompressAI]
+    BASELINE --> DONE([训练完成])
 ```
+
+### _hyperprior_epoch 细节
+
+每个 epoch 对每个 DataLoader 批次执行：
+
+1. `images = images.to(device)` — 数据迁移到 GPU/MPS
+2. `reconstructed, mu, log_var, y_hat, y_likelihoods, z_likelihoods = model(images)` — 前向传播
+3. `loss_mse = F.mse_loss(reconstructed, images)` — 重建损失
+4. `rate = (-log p(y_hat) - log p(z_hat)) / batch_size` — 熵编码码率
+5. `bpp = rate / (H * W)` — 每像素比特
+6. `coverage = kakeya_regularization(unit_normalized_latent, num_projections=32, k=3)` — 挂谷覆盖正则
+7. `total = loss_mse + λ·bpp + λₖ·coverage` — 总损失（λ=0.01 默认）
+8. `total.backward(); optimizer.step()` — 反向传播
+9. `aux_loss = entropy_bottleneck.loss(); aux_loss.backward(); aux_optimizer.step()` — 辅助优化
 
 ---
 
-## 6. 训练阶段时序图
-
-```mermaid
-sequenceDiagram
-    participant T as Trainer
-    participant M as Model
-    participant EB as EntropyBottleneck
-    participant G as Gate Check
-
-    Note over T,G: === Capacity Stage (epoch 1 ~ gate_epoch) ===
-
-    loop 每个 epoch
-        T->>M: capacity_loader (参考图多尺度)
-        M->>EB: encode + quantize + rate
-        EB-->>M: latent + rate_bpp
-        M-->>T: reconstruction + losses
-        T->>M: optimizer.step()
-
-        T->>M: train_loader (程序图多尺度)
-        M->>EB: encode + quantize + rate
-        EB-->>M: latent + rate_bpp
-        M-->>T: reconstruction + losses
-        T->>M: optimizer.step()
-
-        T->>M: rehearsal_loader (参考图)
-        M-->>T: rehearsal metrics
-        T->>M: optimizer.step()
-
-        T->>M: calibration (参考图 256)
-        M-->>T: PSNR, SSIM, bpp
-
-        T->>G: PSNR≥26 且 SSIM≥0.96?
-        G-->>T: gate_epoch = epoch (首次)
-    end
-
-    Note over T,G: === Transition Stage (gate+1 ~ gate+5) ===
-
-    loop 5 epochs
-        T->>M: capacity_loader + train_loader
-        T->>M: rehearsal_loader
-        Note over T: LR = max(lr, 5e-4)<br/>rate_weight = 0.001 (relaxed)
-    end
-
-    Note over T,G: === Finetune Stage (gate+6 ~ end) ===
-
-    loop 剩余 epochs
-        T->>M: train_loader only
-        T->>M: rehearsal_loader
-
-        alt gate+6 ~ gate+10 (warmup)
-            Note over T: rate_weight = 0.001<br/>grad_clip = 10.0
-        else gate+11 ~ end (full)
-            Note over T: rate_weight = 0.01<br/>grad_clip = 5.0
-        end
-    end
-
-    Note over T,G: === 训练结束 ===
-    T->>M: 加载 best.pt
-    T->>M: _evaluate_chart (参考图重建评估)
-    T->>M: _rate_consistency_check (多尺度码率)
-    T->>T: 保存 final.pt + manifest.json
-```
-
----
-
-## 7. 推理流程 (Web API / CLI)
+## 6. 推理流程 (Web API / CLI)
 
 ```mermaid
 flowchart TD
@@ -814,33 +480,38 @@ flowchart TD
     SIZE_CHK -->|OK| PAD[8 倍数对齐<br/>黑色填充]
 
     PAD --> LOAD_CKPT[加载 checkpoint<br/>final.pt]
-    LOAD_CKPT --> MIGRATE{state_dict<br/>兼容?}
-    MIGRATE -->|不兼容| MIG[migrate_legacy_state_dict<br/>GroupNorm→WeightNorm]
-    MIGRATE -->|兼容| MODEL
-    MIG --> MODEL[ImageCodecVAE<br/>eval mode]
+    LOAD_CKPT --> MODEL[KakeyaHyperpriorCodec<br/>eval mode]
 
-    MODEL --> ENCODE[mu = model.encode img]
-    ENCODE --> EB_UPDATE[entropy_model.update<br/>force=True]
-    EB_UPDATE --> COMPRESS[entropy_model.compress<br/>mu → bitstream]
-    COMPRESS --> DECOMPRESS[entropy_model.decompress<br/>bitstream → latent]
-    DECOMPRESS --> DECODE[reconstructed = model.decode latent]
-    DECODE --> CLAMP[clamp 0, 1]
+    MODEL --> ENCODE[mu = model.encode(img)]
+    ENCODE --> MODEL_UPDATE[model.update<br/>熵模型 CDF 表]
+    MODEL_UPDATE --> COMPRESS[entropy_bottleneck.compress<br/>mu → bitstream]
+    COMPRESS --> DECOMPRESS[entropy_bottleneck.decompress<br/>bitstream → latent]
+    DECOMPRESS --> RECONSTRUCT[reconstructed = model.decode(latent)]
+    RECONSTRUCT --> CLAMP[clamp 0, 1]
 
     CLAMP --> CROP[去除 padding<br/>恢复原始尺寸]
-    CROP --> METRICS[计算指标<br/>PSNR / SSIM / bpp]
-    METRICS --> HEATMAP[生成误差热图]
-    HEATMAP --> RESP[返回 base64 图片<br/>+ metrics JSON]
+    CROP --> METRICS[计算 PSNR / SSIM / bpp]
+    HEATMAP --> RESP[返回 base64 图片 + metrics]
+ ```
 
-    subgraph CLI [scripts/codec_cli.py]
-        CLI_COMP[compress<br/>img → .kky]
-        CLI_DECOMP[decompress<br/>.kky → img]
-    end
+### _hyperprior_epoch 细节
 
-    style UPLOAD fill:#e1f5fe
-    style MODEL fill:#f3e5f5
-    style COMPRESS fill:#fff3e0
-    style RESP fill:#e8f5e9
+每个 epoch 对每个 DataLoader 批次执行：
+
+1. `images = images.to(device)` — 数据迁移到 GPU/MPS
+2. `reconstructed, mu, log_var, y_hat, y_likelihoods, z_likelihoods = model(images)` — 前向传播
+3. `loss_mse = F.mse_loss(reconstructed, images)` — 重建损失
+4. `rate = (-log2 p(y_hat) - log2 p(z_hat)) / batch_size` — 熵编码码率（bits）
+5. `bpp_bits = rate / (H * W)` — 每像素比特
+6. `rate_penalty = ReLU(bpp_bits - 2.5)` — 仅超出目标的码率产生惩罚
+7. 感知损失（当 `stage_weights` 提供时）：edge、structural、multiscale、lab、hue、saturation
+8. `total = w_m·MSE + w_e·edge + w_s·structural + ... + λₖ·coverage + λ·rate_penalty` — 总损失
+9. `total.backward(); optimizer.step()` — 反向传播
+10. `aux_loss = entropy_bottleneck.loss(); aux_loss.backward(); aux_optimizer.step()` — 辅助优化
 ```
+---
+
+
 
 ---
 
@@ -1003,7 +674,7 @@ flowchart TD
     CHK -->|W or H < 16| REJECT2[拒绝: 小于 16px]
     CHK -->|OK| PAD[8 倍数对齐<br/>pad_w = 8 - W%8<br/>pad_h = 8 - H%8<br/>黑色填充]
 
-    PAD --> LOAD[加载 final.pt<br/>ImageCodecVAE]
+    PAD --> LOAD[加载 final.pt<br/>KakeyaHyperpriorCodec]
     LOAD --> ENCODE[encoder: WxHx3<br/>→ W/8 x H/8 x 16<br/>下采样 3 次 PixelUnshuffle]
 
     ENCODE --> MU[mu = tanh bound<br/>latent 空间 H/8 x W/8]

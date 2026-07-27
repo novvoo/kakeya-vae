@@ -15,7 +15,7 @@ from sklearn.decomposition import PCA
 from kakeya.config import ExperimentConfig
 from kakeya.data import get_mnist_dataloaders
 from kakeya.evaluation import evaluate_all
-from kakeya.image_codec import train_image_codec
+from kakeya.image_codec import train_image_codec, _run_directory
 
 
 def emit(event: str, **payload: Any) -> None:
@@ -49,11 +49,8 @@ def run(spec_path: Path) -> int:
         validation: dict[str, float],
         run_dir: Path,
     ) -> None:
-        phase = (
-            "容量预训练"
-            if train.get("capacity_stage", 0.0) >= 0.5
-            else "压缩微调"
-        )
+        stage_num = train.get("stage", 1)
+        phase = "容量预训练" if stage_num == 1 else "过渡阶段" if stage_num == 2 else "压缩微调"
         gate = " · 闸门已通过" if train.get("capacity_gate_passed") else ""
         emit(
             "epoch",
@@ -66,42 +63,83 @@ def run(spec_path: Path) -> int:
             message=f"{phase} · 第 {epoch}/{total_epochs} 轮完成{gate}",
         )
 
-    image_result = train_image_codec(
-        config,
-        device,
-        epoch_callback=on_epoch,
-    )
-    dashboard = {
-        "config": config.to_dict(),
-        "history": image_result.history,
-        "metrics": image_result.metrics,
-        "latent": [],
-        "runtime": {"device": str(device)},
-        "image_codec": {
-            "image_size": 256,
-            "test_asset": "Kakeya Codec Test Card v2",
-            "test_role": "in_distribution_calibration",
-            "latent_shape": [config.latent_dim, 32, 32],
-            "images": image_result.images,
-            "training": image_result.training_summary,
-            "bitstream": image_result.bitstream,
-        },
-        "codec_baselines": image_result.codec_baselines,
-    }
-    dashboard_path = image_result.run_dir / "reports" / "dashboard.json"
-    dashboard_path.write_text(
-        json.dumps(dashboard, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    emit(
-        "completed",
-        progress=1.0,
-        run_dir=str(image_result.run_dir),
-        result_path=str(dashboard_path),
-        metrics=image_result.metrics,
-        message="训练完成（KakeyaHyperpriorCodec）",
-    )
-    return 0
+    run_dir = _run_directory(config)
+    try:
+        image_result = train_image_codec(
+            config,
+            device,
+            epoch_callback=on_epoch,
+            run_dir=run_dir,
+        )
+        dashboard = {
+            "config": config.to_dict(),
+            "history": image_result.history,
+            "metrics": image_result.metrics,
+            "latent": [],
+            "runtime": {"device": str(device)},
+            "image_codec": {
+                "image_size": 256,
+                "test_asset": "Kakeya Codec Test Card v2",
+                "test_role": "in_distribution_calibration",
+                "latent_shape": [config.latent_dim, 32, 32],
+                "images": image_result.images,
+                "training": image_result.training_summary,
+                "bitstream": image_result.bitstream,
+            },
+            "codec_baselines": image_result.codec_baselines,
+        }
+        dashboard_path = run_dir / "reports" / "dashboard.json"
+        dashboard_path.write_text(
+            json.dumps(dashboard, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        emit(
+            "completed",
+            progress=1.0,
+            run_dir=str(run_dir),
+            result_path=str(dashboard_path),
+            metrics=image_result.metrics,
+            message="训练完成（KakeyaHyperpriorCodec）",
+        )
+        return 0
+    except Exception as exc:
+        tb = traceback.format_exc()
+        error_dashboard = {
+            "config": config.to_dict(),
+            "history": {"epoch": [], "train": {}, "validation": {}},
+            "metrics": {"psnr": 0, "ssim": 0},
+            "latent": [],
+            "runtime": {"device": str(device)},
+            "image_codec": {
+                "image_size": 256,
+                "test_asset": "Kakeya Codec Test Card v2",
+                "test_role": "in_distribution_calibration",
+                "latent_shape": [config.latent_dim, 32, 32],
+                "images": {},
+                "training": {
+                    "error": tb,
+                    "capacity_gate_passed": False,
+                    "capacity_gate": {"psnr": 0, "ssim": 0},
+                    "final_stage": "failed",
+                },
+                "bitstream": {},
+            },
+            "codec_baselines": [],
+            "error": tb,
+        }
+        (run_dir / "reports").mkdir(parents=True, exist_ok=True)
+        dashboard_path = run_dir / "reports" / "dashboard.json"
+        dashboard_path.write_text(
+            json.dumps(error_dashboard, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        emit(
+            "failed",
+            error=str(exc),
+            traceback=tb,
+            message="训练失败",
+        )
+        raise
 
     result = train_model(
         config,

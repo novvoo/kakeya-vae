@@ -44,12 +44,16 @@ def test_request_builds_method_specific_objective() -> None:
 
     assert config["train_limit"] == 32
     assert config["test_limit"] is None
-    assert config["objective"] == {
-        "num_projections": 16,
-        "k": 3,
-        "lambda_rate": 1.0,
-        "lambda_kakeya": 0.001,
-    }
+    obj = config["objective"]
+    assert obj["num_projections"] == 16
+    assert obj["k"] == 3
+    assert obj["lambda_rate"] == 0.01
+    assert obj["lambda_kakeya"] == 0.001
+    # stage_weights should be present for image_codec method
+    assert "stage_weights" in obj
+    assert "capacity" in obj["stage_weights"]
+    assert "transition" in obj["stage_weights"]
+    assert "finetune" in obj["stage_weights"]
 
 
 def test_invalid_epoch_count_returns_validation_error() -> None:

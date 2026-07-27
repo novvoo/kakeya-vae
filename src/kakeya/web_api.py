@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 
-from kakeya.config import ExperimentConfig
+from kakeya.config import DEFAULT_STAGE_WEIGHTS, ExperimentConfig
 from kakeya.image_codec import TEST_IMAGE
 from kakeya.job_manager import JobManager
 
@@ -39,7 +39,7 @@ class ExperimentRequest(BaseModel):
     gamma: Annotated[float, Field(ge=0, le=1000)] = 10.0
     num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
     k: Annotated[int, Field(ge=1, le=4096)] = 3
-    lambda_rate: Annotated[float, Field(gt=0, le=100)] = 1.0
+    lambda_rate: Annotated[float, Field(gt=0, le=100)] = 0.01
     lambda_kakeya: Annotated[float, Field(ge=0, le=10)] = 0.001
 
     @model_validator(mode="after")
@@ -68,6 +68,13 @@ class ExperimentRequest(BaseModel):
             "lambda_rate": self.lambda_rate,
             "lambda_kakeya": self.lambda_kakeya,
         }
+        # Default stage_weights are managed server-side via DEFAULT_STAGE_WEIGHTS.
+        # Users can override specific weights via the objective.stage_weights field
+        # when constructing requests programmatically.  The web UI sends the defaults
+        # to make them visible before training starts.
+        stage_weights = DEFAULT_STAGE_WEIGHTS.copy() if self.method == "image_codec" else {}
+        if stage_weights:
+            objective["stage_weights"] = stage_weights
         config = ExperimentConfig(
             method=self.method,
             epochs=self.epochs,
@@ -267,8 +274,7 @@ async def reconstruct_custom_checkpoint(
 def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]:
     import base64
     import io
-    from copy import deepcopy
-
+    import math
     import numpy as np
     import torch
     import torch.nn.functional as F
@@ -293,7 +299,13 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
         padded.paste(source_image, (0, 0))
         source_image = padded
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
     try:
         payload = torch.load(
             checkpoint_path, map_location=device, weights_only=False
@@ -304,23 +316,23 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     latent_dim = config.get("latent_dim", 16) if isinstance(config, dict) else 16
     try:
-        model = ImageCodecVAE(latent_dim=latent_dim).to(device)
-        model.load_state_dict(payload["model_state_dict"])
-    except RuntimeError:
-        try:
-            migrated = migrate_legacy_state_dict(payload["model_state_dict"])
-            model.load_state_dict(migrated)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="模型结构不匹配，且旧版迁移也失败",
-            )
+        model = KakeyaHyperpriorCodec(
+            latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
+        ).to(device)
+        # Exclude CDF buffers that mismatch shapes; update() repopulates them.
+        skip_keys = {"entropy_bottleneck._offset",
+                     "entropy_bottleneck._quantized_cdf",
+                     "entropy_bottleneck._cdf_length"}
+        filtered_sd = {k: v for k, v in payload["model_state_dict"].items()
+                       if k not in skip_keys}
+        model.load_state_dict(filtered_sd, strict=False)
+        model.update()
+        model.eval()
     except Exception:
         raise HTTPException(
             status_code=400,
             detail="模型结构不匹配，请确认是 Kakeya image_codec 训练的 checkpoint",
         )
-    model.eval()
 
     source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
     source = source.permute(2, 0, 1).unsqueeze(0).to(device)
@@ -328,37 +340,19 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     # Whole-image encode / compress / decode path.  The multi-scale trained
     # model handles any resolution directly, so no tiling or rescaling is
     # needed; padding to a multiple of 8 (above) keeps the encoder happy.
-    header_estimate = 64 + 256
     with torch.no_grad():
-        entropy_model = deepcopy(model.entropy_bottleneck).cpu().eval()
-        entropy_model.update(force=True)
-
-        mu, _ = model.encode(source)
-        latent_cpu = mu.detach().cpu()
-        strings = entropy_model.compress(latent_cpu)
-        payload_data = strings[0]
-        shape = list(latent_cpu.shape[-2:])
-        decoded_latent = entropy_model.decompress([payload_data], shape).to(device)
-        bitstream_bytes_estimate = len(payload_data) + header_estimate
-        reconstructed = model.decode(decoded_latent).clamp(0, 1)
+        reconstructed = model.reconstruct(source).clamp(0, 1)
 
     if pad_w or pad_h:
         reconstructed = reconstructed[:, :, :h, :w]
         source = source[:, :, :h, :w]
 
     mse = float(F.mse_loss(reconstructed, source))
-    psnr = 99.0 if mse == 0 else 10 * np.log10(1.0 / mse)
+    psnr = 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
     ssim = float(_ssim_torch(reconstructed, source))
     out_h, out_w = source.shape[2], source.shape[3]
-    bpp = bitstream_bytes_estimate * 8 / (out_h * out_w)
-
-    def _to_png(tensor: torch.Tensor) -> str:
-        arr = tensor.detach().cpu().permute(1, 2, 0).numpy()
-        img = Image.fromarray((arr.clip(0, 1) * 255).astype(np.uint8), mode="RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("ascii")
-
+    bitstream_bytes_estimate = 0
+    bpp = 0.0
     diff = (reconstructed - source).abs()[0]
     heat = torch.stack(
         (
@@ -367,6 +361,13 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             torch.zeros_like(diff[0]),
         )
     )
+
+    def _to_png(tensor: torch.Tensor) -> str:
+        arr = tensor.detach().cpu().permute(1, 2, 0).numpy()
+        img = Image.fromarray((arr.clip(0, 1) * 255).astype(np.uint8), mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
     return {
         "original": _to_png(source[0]),
