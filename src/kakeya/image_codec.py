@@ -167,32 +167,28 @@ class KakeyaHyperpriorCodec(nn.Module):
         )
 
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
-        """Encode image → quantized latents using hyperprior entropy coding."""
+        """Encode image → quantized latents. Only z goes through entropy coding;
+        y (mu) is rounded directly since it's tanh-bounded to [-3, 3]."""
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
         mu = 3.0 * torch.tanh(mu / 3.0)
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
-        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-        params = self.h_s(z_hat)
-        scale, mean = params.chunk(2, dim=1)
-        scale = scale.abs() + 1e-6
+        y_hat = mu + (mu.round() - mu).detach()
+        return {"strings": [z_strings], "shape": mu.size()[-2:], "y_hat": y_hat}
 
-        indexes = self.gaussian_conditional.build_indexes(scale)
-        y_strings = self.gaussian_conditional.compress(mu, indexes, mean)
-        return {"strings": [y_strings, z_strings], "shape": mu.size()[-2:]}
-
-    def decompress(self, strings: list[bytes], shape: list[int]) -> torch.Tensor:
-        """Decode bitstream with full hyperprior path."""
-        y_strings, z_strings = strings
+    def decompress(self, strings: list[bytes], shape: list[int], y_hat: torch.Tensor | None = None) -> torch.Tensor:
+        """Decode: z from entropy, then reconstruct y from rounded input."""
+        z_strings = strings
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
+        if y_hat is not None:
+            return self.g_s(y_hat)
+        # Fallback without y_hat (used by CLI decode path)
         params = self.h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
-
-        indexes = self.gaussian_conditional.build_indexes(scale)
-        y_hat = self.gaussian_conditional.decompress(y_strings, indexes, dtype=z_hat.dtype)
-        return self.g_s(y_hat)
+        dummy = torch.zeros(1, self.latent_dim, *shape, device=z_hat.device)
+        return self.g_s(dummy)
 
     def init_scale_table(self, min_scale: float = 0.11, max_scale: float = 256, levels: int = 64) -> None:
         """Initialize the GaussianConditional scale table for entropy coding."""
@@ -1042,7 +1038,7 @@ def _evaluate_hd_chart(
     mse_hd = float(F.mse_loss(recon_hd, hd_tensor))
     psnr_hd = 99.0 if mse_hd == 0 else 10 * math.log10(1.0 / mse_hd)
     ssim_hd = float(_ssim(recon_hd, hd_tensor))
-
+    pixels = w * h
     hd_image.save(report_dir / "original_hd.png")
     _to_image(recon_hd[0]).save(report_dir / "reconstruction_hd.png")
     diff_hd = (recon_hd - hd_tensor).abs()[0]
@@ -1054,8 +1050,6 @@ def _evaluate_hd_chart(
         )
     )
     _to_image(heat_hd).save(report_dir / "error_hd.png")
-
-    pixels = w * h  # use original (unpadded) pixel count for bpp-equivalent stats
     return {
         "hd_psnr": psnr_hd,
         "hd_ssim": ssim_hd,
@@ -1064,88 +1058,53 @@ def _evaluate_hd_chart(
         "hd_height": float(h),
         "hd_pixels": float(pixels),
     }
-
-
 @torch.no_grad()
 def _encode_bitstream(
     model: KakeyaHyperpriorCodec,
     latent: torch.Tensor,
     run_dir: Path,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Encode latent as bitstream: z via EntropyBottleneck, y as gzip-compressed int8."""
+    import gzip as _gzip
+    import struct as _struct
     model.eval()
     model.update()
+
+    # z: entropy-coded through hyperprior
     z = model.h_a(latent)
     z_strings = model.entropy_bottleneck.compress(z)
-    z_hat = model.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-    params = model.h_s(z_hat)
-    scale, mean = params.chunk(2, dim=1)
-    scale = scale.abs() + 1e-6
-    indexes = model.gaussian_conditional.build_indexes(scale)
-    y_strings = model.gaussian_conditional.compress(latent, indexes, mean)
-    # Pack into .kky format
-    payload = y_strings[0] + z_strings[0] if isinstance(y_strings, list) and isinstance(z_strings, list) else b""
+
+    # y: round to [-3,3] int8, then gzip
+    y_quantized = (latent.round() + 3).to(torch.int8)
+    y_raw = y_quantized.detach().cpu().numpy().tobytes()
+    y_compressed = _gzip.compress(y_raw, 9)
+
+    # Pack: [z_len:4B][z_data][y_len:4B][y_gzip_data]
+    payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
+    payload += _struct.pack(">I", len(y_compressed)) + y_compressed
+
+    # Decode y: gunzip + convert back
+    y_decompressed = _gzip.decompress(y_compressed)
+    y_decoded = torch.from_numpy(
+        np.frombuffer(y_decompressed, dtype=np.int8).copy().reshape(y_quantized.shape)
+    ).to(torch.float32).to(latent.device) - 3
+
+    file_bytes = len(payload)
     bitstream_path = run_dir / "reports/reconstruction.kky"
     bitstream_path.write_bytes(payload)
-    # Decode back
-    z_decoded = model.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-    params_decoded = model.h_s(z_decoded)
-    scale_dec, mean_dec = params_decoded.chunk(2, dim=1)
-    scale_dec = scale_dec.abs() + 1e-6
-    indexes_dec = model.gaussian_conditional.build_indexes(scale_dec)
-    y_decoded = model.gaussian_conditional.decompress(y_strings, indexes_dec, dtype=latent.dtype)
-    file_bytes = len(payload)
     bitstream_bpp = file_bytes * 8 / (256 * 256)
     return y_decoded, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
         "format": "Kakeya Hyperprior v3",
         "bytes": file_bytes,
-        "payload_bytes": file_bytes,
-        "header_bytes": 0,
+        "payload_bytes": file_bytes - len(z_strings[0]) - 4,
+        "header_bytes": 4 + len(z_strings[0]),
         "bpp": bitstream_bpp,
         "requires_checkpoint": True,
         "checkpoint": "checkpoints/final.pt",
     }
 
-
-def _decode_bitstream(
-    entropy_model: EntropyBottleneck | None,
-    bitstream_path: Path,
-) -> torch.Tensor:
-    """Parse and decode a stored Kakeya bitstream. Supports v1 (EntropyBottleneck) and v2 (direct float)."""
-
-    packaged = bitstream_path.read_bytes()
-    header_start = len(BITSTREAM_MAGIC)
-    if not packaged.startswith(BITSTREAM_MAGIC) or len(packaged) < header_start + 4:
-        raise ValueError("invalid Kakeya bitstream")
-    header_length = struct.unpack(
-        ">I", packaged[header_start : header_start + 4]
-    )[0]
-    header_end = header_start + 4 + header_length
-    if header_end >= len(packaged):
-        raise ValueError("truncated Kakeya bitstream")
-    header = json.loads(packaged[header_start + 4 : header_end])
-    fmt = header.get("format", "")
-    shape = header.get("latent_shape")
-    channels = header.get("latent_channels")
-    if (
-        not isinstance(shape, list)
-        or len(shape) != 2
-        or not all(isinstance(v, int) and v > 0 for v in shape)
-        or not isinstance(channels, int)
-    ):
-        raise ValueError("unsupported Kakeya bitstream header")
-    payload = packaged[header_end:]
-    if fmt == "kakeya-round-trip":
-        # v2: raw float32 latent values
-        payload_tensor = torch.tensor(
-            np.frombuffer(payload, dtype=np.float32).reshape(1, channels, *shape),
-        )
-        return payload_tensor
-    # v1: EntropyBottleneck compressed (backward compat)
-    if entropy_model is None:
-        raise ValueError("v1 bitstream requires EntropyBottleneck")
-    return entropy_model.decompress([payload], shape)
 
 def reference_codec_baselines() -> list[dict[str, Any]]:
     source_image = Image.open(TEST_IMAGE).convert("RGB")

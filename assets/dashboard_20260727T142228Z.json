@@ -1,0 +1,216 @@
+{
+  "config": {
+    "method": "image_codec",
+    "epochs": 80,
+    "latent_dim": 16,
+    "batch_size": 4,
+    "learning_rate": 0.0005,
+    "seed": 42,
+    "data_dir": "data",
+    "output_dir": "runs",
+    "num_workers": 0,
+    "train_limit": 128,
+    "test_limit": null,
+    "download": true,
+    "objective": {
+      "num_projections": 32,
+      "k": 3,
+      "lambda_rate": 1.0,
+      "lambda_kakeya": 0.001,
+      "stage_weights": {
+        "capacity": {
+          "mse": 1.0,
+          "edge": 1.0,
+          "structural": 0.2,
+          "multiscale": 0.2,
+          "lab": 0.05,
+          "hue": 0.05,
+          "saturation": 0.05,
+          "kakeya": 0.002
+        },
+        "transition": {
+          "mse": 2.0,
+          "edge": 1.5,
+          "structural": 0.4,
+          "multiscale": 0.3,
+          "lab": 0.08,
+          "hue": 0.08,
+          "saturation": 0.08,
+          "kakeya": 0.001
+        },
+        "finetune": {
+          "mse": 3.0,
+          "edge": 2.0,
+          "structural": 0.6,
+          "multiscale": 0.4,
+          "lab": 0.12,
+          "hue": 0.06,
+          "saturation": 0.08,
+          "kakeya": 0.0005
+        }
+      }
+    }
+  },
+  "history": {
+    "epoch": [],
+    "train": {},
+    "validation": {}
+  },
+  "metrics": {
+    "mse": 0.0050543989054858685,
+    "psnr": 22.963304854840153,
+    "ssim": 0.9376856684684753,
+    "latent_dim": 16.0,
+    "source_bytes": 114041.0,
+    "bitstream_bytes": 7298.0,
+    "bitstream_payload_bytes": 6802.0,
+    "bitstream_bpp": 0.890869140625,
+    "hd_psnr": 21.564319684209856,
+    "hd_ssim": 0.8750979900360107,
+    "hd_mse": 0.006975382566452026,
+    "hd_width": 1254.0,
+    "hd_height": 1254.0,
+    "hd_pixels": 1572516.0,
+    "method": "hyperprior_kakeya",
+    "total_epochs": 80,
+    "target_rate_bpp": 2.5,
+    "final_stage": "single_stage",
+    "capacity_gate_passed": false,
+    "capacity_gate": {
+      "psnr": 0,
+      "ssim": 0
+    }
+  },
+  "latent": [],
+  "runtime": {
+    "device": "mps"
+  },
+  "image_codec": {
+    "image_size": 256,
+    "test_asset": "Kakeya Codec Test Card v2",
+    "test_role": "in_distribution_calibration",
+    "latent_shape": [
+      16,
+      32,
+      32
+    ],
+    "images": {
+      "original": "reports/original.png",
+      "reconstruction": "reports/reconstruction.png",
+      "error": "reports/error.png",
+      "original_hd": "reports/original_hd.png",
+      "reconstruction_hd": "reports/reconstruction_hd.png",
+      "error_hd": "reports/error_hd.png"
+    },
+    "training": {
+      "method": "hyperprior_kakeya",
+      "total_epochs": 80,
+      "target_rate_bpp": 2.5,
+      "final_stage": "single_stage",
+      "capacity_gate_passed": false,
+      "capacity_gate": {
+        "psnr": 0,
+        "ssim": 0
+      }
+    },
+    "bitstream": {
+      "path": "reports/reconstruction.kky",
+      "filename": "reconstruction.kky",
+      "format": "Kakeya Hyperprior v3",
+      "bytes": 7298,
+      "payload_bytes": 6802,
+      "header_bytes": 496,
+      "bpp": 0.890869140625,
+      "requires_checkpoint": true,
+      "checkpoint": "checkpoints/final.pt"
+    }
+  },
+  "codec_baselines": [
+    {
+      "codec": "Original PNG",
+      "settings": "source",
+      "bytes": 114041,
+      "mse": 0.0,
+      "psnr": 99.0,
+      "ssim": 1.0
+    },
+    {
+      "codec": "PNG",
+      "settings": "optimized",
+      "bytes": 109066,
+      "mse": 0.0,
+      "psnr": 99.0,
+      "ssim": 1.0
+    },
+    {
+      "codec": "JPEG",
+      "settings": "quality 90",
+      "bytes": 30385,
+      "mse": 0.0003979559987783432,
+      "psnr": 34.00164944368959,
+      "ssim": 0.9875004887580872
+    },
+    {
+      "codec": "WebP",
+      "settings": "quality 90",
+      "bytes": 23782,
+      "mse": 0.00027763735852204263,
+      "psnr": 35.56522096184237,
+      "ssim": 0.9913949966430664
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 2 (mse)",
+      "bytes": 5236,
+      "mse": 0.006899325642734766,
+      "psnr": 21.611933562122463,
+      "ssim": 0.900974452495575,
+      "learned": true
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 4 (mse)",
+      "bytes": 9980,
+      "mse": 0.002392430556938052,
+      "psnr": 26.211606592674418,
+      "ssim": 0.9671599864959717,
+      "learned": true
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 6 (mse)",
+      "bytes": 16676,
+      "mse": 0.0007139997906051576,
+      "psnr": 31.46301915589425,
+      "ssim": 0.9884252548217773,
+      "learned": true
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 2 (mse)",
+      "bytes": 5236,
+      "mse": 0.006899325177073479,
+      "psnr": 21.611933855244057,
+      "ssim": 0.9009706377983093,
+      "learned": true
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 4 (mse)",
+      "bytes": 9980,
+      "mse": 0.002392430789768696,
+      "psnr": 26.211606170020314,
+      "ssim": 0.9671546816825867,
+      "learned": true
+    },
+    {
+      "codec": "CompressAI mbt2018",
+      "settings": "quality 6 (mse)",
+      "bytes": 16676,
+      "mse": 0.0007139993831515312,
+      "psnr": 31.463021634255092,
+      "ssim": 0.98841792345047,
+      "learned": true
+    }
+  ]
+}

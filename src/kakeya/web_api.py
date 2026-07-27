@@ -320,15 +320,22 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
         ).to(device)
         # Exclude CDF buffers that mismatch shapes; update() repopulates them.
-        skip_keys = {"entropy_bottleneck._offset",
-                     "entropy_bottleneck._quantized_cdf",
-                     "entropy_bottleneck._cdf_length"}
+        skip_keys = {
+            "entropy_bottleneck._offset",
+            "entropy_bottleneck._quantized_cdf",
+            "entropy_bottleneck._cdf_length",
+            "gaussian_conditional._offset",
+            "gaussian_conditional._quantized_cdf",
+            "gaussian_conditional._cdf_length",
+            "gaussian_conditional.scale_table",
+        }
         filtered_sd = {k: v for k, v in payload["model_state_dict"].items()
                        if k not in skip_keys}
         model.load_state_dict(filtered_sd, strict=False)
+        model.init_scale_table()
         model.update()
         model.eval()
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail="模型结构不匹配，请确认是 Kakeya image_codec 训练的 checkpoint",
