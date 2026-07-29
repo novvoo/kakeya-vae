@@ -1081,6 +1081,43 @@ button.upload-btn:disabled {
   cursor: progress;
 }
 
+
+.regenerate-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 24px;
+}
+
+.regenerate-btn {
+  padding: 10px 18px;
+  border: 1px solid var(--ink);
+  background: white;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex: 0 0 auto;
+}
+
+.regenerate-btn:hover:not(:disabled) {
+  background: var(--ink);
+  color: white;
+}
+
+.regenerate-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.regenerate-hint {
+  color: #888;
+  font-size: 11px;
+  font-family: var(--mono);
+  line-height: 1.4;
+  flex: 1 1 auto;
+}
 .topbar-actions {
   display: flex;
   align-items: center;

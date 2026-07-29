@@ -40,7 +40,7 @@ TARGET_IMAGE_SIZE = 256
 MULTISCALE_TRAIN_SIZES = (128, 192, 256, 384, 512, 768)
 MULTISCALE_PRIMARY_SIZE = 256
 MULTISCALE_PRIMARY_RATIO = 0.5
-LATENT_MEAN_BOUND = 3.0
+LATENT_MEAN_BOUND = 5.0
 # If the model hasn't met the gate threshold by this epoch, force the gate
 # open so the training still enters transition + finetune.  This prevents
 # the model from staying in capacity_pretrain forever when the architecture
@@ -121,6 +121,7 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
+            ResidualBlockGDN(32),  # depth compensation for 4× downscale
             weight_norm(nn.Conv2d(32, latent_dim * 2, 1)),
         )
 
@@ -154,10 +155,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.y_entropy_bottleneck = EntropyBottleneck(latent_dim)
         self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
 
-        # Synthesis transform: DepthToSpace × 2 → 4× upscale back to 256
         self.g_s = nn.Sequential(
             weight_norm(nn.Conv2d(latent_dim, 32, 3, padding=1)),
             ResidualBlockGDN(32),
+            ResidualBlockGDN(32),  # depth compensation for 4× downscale
             DepthToSpace(32, 24),
             ResidualBlockGDN(24),
             DepthToSpace(24, 12),
@@ -169,10 +170,10 @@ class KakeyaHyperpriorCodec(nn.Module):
 
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
         """Encode image → quantized latents. Only z goes through entropy coding;
-        y (mu) is rounded directly since it's tanh-bounded to [-3, 3]."""
+        y (mu) is rounded directly since it's tanh-bounded to [-LATENT_MEAN_BOUND, LATENT_MEAN_BOUND]."""
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
-        mu = 3.0 * torch.tanh(mu / 3.0)
+        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         y_hat = mu + (mu.round() - mu).detach()
@@ -195,23 +196,74 @@ class KakeyaHyperpriorCodec(nn.Module):
         """Initialize the GaussianConditional scale table for entropy coding."""
         table = torch.exp(torch.linspace(math.log(min_scale), math.log(max_scale), levels))
         self.gaussian_conditional.update_scale_table(table.tolist(), force=True)
-
     def _apply_h_s(self, z_hat: torch.Tensor) -> torch.Tensor:
-        """h_s with self-attention on z_hat (16×16 = 256 tokens)."""
+        """h_s with self-attention on z_hat, windowed for large inputs.
+
+        For small hyper-latents (≤16×16 = 256 tokens, the training regime)
+        the full spatial self-attention runs as-is.  For larger images the
+        hyper-latent is partitioned into 16×16 non-overlapping windows and
+        attention runs per-window, keeping the same trained attention
+        semantics without O(n²) memory blowup on high-res inputs.
+        """
         B, C, H, W = z_hat.shape
         attn_in = self.h_s_proj_in(z_hat)          # → B, 4C, H, W
-        flat = attn_in.flatten(2).transpose(1, 2)   # → B, H*W, 4C
-        attn_out, _ = self.h_s_attention(flat, flat, flat)
-        attn_out = attn_out.transpose(1, 2).reshape(B, -1, H, W)
+        token_count = H * W
+        # The model was trained on 256px images → 16×16 hyper-latent = 256 tokens.
+        # Stay in that regime below the threshold and fall back to windowed
+        # attention above it so O(n²) does not blow up memory.
+        if token_count <= 256:
+            flat = attn_in.flatten(2).transpose(1, 2)   # → B, H*W, 4C
+            attn_out, _ = self.h_s_attention(flat, flat, flat)
+            attn_out = attn_out.transpose(1, 2).reshape(B, -1, H, W)
+        else:
+            attn_out = self._windowed_attention(attn_in, window_size=16)
         z_attended = self.h_s_proj_out(attn_out) + z_hat  # residual
         return self.h_s(z_attended)
+
+    def _windowed_attention(
+        self, attn_in: torch.Tensor, window_size: int = 16
+    ) -> torch.Tensor:
+        """Apply self-attention per non-overlapping spatial window.
+
+        Partitions the (B, 4C, H, W) tensor into (B×nH×nW, 4C, ws, ws)
+        windows, runs the same trained MultiheadAttention per window, then
+        folds back.
+        """
+        ws = window_size
+        B, C, H, W = attn_in.shape
+        # Pad to window alignment
+        pH = (ws - H % ws) % ws
+        pW = (ws - W % ws) % ws
+        if pH or pW:
+            attn_in = F.pad(attn_in, (0, pW, 0, pH))
+        _, C, Hp, Wp = attn_in.shape
+        nH, nW = Hp // ws, Wp // ws
+        # Unfold → (B, C, nH, ws, nW, ws) → (B×nH×nW, C, ws, ws)
+        windows = (
+            attn_in.unfold(2, ws, ws)
+            .unfold(3, ws, ws)
+            .permute(0, 2, 3, 1, 4, 5)
+            .reshape(B * nH * nW, C, ws, ws)
+        )
+        flat = windows.flatten(2).transpose(1, 2)  # (B×nH×nW, ws², C)
+        attn_w, _ = self.h_s_attention(flat, flat, flat)
+        attn_w = attn_w.transpose(1, 2).reshape(B * nH * nW, C, ws, ws)
+        # Fold back
+        attn_out = (
+            attn_w.reshape(B, nH, nW, C, ws, ws)
+            .permute(0, 3, 1, 4, 2, 5)
+            .reshape(B, C, Hp, Wp)
+        )
+        if pH or pW:
+            attn_out = attn_out[:, :, :H, :W]
+        return attn_out
 
     def forward(
         self, image: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
-        mu = 3.0 * torch.tanh(mu / 3.0)
+        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self._apply_h_s(z_hat)
@@ -223,7 +275,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
-        mu = 3.0 * torch.tanh(mu / 3.0)
+        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
         return mu
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode latent tensor back to RGB image."""
@@ -235,10 +287,16 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.y_entropy_bottleneck.update(force=force)
 
     def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
-        """Deterministic encode → quantize → decode for evaluation."""
+        """Deterministic encode → quantize → decode for evaluation.
+
+        Uses the GaussianConditional for quantization (via learned scale/mean
+        from the hyperprior) rather than a crude STE integer round — this
+        gives much finer quantization steps (~scale, typically ~0.1) compared
+        to the 7 integer bins from rounding to [-3,-2,…,3].
+        """
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
-        mu = 3.0 * torch.tanh(mu / 3.0)
+        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
         z = self.h_a(mu)
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
@@ -246,8 +304,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
-        # Use straight-through rounding for evaluation (STE same as training)
-        y_hat = mu + (mu.round() - mu).detach()
+        # GaussianConditional quantizes y with learned step size:
+        #   y_hat = round((mu - mean) / scale) * scale + mean
+        # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
+        y_hat, _ = self.gaussian_conditional(mu, scale, mean)
         return self.g_s(y_hat)
 
 

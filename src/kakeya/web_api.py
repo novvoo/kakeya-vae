@@ -195,6 +195,134 @@ def experiment_image(
         raise HTTPException(status_code=404, detail="图像结果不存在")
     return FileResponse(image_path, media_type="image/png")
 
+@app.post("/api/experiments/{job_id}/regenerate", status_code=200)
+def regenerate_experiment(job_id: str) -> dict[str, Any]:
+    """Re-run chart reconstruction on the trained checkpoint.
+
+    Loads the model checkpoint, runs encode → decode on the standard
+    test chart (256² and HD), overwrites the static report images and
+    bitstream, then returns updated metrics.  Idempotent — does not
+    re-train.
+    """
+    import io
+    import math
+
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image, ImageOps
+
+    from kakeya.image_codec import (
+        KakeyaHyperpriorCodec,
+        TEST_IMAGE,
+        TEST_IMAGE_HD,
+        _encode_bitstream,
+        _evaluate_hd_chart,
+        _ssim,
+        _to_image,
+    )
+
+    record = manager.get(job_id)
+    if record is None or not record.run_dir:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    run_dir = (manager.project_root / record.run_dir).resolve()
+    checkpoint_path = run_dir / "checkpoints" / "final.pt"
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail="检查点不存在，无法重新生成")
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    latent_dim = config.get("latent_dim", 16) if isinstance(config, dict) else 16
+    model = KakeyaHyperpriorCodec(
+        latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
+    ).to(device)
+
+    skip_keys = {
+        "entropy_bottleneck._offset", "entropy_bottleneck._quantized_cdf",
+        "entropy_bottleneck._cdf_length", "y_entropy_bottleneck._offset",
+        "y_entropy_bottleneck._quantized_cdf", "y_entropy_bottleneck._cdf_length",
+        "gaussian_conditional._offset", "gaussian_conditional._quantized_cdf",
+        "gaussian_conditional._cdf_length", "gaussian_conditional.scale_table",
+    }
+    filtered_sd = {
+        k: v for k, v in payload["model_state_dict"].items() if k not in skip_keys
+    }
+    model.load_state_dict(filtered_sd, strict=False)
+    model.init_scale_table()
+    model.update()
+    model.eval()
+
+    model.to(device)
+
+    # --- 256² reconstruction (same as _evaluate_chart) ---
+    source_image = Image.open(TEST_IMAGE).convert("RGB")
+    source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
+    source = source.permute(2, 0, 1).unsqueeze(0).to(device)
+    mu = model.encode(source)
+    decoded_latent, bitstream = _encode_bitstream(model, mu, run_dir)
+    reconstructed = model.decode(decoded_latent.to(device)).clamp(0, 1)
+    mse = float(F.mse_loss(reconstructed, source))
+    psnr = 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
+    ssim = float(_ssim(reconstructed, source))
+
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    original_path = report_dir / "original.png"
+    reconstruction_path = report_dir / "reconstruction.png"
+    error_path = report_dir / "error.png"
+    source_image.save(original_path)
+    _to_image(reconstructed[0]).save(reconstruction_path)
+    difference = (reconstructed - source).abs()[0]
+    heat = torch.stack(
+        (
+            difference.mean(dim=0).mul(3).clamp(0, 1),
+            difference.mean(dim=0).mul(0.7).clamp(0, 1),
+            torch.zeros_like(difference[0]),
+        )
+    )
+    _to_image(heat).save(error_path)
+
+    # --- HD reconstruction ---
+    hd_metrics = _evaluate_hd_chart(model, device, run_dir, report_dir)
+
+    metrics: dict[str, Any] = {
+        "mse": mse,
+        "psnr": psnr,
+        "ssim": ssim,
+        "latent_dim": float(model.latent_dim),
+        "source_bytes": float(TEST_IMAGE.stat().st_size),
+        "bitstream_bytes": float(bitstream["bytes"]),
+        "bitstream_payload_bytes": float(bitstream["payload_bytes"]),
+        "bitstream_bpp": float(bitstream["bpp"]),
+    }
+    metrics.update(hd_metrics)
+
+    # --- Update saved dashboard.json ---
+    old = manager.result(job_id)
+    if old is not None:
+        old["metrics"] = metrics
+        if "image_codec" in old:
+            old["image_codec"]["images"] = {
+                "original": "reports/original.png",
+                "reconstruction": "reports/reconstruction.png",
+                "error": "reports/error.png",
+                "original_hd": "reports/original_hd.png",
+                "reconstruction_hd": "reports/reconstruction_hd.png",
+                "error_hd": "reports/error_hd.png",
+            }
+            old["image_codec"]["bitstream"] = bitstream
+        dash_path = (run_dir / "reports" / "dashboard.json").resolve()
+        if run_dir in dash_path.parents:
+            dash_path.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {"metrics": metrics, "bitstream": bitstream}
+
 @app.get("/api/experiments/{job_id}/artifact/bitstream")
 def experiment_bitstream(job_id: str) -> FileResponse:
     record = manager.get(job_id)

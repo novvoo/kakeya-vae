@@ -1504,9 +1504,20 @@ function ImageCodecResults({
   result: ResultPayload;
   jobId: string;
 }) {
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenerateKey, setRegenerateKey] = useState(0);
+  const [regeneratedMetrics, setRegeneratedMetrics] = useState<Record<string, number> | null>(null);
+  const [customRecon, setCustomRecon] = useState<{
+    original: string;
+    reconstruction: string;
+    error: string;
+    metrics: { psnr: number; ssim: number; bpp: number; bitstream_bytes: number };
+  } | null>(null);
+  const [customLoading, setCustomLoading] = useState(false);
+  const m = regeneratedMetrics ?? result.metrics;
   const quality = assessImageQuality(
-    Number(result.metrics.psnr ?? 0),
-    Number(result.metrics.ssim ?? 0),
+    Number(m.psnr ?? 0),
+    Number(m.ssim ?? 0),
   );
   const training = result.image_codec?.training;
   const bitstream = result.image_codec?.bitstream;
@@ -1518,7 +1529,7 @@ function ImageCodecResults({
   const metrics = [
     ["当前结论", quality.usable ? "还原基本有效" : "当前还原无效"],
     ["肉眼质量", quality.label],
-    ["结构保真", `${(Number(result.metrics.ssim ?? 0) * 100).toFixed(1)}%`],
+    ["结构保真", `${(Number(m.ssim ?? 0) * 100).toFixed(1)}%`],
     ["真实码流", bitstream ? formatBytes(bitstream.bytes) : "未生成"],
     ["潜在通道", String(result.config.latent_dim)],
   ] as const;
@@ -1543,13 +1554,26 @@ function ImageCodecResults({
     hd_width?: number;
     hd_height?: number;
   };
-  const [customRecon, setCustomRecon] = useState<{
-    original: string;
-    reconstruction: string;
-    error: string;
-    metrics: { psnr: number; ssim: number; bpp: number; bitstream_bytes: number };
-  } | null>(null);
-  const [customLoading, setCustomLoading] = useState(false);
+  const handleRegenerate = async () => {
+    setRegenerating(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/experiments/${jobId}/regenerate`,
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "重新生成失败");
+      }
+      const data = await res.json();
+      setRegeneratedMetrics(data.metrics);
+      setRegenerateKey((k) => k + 1);
+    } catch (err) {
+      alert((err as Error).message || "重新生成失败，请稍后重试");
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   const handleCustomUpload = async (file: File) => {
     setCustomLoading(true);
@@ -1568,7 +1592,6 @@ function ImageCodecResults({
       setCustomRecon(data);
     } catch (err) {
       alert((err as Error).message || "图片还原失败，请检查图片格式");
-    } finally {
       setCustomLoading(false);
     }
   };
@@ -1681,6 +1704,19 @@ function ImageCodecResults({
           这项判断同时参考结构相似度和实际图像，不要求理解 PSNR。
         </p>
       </div>
+      <div className="regenerate-bar">
+        <button
+          type="button"
+          className="regenerate-btn"
+          onClick={handleRegenerate}
+          disabled={regenerating}
+        >
+          {regenerating ? "重新生成中…" : "重新生成图文还原"}
+        </button>
+        <span className="regenerate-hint">
+          重新用当前 checkpoint 跑 encode → decode，覆盖已保存的结果图和码流
+        </span>
+      </div>
       <div className="codec-summary">
         <div>
           <p className="section-index">IN-DISTRIBUTION CODEC CALIBRATION</p>
@@ -1697,7 +1733,7 @@ function ImageCodecResults({
             {/* Dynamic experiment artifacts are intentionally loaded from the local API. */}
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              src={`${API_BASE}/api/experiments/${jobId}/image/${kind}`}
+              src={`${API_BASE}/api/experiments/${jobId}/image/${kind}?t=${regenerateKey}`}
               alt={label}
             />
             <figcaption>{label}</figcaption>
@@ -1725,7 +1761,7 @@ function ImageCodecResults({
               <figure key={kind}>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
-                  src={`${API_BASE}/api/experiments/${jobId}/image/${kind}`}
+                  src={`${API_BASE}/api/experiments/${jobId}/image/${kind}?t=${regenerateKey}`}
                   alt={label}
                 />
                 <figcaption>{label}</figcaption>
