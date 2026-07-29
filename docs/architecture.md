@@ -278,10 +278,9 @@ graph TD
         Y_HAT --> D0[weight_norm Conv 3x3<br/>8→64]
         D0 --> DRB64[ResidualBlockGDN<br/>64]
         DRB64 --> D1[weight_norm Conv 3x3<br/>64→32]
-        D1 --> DRB32a[ResidualBlockGDN<br/>32]
-        DRB32a --> DRB32b[ResidualBlockGDN<br/>32]
-        DRB32b --> UPSMP[BilinearUpsample 2x<br/>64→128 平滑]
-        UPSMP --> D2[weight_norm Conv 3x3<br/>32→24]
+        D1 --> DRB32[ResidualBlockGDN<br/>32]
+        DRB32 --> UPS[LearnedUpsample<br/>bilinear + sharp residual]
+        UPS --> D2[weight_norm Conv 3x3<br/>32→24]
         D2 --> DRB24[ResidualBlockGDN<br/>24]
         DRB24 --> D2S[DepthToSpace<br/>24→12, x2]
         D2S --> DC1[weight_norm Conv 3x3<br/>12→24]
@@ -290,7 +289,6 @@ graph TD
         DC2 --> SIG[Sigmoid]
         SIG --> OUT[RGB Output<br/>H x W x 3]
     end
-
     style Input fill:#e1f5fe
     style g_a fill:#f3e5f5
     style 超先验 Hyperprior fill:#e8eaf6
@@ -323,7 +321,7 @@ graph LR
         C4 --> ADD[+]
         C --> ADD
         ADD --> OUT3[Output]
-    end
+| 上采样 | LearnedUpsample（bilinear + sharp residual）+ DepthToSpace = 4x |
 ```
 | 维度 | 说明 |
 |---|---|

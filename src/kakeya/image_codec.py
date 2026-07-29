@@ -81,15 +81,27 @@ class DepthToSpace(nn.Module):
         return self.net(value)
 
 
-class BilinearUpsample(nn.Module):
-    """2× bilinear spatial upsampling as a nn.Module wrapper for nn.Sequential."""
+class LearnedUpsample(nn.Module):
+    """2× upsampling combining bilinear smooth base with a learned sharp residual.
 
-    def __init__(self, scale_factor: int = 2) -> None:
+    ``base = bilinear(x)`` gives smooth interpolation (good for gradients).
+    ``residual = PixelShuffle(Conv(x)) - bilinear(x)`` gives the sharp edge
+    signal that bilinear loses.  The residual is learned so the model can
+    decide per-location how much sharpening to apply.
+    """
+
+    def __init__(self, channels: int) -> None:
         super().__init__()
-        self.scale_factor = scale_factor
+        self.sharpener = nn.Sequential(
+            weight_norm(nn.Conv2d(channels, channels * 4, 3, padding=1)),
+            nn.PixelShuffle(2),
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return F.interpolate(value, scale_factor=self.scale_factor, mode="bilinear", align_corners=False)
+        base = F.interpolate(value, scale_factor=2, mode="bilinear", align_corners=False)
+        residual = self.sharpener(value)
+        return base + residual
+
 
 class ResidualBlockGDN(nn.Module):
     """Residual block with GDN activation."""
@@ -170,7 +182,7 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(64),
             weight_norm(nn.Conv2d(64, 32, 3, padding=1)),           # squeeze to 32ch
             ResidualBlockGDN(32),
-            BilinearUpsample(2),                                     # 64→128 smooth
+            LearnedUpsample(32),                                     # bilinear + sharp residual
             weight_norm(nn.Conv2d(32, 24, 3, padding=1)),           # mix to 24ch
             ResidualBlockGDN(24),
             DepthToSpace(24, 12),
