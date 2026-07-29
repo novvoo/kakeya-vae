@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
     "capacity": {
-        "mse": 1.0,
+        "mse": 3.0,
         "edge": 1.0,
         "structural": 0.2,
         "multiscale": 0.2,

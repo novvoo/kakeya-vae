@@ -113,9 +113,9 @@ graph TD
     end
 
     subgraph 挂谷正则计算路径
-        L1[latent: B x 16 x H/8 x W/8]
-        L2[permute → B x H/8 x W/8 x 16]
-        L3[reshape → B*H/8*W/8 x 16<br/>每个空间位置一个 16 维点]
+        L1[latent: B x 16 x H/4 x W/4]
+        L2[permute → B x H/4 x W/4 x 16]
+        L3[reshape → B*H/4*W/4 x 16<br/>每个空间位置一个 16 维点]
         L4[F.normalize dim=1<br/>归一化到单位球面]
         L5[kakeya_regularization<br/>32 方向投影 + top-k 间距]
         L6[coverage = -mean top-k gaps<br/>负号: 最大化覆盖]
@@ -248,19 +248,17 @@ graph TD
         S2D1 --> RB1[ResidualBlockGDN<br/>24]
         RB1 --> S2D2[SpaceToDepth<br/>24→32, /2]
         S2D2 --> RB2[ResidualBlockGDN<br/>32]
-        RB2 --> S2D3[SpaceToDepth<br/>32→64, /2]
-        S2D3 --> RB3[ResidualBlockGDN<br/>64]
-        RB3 --> CONV[weight_norm Conv 1x1<br/>64→32]
+        RB2 --> CONV[weight_norm Conv 1x1<br/>32→32]
         CONV --> SPLIT[chunk 2 dim=1<br/>→ mu + log_var]
     end
 
     subgraph 超先验 Hyperprior
-        SPLIT -->|mu| TANH[tanh bound ±3<br/>mu_bounded 16×32×32]
+        SPLIT -->|mu| TANH[tanh bound ±3<br/>mu_bounded 16×64×64]
         TANH --> HA1[Conv 3x3 stride1<br/>16→8]
         HA1 --> HA2[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA2 --> HA3[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA3 --> EB[EntropyBottleneck<br/>8 通道]
-        EB --> ATTN[Self-Attention<br/>8×8 → 64 tokens<br/>4 heads × 8-dim<br/>1×1 proj 8→32→8<br/>residual add]
+        EB --> ATTN[Self-Attention<br/>16×16 → 256 tokens<br/>4 heads × 8-dim<br/>1×1 proj 8→32→8<br/>residual add]
         ATTN --> HD1[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
         HD1 --> HD2[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
         HD2 --> HD3[Conv 3x3<br/>8→32]
@@ -273,12 +271,10 @@ graph TD
         GC --> Y_HAT[y_hat<br/>量化潜变量]
         GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
     end
-
     subgraph g_s — 综合变换
-        Y_HAT --> D0[weight_norm Conv 3x3<br/>16→64]
-        D0 --> DRB1[ResidualBlockGDN<br/>64]
-        DRB1 --> D2S1[DepthToSpace<br/>64→32, x2]
-        D2S1 --> DRB2[ResidualBlockGDN<br/>32]
+
+        Y_HAT --> S2D0[weight_norm Conv 3x3<br/>16→32]
+        S2D0 --> DRB2[ResidualBlockGDN<br/>32]
         DRB2 --> D2S2[DepthToSpace<br/>32→24, x2]
         D2S2 --> DRB3[ResidualBlockGDN<br/>24]
         DRB3 --> D2S3[DepthToSpace<br/>24→12, x2]
@@ -331,10 +327,10 @@ graph LR
 | 熵模型 | EntropyBottleneck（超先验 z）+ GaussianConditional（条件高斯 y） |
 | 激活函数 | GDN / IGDN（压缩专用归一化） |
 | ResidualBlock | GDN 替代 InstanceNorm + SiLU |
-| 下采样 | SpaceToDepth x 3 = 8x（保持文字精度） |
+| 下采样 | SpaceToDepth x 2 = 4x（保持文字精度） |
 | 损失函数 | MSE + lambda·rate + lambdaₖ·kakeya（单阶段） |
 | 训练阶段 | 单阶段端到端 |
-| h_s 增强 | Self-Attention（8×8→64 tokens, 4 heads, 1×1 proj, residual）— Cheng2020 路线 |
+| h_s 增强 | Self-Attention（16×16→256 tokens, 4 heads, 1×1 proj, residual）— Cheng2020 路线 |
 | 潜空间 | 16 通道, ±3 bound |
 ---
 
@@ -666,24 +662,20 @@ graph TD
 
 ### 9.3 高清大图推理流程
 
-推理时不分块、不缩放，整图通过模型（padding 到 8 的倍数）：
+推理时不分块、不缩放，整图通过模型（padding 到 4 的倍数）：
 
 ```mermaid
 flowchart TD
     INPUT([输入图片<br/>任意尺寸 WxH]) --> CHK{尺寸检查}
     CHK -->|W or H > 4096| REJECT[拒绝: 超过 4096px]
-    CHK -->|W or H < 16| REJECT2[拒绝: 小于 16px]
-    CHK -->|OK| PAD[8 倍数对齐<br/>pad_w = 8 - W%8<br/>pad_h = 8 - H%8<br/>黑色填充]
+    CHK -->|OK| PAD[4 倍数对齐<br/>pad_w = (4 - W%4) % 4<br/>pad_h = (4 - H%4) % 4<br/>黑色填充]
 
-    PAD --> LOAD[加载 final.pt<br/>KakeyaHyperpriorCodec]
-    LOAD --> ENCODE[encoder: WxHx3<br/>→ W/8 x H/8 x 16<br/>下采样 3 次 PixelUnshuffle]
-
-    ENCODE --> MU[mu = tanh bound<br/>latent 空间 H/8 x W/8]
+    LOAD --> ENCODE[encoder: WxHx3<br/>→ W/4 x H/4 x 16<br/>下采样 2 次 PixelUnshuffle]
+    ENCODE --> MU[mu = tanh bound<br/>latent 空间 H/4 x W/4]
     MU --> EB_COPY[复制 EntropyBottleneck<br/>CPU eval update force]
 
     EB_COPY --> COMPRESS[entropy_model.compress<br/>mu → bitstream bytes]
-    COMPRESS --> DECOMPRESS[entropy_model.decompress<br/>bitstream → quantized latent]
-    DECOMPRESS --> DECODE[decoder: W/8 x H/8 x 16<br/>→ WxHx3<br/>上采样 3 次 PixelShuffle]
+    DECOMPRESS --> DECODE[decoder: W/4 x H/4 x 16<br/>→ WxHx3<br/>上采样 2 次 PixelShuffle]
 
     DECODE --> CLAMP[clamp 0, 1]
     CLAMP --> CROP[去除 padding<br/>恢复 WxH]
@@ -814,7 +806,7 @@ flowchart TD
 
 | 阶段 | 损失权重 (config.stage_weights) | kakeya | 设计意图 |
 |------|--------------------------------|--------|----------|
-| Capacity | mse 0.5 / structural 0.1 / lab 0.02 | 0.002 | 专注方向覆盖，mse/structural/lab 用低权重做"种子" |
+| Capacity | mse 3.0 / structural 0.1 / lab 0.02 | 0.002 | 专注方向覆盖，mse/structural/lab 用低权重做"种子" |
 | Transition | mse 5.0 / structural 0.25 / lab 0.05 | 0.001 | 权重递增，感知约束逐步强化 |
 | Finetune | mse 5.0 / structural 0.5 / lab 0.10 + rate | 0.0005 | 全部权重最高，协同优化码率与画质 |
 
@@ -833,7 +825,7 @@ flowchart TD
     end
 
     subgraph 解决方案：所有损失全程参与，权重递增
-        S1[Capacity: 全部损失参与<br/>mse 0.5 / structural 0.1 / lab 0.02<br/>kakeya 0.002]
+        S1[Capacity: 全部损失参与<br/>mse 3.0 / structural 0.1 / lab 0.02<br/>kakeya 0.002]
         S2[Transition: 权重递增<br/>mse 5.0 / structural 0.25 / lab 0.05<br/>kakeya 0.001]
         S3[Finetune: 权重最高<br/>structural 0.5 / lab 0.10 + rate<br/>kakeya 0.0005]
         S1 --> S2 --> S3

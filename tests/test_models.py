@@ -35,9 +35,9 @@ def test_image_codec_forward_pass() -> None:
     mu = model.encode(image)
     recon, _, _, y_hat, yl, zl = model(image)
     assert recon.shape == image.shape
-    assert mu.shape == (1, 8, 32, 32)
+    assert mu.shape == (1, 8, 64, 64)
     assert mu.abs().max() <= 3.0
-    assert yl.shape == (1, 8, 32, 32)
+    assert yl.shape == (1, 8, 64, 64)
     assert torch.isfinite(yl).all()
 
 
@@ -84,6 +84,6 @@ def test_kakeya_hyperprior_forward_pass() -> None:
     x = torch.rand(1, 3, 128, 128)
     (recon, mu, log_var, y_hat, y_likelihoods, z_likelihoods) = model(x)
     assert recon.shape == (1, 3, 128, 128)
-    assert mu.shape == (1, 4, 16, 16)
+    assert mu.shape == (1, 4, 32, 32)
     assert torch.isfinite(recon).all()
     assert torch.isfinite(y_likelihoods).all()

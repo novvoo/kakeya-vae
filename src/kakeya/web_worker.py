@@ -81,7 +81,7 @@ def run(spec_path: Path) -> int:
                 "image_size": 256,
                 "test_asset": "Kakeya Codec Test Card v2",
                 "test_role": "in_distribution_calibration",
-                "latent_shape": [config.latent_dim, 32, 32],
+                "latent_shape": [config.latent_dim, 64, 64],
                 "images": image_result.images,
                 "training": image_result.training_summary,
                 "bitstream": image_result.bitstream,
@@ -114,7 +114,7 @@ def run(spec_path: Path) -> int:
                 "image_size": 256,
                 "test_asset": "Kakeya Codec Test Card v2",
                 "test_role": "in_distribution_calibration",
-                "latent_shape": [config.latent_dim, 32, 32],
+                "latent_shape": [config.latent_dim, 64, 64],
                 "images": {},
                 "training": {
                     "error": tb,

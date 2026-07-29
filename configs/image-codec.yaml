@@ -19,7 +19,7 @@ objective:
   stage_weights:
     capacity:
       kakeya: 0.002
-      mse: 0.5
+      mse: 3.0
       structural: 0.1
       lab: 0.02
       hue: 0.02

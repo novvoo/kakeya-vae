@@ -114,21 +114,18 @@ class KakeyaHyperpriorCodec(nn.Module):
     def __init__(self, latent_dim: int = 16, hyper_dim: int = 8) -> None:
         super().__init__()
         self.latent_dim = latent_dim
-
-        # Analysis transform: SpaceToDepth × 3 → 8× downscale to 32×32
+        # Analysis transform: SpaceToDepth × 2 → 4× downscale to 64×64
         # GDN replaces InstanceNorm for better compression statistics.
         self.g_a = nn.Sequential(
             SpaceToDepth(3, 24),
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
-            SpaceToDepth(32, 64),
-            ResidualBlockGDN(64),
-            weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),
+            weight_norm(nn.Conv2d(32, latent_dim * 2, 1)),
         )
 
         # Hyperprior — spatially adaptive entropy model.
-        # h_a compresses the latent → hyper-latent (32→8 spatial).
+        # h_a compresses the latent → hyper-latent (64→16 spatial).
         # h_s decompresses back → scale + mean for GaussianConditional.
         self.h_a = nn.Sequential(
             nn.Conv2d(latent_dim, hyper_dim, 3, stride=1, padding=1),
@@ -157,11 +154,9 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.y_entropy_bottleneck = EntropyBottleneck(latent_dim)
         self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
 
-        # Synthesis transform: DepthToSpace × 3 → 8× upscale back to 256
+        # Synthesis transform: DepthToSpace × 2 → 4× upscale back to 256
         self.g_s = nn.Sequential(
-            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
-            ResidualBlockGDN(64),
-            DepthToSpace(64, 32),
+            weight_norm(nn.Conv2d(latent_dim, 32, 3, padding=1)),
             ResidualBlockGDN(32),
             DepthToSpace(32, 24),
             ResidualBlockGDN(24),
@@ -202,7 +197,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.gaussian_conditional.update_scale_table(table.tolist(), force=True)
 
     def _apply_h_s(self, z_hat: torch.Tensor) -> torch.Tensor:
-        """h_s with self-attention on z_hat (8×8 = 64 tokens)."""
+        """h_s with self-attention on z_hat (16×16 = 256 tokens)."""
         B, C, H, W = z_hat.shape
         attn_in = self.h_s_proj_in(z_hat)          # → B, 4C, H, W
         flat = attn_in.flatten(2).transpose(1, 2)   # → B, H*W, 4C
@@ -1031,10 +1026,10 @@ def _evaluate_hd_chart(
     if not TEST_IMAGE_HD.is_file():
         return {}
     hd_image = Image.open(TEST_IMAGE_HD).convert("RGB")
-    # Pad to a multiple of 8 (3× PixelShuffle requires divisibility by 8).
+    # Pad to a multiple of 4 (2× PixelShuffle requires divisibility by 4).
     w, h = hd_image.size
-    pad_w = (8 - w % 8) % 8
-    pad_h = (8 - h % 8) % 8
+    pad_w = (4 - w % 4) % 4
+    pad_h = (4 - h % 4) % 4
     if pad_w or pad_h:
         hd_image = ImageOps.expand(hd_image, border=(0, 0, pad_w, pad_h), fill=(0, 0, 0))
     hd_tensor = torch.from_numpy(np.asarray(hd_image, dtype=np.float32) / 255.0)
