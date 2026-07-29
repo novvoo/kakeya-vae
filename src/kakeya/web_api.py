@@ -27,7 +27,7 @@ manager = JobManager()
 class ExperimentRequest(BaseModel):
     method: Literal["image_codec", "hyperprior_kakeya"] = "image_codec"
     epochs: Annotated[int, Field(ge=1, le=500)] = 80
-    latent_dim: Annotated[int, Field(ge=2, le=256)] = 16
+    latent_dim: Annotated[int, Field(ge=2, le=256)] = 8
     batch_size: Annotated[int, Field(ge=1, le=2048)] = 4
     learning_rate: Annotated[float, Field(gt=0, le=1)] = 0.0005
     seed: Annotated[int, Field(ge=0, le=2**31 - 1)] = 42
@@ -238,7 +238,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
-    latent_dim = config.get("latent_dim", 16) if isinstance(config, dict) else 16
+    latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     model = KakeyaHyperpriorCodec(
         latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
     ).to(device)
@@ -442,7 +442,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
         raise HTTPException(status_code=400, detail="无法加载模型检查点")
 
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
-    latent_dim = config.get("latent_dim", 16) if isinstance(config, dict) else 16
+    latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     try:
         model = KakeyaHyperpriorCodec(
             latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)

@@ -111,7 +111,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     - Single-stage training (no capacity/transition/finetune)
     """
 
-    def __init__(self, latent_dim: int = 16, hyper_dim: int = 8) -> None:
+    def __init__(self, latent_dim: int = 8, hyper_dim: int = 8) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         # Analysis transform: SpaceToDepth × 2 → 4× downscale to 64×64

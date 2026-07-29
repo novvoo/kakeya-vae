@@ -140,7 +140,7 @@ type ResultPayload = {
 const DEFAULT_CONFIG: ExperimentConfig = {
   method: "image_codec",
   epochs: 80,
-  latent_dim: 16,
+  latent_dim: 8,
   batch_size: 4,
   learning_rate: 0.0005,
   seed: 42,

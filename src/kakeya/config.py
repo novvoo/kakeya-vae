@@ -64,7 +64,7 @@ SUPPORTED_METHODS = {
 class ExperimentConfig:
     method: str
     epochs: int = 25
-    latent_dim: int = 16
+    latent_dim: int = 8
     batch_size: int = 128
     learning_rate: float = 1e-3
     seed: int = 42
