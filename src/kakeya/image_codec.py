@@ -121,8 +121,9 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
-            ResidualBlockGDN(32),  # depth compensation for 4× downscale
-            weight_norm(nn.Conv2d(32, latent_dim * 2, 1)),
+            weight_norm(nn.Conv2d(32, 64, 1)),      # expand to 64ch bottleneck
+            ResidualBlockGDN(64),
+            weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),  # squeeze to latent
         )
 
         # Hyperprior — spatially adaptive entropy model.
@@ -154,11 +155,11 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
         self.y_entropy_bottleneck = EntropyBottleneck(latent_dim)
         self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
-
         self.g_s = nn.Sequential(
-            weight_norm(nn.Conv2d(latent_dim, 32, 3, padding=1)),
+            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),  # expand to 64ch
+            ResidualBlockGDN(64),
+            weight_norm(nn.Conv2d(64, 32, 3, padding=1)),          # squeeze to 32ch
             ResidualBlockGDN(32),
-            ResidualBlockGDN(32),  # depth compensation for 4× downscale
             DepthToSpace(32, 24),
             ResidualBlockGDN(24),
             DepthToSpace(24, 12),
@@ -304,6 +305,13 @@ class KakeyaHyperpriorCodec(nn.Module):
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
+        # The hyperprior decoder (h_s) uses transposed convolutions that may
+        # produce a slightly different spatial size than g_a's output for
+        # non-power-of-2 image dimensions.  Interpolate to match mu so the
+        # GaussianConditional doesn't crash with a size mismatch.
+        if scale.shape[-2:] != mu.shape[-2:]:
+            scale = F.interpolate(scale, size=mu.shape[-2:], mode="bilinear", align_corners=False)
+            mean = F.interpolate(mean, size=mu.shape[-2:], mode="bilinear", align_corners=False)
         # GaussianConditional quantizes y with learned step size:
         #   y_hat = round((mu - mean) / scale) * scale + mean
         # This yields finer gradations (~0.1 steps vs 1.0 for integer round).

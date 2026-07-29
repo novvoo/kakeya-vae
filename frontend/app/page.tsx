@@ -1592,6 +1592,7 @@ function ImageCodecResults({
       setCustomRecon(data);
     } catch (err) {
       alert((err as Error).message || "图片还原失败，请检查图片格式");
+    } finally {
       setCustomLoading(false);
     }
   };
