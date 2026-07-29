@@ -137,6 +137,11 @@ class KakeyaHyperpriorCodec(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv2d(hyper_dim, hyper_dim, 5, stride=2, padding=2),
         )
+        self.h_s_attention = nn.MultiheadAttention(
+            hyper_dim * 4, num_heads=4, batch_first=True, dropout=0.0
+        )
+        self.h_s_proj_in = nn.Conv2d(hyper_dim, hyper_dim * 4, 1)
+        self.h_s_proj_out = nn.Conv2d(hyper_dim * 4, hyper_dim, 1)
         self.h_s = nn.Sequential(
             nn.ConvTranspose2d(hyper_dim, hyper_dim, 5, stride=2, padding=2,
                                output_padding=1),
@@ -149,6 +154,7 @@ class KakeyaHyperpriorCodec(nn.Module):
 
         # Entropy models
         self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
+        self.y_entropy_bottleneck = EntropyBottleneck(latent_dim)
         self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
 
         # Synthesis transform: DepthToSpace × 3 → 8× upscale back to 256
@@ -184,7 +190,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         if y_hat is not None:
             return self.g_s(y_hat)
         # Fallback without y_hat (used by CLI decode path)
-        params = self.h_s(z_hat)
+        params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         dummy = torch.zeros(1, self.latent_dim, *shape, device=z_hat.device)
@@ -194,37 +200,36 @@ class KakeyaHyperpriorCodec(nn.Module):
         """Initialize the GaussianConditional scale table for entropy coding."""
         table = torch.exp(torch.linspace(math.log(min_scale), math.log(max_scale), levels))
         self.gaussian_conditional.update_scale_table(table.tolist(), force=True)
+
+    def _apply_h_s(self, z_hat: torch.Tensor) -> torch.Tensor:
+        """h_s with self-attention on z_hat (8×8 = 64 tokens)."""
+        B, C, H, W = z_hat.shape
+        attn_in = self.h_s_proj_in(z_hat)          # → B, 4C, H, W
+        flat = attn_in.flatten(2).transpose(1, 2)   # → B, H*W, 4C
+        attn_out, _ = self.h_s_attention(flat, flat, flat)
+        attn_out = attn_out.transpose(1, 2).reshape(B, -1, H, W)
+        z_attended = self.h_s_proj_out(attn_out) + z_hat  # residual
+        return self.h_s(z_attended)
+
     def forward(
         self, image: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full forward pass with rate estimation.
-
-        GaussianConditional handles noise internally (no separate log_var/noise).
-        Returns:
-            reconstructed, mu, None (placeholder), y_hat, y_likelihoods, z_likelihoods
-        """
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
         mu = 3.0 * torch.tanh(mu / 3.0)
-
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-
-        params = self.h_s(z_hat)
+        params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
-
         y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
         reconstructed = self.g_s(y_hat)
-
         return reconstructed, mu, None, y_hat, y_likelihoods, z_likelihoods
     def encode(self, image: torch.Tensor) -> torch.Tensor:
-        """Return bounded mu from the encoder."""
         raw = self.g_a(image)
         mu, _ = raw.chunk(2, dim=1)
         mu = 3.0 * torch.tanh(mu / 3.0)
         return mu
-
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode latent tensor back to RGB image."""
         return self.g_s(latent)
@@ -232,6 +237,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     def update(self, force: bool = False) -> None:
         """Update entropy bottleneck CDF tables (required before compress)."""
         self.entropy_bottleneck.update(force=force)
+        self.y_entropy_bottleneck.update(force=force)
 
     def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
         """Deterministic encode → quantize → decode for evaluation."""
@@ -242,7 +248,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
         )
-        params = self.h_s(z_hat)
+        params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         # Use straight-through rounding for evaluation (STE same as training)
@@ -666,6 +672,7 @@ def _hyperprior_epoch(
                     if aux_optimizer is not None:
                         aux_optimizer.zero_grad(set_to_none=True)
                         aux_loss = model.entropy_bottleneck.loss()
+                        aux_loss += model.y_entropy_bottleneck.loss()
                         aux_loss.backward()
                         aux_optimizer.step()
 
@@ -1058,7 +1065,293 @@ def _evaluate_hd_chart(
         "hd_height": float(h),
         "hd_pixels": float(pixels),
     }
-@torch.no_grad()
+    """Encode latent as bitstream: z via EntropyBottleneck, y via y_EntropyBottleneck."""
+    import struct as _struct
+    model.eval()
+    model.update()
+
+    # z: entropy-coded through hyperprior EntropyBottleneck
+    z = model.h_a(latent)
+    z_strings = model.entropy_bottleneck.compress(z)
+
+    # y: entropy-coded through y_entropy_bottleneck (16 channels)
+    # Pass mu directly; the bottleneck learns its own CDF from training.
+    y_strings = model.y_entropy_bottleneck.compress(latent)
+    y_hat = model.y_entropy_bottleneck.decompress(
+        y_strings, latent.size()[-2:]
+    )
+
+    # Pack: [z_len:4B][z_data][y_len:4B][y_data]
+    payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
+    payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
+    file_bytes = len(payload)
+    bitstream_path = run_dir / "reports/reconstruction.kky"
+    bitstream_path.write_bytes(payload)
+    bitstream_bpp = file_bytes * 8 / (256 * 256)
+    return y_hat, {
+        "path": "reports/reconstruction.kky",
+        "filename": "reconstruction.kky",
+        "format": "Kakeya Hyperprior v4",
+        "bytes": file_bytes,
+        "payload_bytes": file_bytes - len(z_strings[0]) - 4,
+        "header_bytes": 4 + len(z_strings[0]),
+        "bpp": bitstream_bpp,
+        "requires_checkpoint": True,
+        "checkpoint": "checkpoints/final.pt",
+    }
+
+
+
+def reference_codec_baselines() -> list[dict[str, Any]]:
+    source_image = Image.open(TEST_IMAGE).convert("RGB")
+    source = torch.from_numpy(
+        np.asarray(source_image, dtype=np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0)
+    rows: list[dict[str, Any]] = [
+        {
+            "codec": "Original PNG",
+            "settings": "source",
+            "bytes": TEST_IMAGE.stat().st_size,
+            "mse": 0.0,
+            "psnr": 99.0,
+            "ssim": 1.0,
+        }
+    ]
+    variants = (
+        ("PNG", "optimized", "PNG", {"optimize": True}),
+        ("JPEG", "quality 90", "JPEG", {"quality": 90, "optimize": True}),
+        ("WebP", "quality 90", "WEBP", {"quality": 90, "method": 6}),
+    )
+    for codec, settings, image_format, options in variants:
+        buffer = BytesIO()
+        source_image.save(buffer, format=image_format, **options)
+        payload = buffer.getvalue()
+        decoded = Image.open(BytesIO(payload)).convert("RGB")
+        decoded_tensor = torch.from_numpy(
+            np.asarray(decoded, dtype=np.float32) / 255.0
+        ).permute(2, 0, 1).unsqueeze(0)
+        mse = float(F.mse_loss(decoded_tensor, source))
+        rows.append(
+            {
+                "codec": codec,
+                "settings": settings,
+                "bytes": len(payload),
+                "mse": mse,
+                "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+                "ssim": float(_ssim(decoded_tensor, source)),
+            }
+        )
+    rows.extend(_compressai_baselines(source, source_image))
+    return rows
+
+
+def _compressai_baselines(
+    source: torch.Tensor, source_image: Image.Image
+) -> list[dict[str, Any]]:
+    try:
+        from compressai.zoo import mbt2018_mean
+    except ImportError:
+        return []
+    import ssl
+
+    original_context = ssl._create_default_https_context
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
+    results: list[dict[str, Any]] = []
+    try:
+        for quality in (2, 4, 6):
+            try:
+                net = mbt2018_mean(
+                    quality=quality, metric="mse", pretrained=True
+                )
+            except Exception:
+                continue
+            net.eval()
+            net = net.to(source.device)
+            with torch.no_grad():
+                compressed = net.compress(source)
+                strings = compressed["strings"]
+                out = net.decompress(strings, compressed["shape"])
+                x_hat = out["x_hat"].clamp(0, 1)
+            total_bytes = sum(
+                len(s) for string_list in strings for s in string_list
+            )
+            total_bytes += 64
+            mse = float(F.mse_loss(x_hat, source))
+            results.append(
+                {
+                    "codec": "CompressAI mbt2018",
+                    "settings": f"quality {quality} (mse)",
+                    "bytes": total_bytes,
+                    "mse": mse,
+                    "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+                    "ssim": float(_ssim(x_hat, source)),
+                    "learned": True,
+                }
+            )
+    finally:
+        try:
+            ssl._create_default_https_context = original_context
+        except Exception:
+            pass
+    return results
+
+
+def _ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    mu_x = F.avg_pool2d(x, 11, stride=1, padding=5)
+    mu_y = F.avg_pool2d(y, 11, stride=1, padding=5)
+    sigma_x = F.avg_pool2d(x * x, 11, 1, 5) - mu_x.square()
+    sigma_y = F.avg_pool2d(y * y, 11, 1, 5) - mu_y.square()
+    sigma_xy = F.avg_pool2d(x * y, 11, 1, 5) - mu_x * mu_y
+    c1, c2 = 0.01**2, 0.03**2
+    return (
+        ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2))
+        / ((mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2))
+    ).mean()
+
+
+def _edges(image: torch.Tensor) -> torch.Tensor:
+    horizontal = image[:, :, :, 1:] - image[:, :, :, :-1]
+    vertical = image[:, :, 1:, :] - image[:, :, :-1, :]
+    return torch.cat(
+        (
+            F.pad(horizontal.abs(), (0, 1, 0, 0)),
+            F.pad(vertical.abs(), (0, 0, 0, 1)),
+        ),
+        dim=1,
+    )
+
+
+_SRGB_TO_LIN_COEFF = 1.0 / 12.92
+_SRGB_TO_LIN_EXP = 1.0 / 2.4
+_SRGB_TO_LIN_OFFSET = 0.055
+_SRGB_TO_LIN_SCALE = 1.055
+
+_LAB_DELTA = 6.0 / 29.0
+_LAB_DELTA_CUBED = _LAB_DELTA ** 3
+_LAB_FACTOR = 3.0 * _LAB_DELTA ** 2
+
+_D65_XYZ = torch.tensor([0.95047, 1.0, 1.08883])
+
+_XYZ_TO_LAB = torch.tensor([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+])
+
+
+def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    if rgb.max() <= 1.5:
+        srgb = rgb.clamp(0, 1)
+    else:
+        srgb = (rgb / 255.0).clamp(0, 1)
+    lin = torch.where(
+        srgb <= 0.04045,
+        srgb * _SRGB_TO_LIN_COEFF,
+        ((srgb + _SRGB_TO_LIN_OFFSET) / _SRGB_TO_LIN_SCALE).pow(_SRGB_TO_LIN_EXP),
+    )
+    if lin.size(1) == 3:
+        rgb_ch = lin.permute(0, 2, 3, 1)
+        xyz = (rgb_ch @ _XYZ_TO_LAB.to(lin.device).T).permute(0, 3, 1, 2)
+    else:
+        xyz = lin
+    ref = _D65_XYZ.to(lin.device).view(1, 3, 1, 1)
+    xyz_norm = xyz / ref
+    f = torch.where(
+        xyz_norm > _LAB_DELTA_CUBED,
+        xyz_norm.pow(1.0 / 3.0),
+        xyz_norm / _LAB_FACTOR + 4.0 / 29.0,
+    )
+    L = 116.0 * f[:, 1:2, :, :] - 16.0
+    a = 500.0 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
+    b = 200.0 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
+    return torch.cat([L, a, b], dim=1)
+
+
+def _lab_losses(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """CIELAB-based color losses: ΔE, hue, and saturation.
+
+    All returns are normalized to ~O(1) scale so that stage weights stay
+    on the same order as other loss weights.
+    """
+    rec_lab = _rgb_to_lab(reconstructed)
+    tgt_lab = _rgb_to_lab(target)
+    diff = rec_lab - tgt_lab
+    L = tgt_lab[:, 0:1, :, :]
+    chroma_weight = 1.0 + 2.0 * ((50.0 - L.clamp(0.0, 50.0)) / 50.0)
+    delta_e = torch.sqrt(
+        0.25 * diff[:, 0:1, :, :].pow(2)
+        + chroma_weight * diff[:, 1:2, :, :].pow(2)
+        + chroma_weight * diff[:, 2:3, :, :].pow(2)
+        + 1e-8,
+    ).mean() / 7.0
+    # Hue: 1 - cos(Δh) handles angular wraparound, range [0, 2].
+    a_rec, b_rec = rec_lab[:, 1:2, :, :], rec_lab[:, 2:3, :, :]
+    a_tgt, b_tgt = tgt_lab[:, 1:2, :, :], tgt_lab[:, 2:3, :, :]
+    h_rec = torch.atan2(b_rec, a_rec)
+    h_tgt = torch.atan2(b_tgt, a_tgt)
+    hue = (1.0 - torch.cos(h_rec - h_tgt)).mean() / 2.0
+    # Saturation: |Δchroma|, typical chroma scale 0-50.
+    C_rec = torch.sqrt(a_rec.pow(2) + b_rec.pow(2) + 1e-8)
+    C_tgt = torch.sqrt(a_tgt.pow(2) + b_tgt.pow(2) + 1e-8)
+    saturation = (C_rec - C_tgt).abs().mean() / 10.0
+    return {"delta_e": delta_e, "hue": hue, "saturation": saturation}
+
+
+def _detail_weight(image: torch.Tensor) -> torch.Tensor:
+    """Emphasize edges and text strokes instead of flat backgrounds."""
+    grayscale = image.mean(dim=1, keepdim=True)
+    horizontal = F.pad(
+        (grayscale[:, :, :, 1:] - grayscale[:, :, :, :-1]).abs(),
+        (0, 1, 0, 0),
+    )
+    vertical = F.pad(
+        (grayscale[:, :, 1:, :] - grayscale[:, :, :-1, :]).abs(),
+        (0, 0, 0, 1),
+    )
+    edge_attention = ((horizontal + vertical) * 8).clamp(0, 1)
+    dark_foreground = ((0.75 - grayscale) * 2).clamp(0, 1)
+    return 1 + 3 * torch.maximum(edge_attention, dark_foreground)
+
+
+def _multiscale_l1(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    cur = min(reconstructed.shape[-1], target.shape[-1])
+    orig_weight = 0.5
+    orig_loss = F.l1_loss(reconstructed, target)
+    losses = [(orig_loss, orig_weight)]
+    for size in (128, 64):
+        if cur <= size:
+            continue
+        reconstructed_level = F.interpolate(
+            reconstructed, size=(size, size), mode="bilinear", align_corners=False
+        )
+        target_level = F.interpolate(
+            target, size=(size, size), mode="bilinear", align_corners=False
+        )
+        losses.append((F.l1_loss(reconstructed_level, target_level), 0.25))
+    if len(losses) == 1:
+        return losses[0][0]
+    total_weight = sum(w for _, w in losses)
+    return sum(loss * w for loss, w in losses) / total_weight
+
+
+def _run_directory(config: ExperimentConfig) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = config.output_dir / config.method / timestamp
+    suffix = 1
+    while run_dir.exists():
+        run_dir = config.output_dir / config.method / f"{timestamp}-{suffix}"
+        suffix += 1
+    for name in ("checkpoints", "metrics", "reports"):
+        (run_dir / name).mkdir(parents=True, exist_ok=True)
+    return run_dir
+
 def _encode_bitstream(
     model: KakeyaHyperpriorCodec,
     latent: torch.Tensor,
@@ -1070,33 +1363,317 @@ def _encode_bitstream(
     model.eval()
     model.update()
 
-    # z: entropy-coded through hyperprior
+    # z: entropy-coded through hyperprior EntropyBottleneck
     z = model.h_a(latent)
     z_strings = model.entropy_bottleneck.compress(z)
 
-    # y: round to [-3,3] int8, then gzip
-    y_quantized = (latent.round() + 3).to(torch.int8)
-    y_raw = y_quantized.detach().cpu().numpy().tobytes()
-    y_compressed = _gzip.compress(y_raw, 9)
+    # y: entropy-coded through y_entropy_bottleneck (16 channels)
+    y_strings = model.y_entropy_bottleneck.compress(latent)
+    y_hat = model.y_entropy_bottleneck.decompress(y_strings, latent.size()[-2:])
 
-    # Pack: [z_len:4B][z_data][y_len:4B][y_gzip_data]
+    # Pack: [z_len:4B][z_data][y_len:4B][y_data]
     payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
-    payload += _struct.pack(">I", len(y_compressed)) + y_compressed
-
-    # Decode y: gunzip + convert back
-    y_decompressed = _gzip.decompress(y_compressed)
-    y_decoded = torch.from_numpy(
-        np.frombuffer(y_decompressed, dtype=np.int8).copy().reshape(y_quantized.shape)
-    ).to(torch.float32).to(latent.device) - 3
+    payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
 
     file_bytes = len(payload)
     bitstream_path = run_dir / "reports/reconstruction.kky"
     bitstream_path.write_bytes(payload)
     bitstream_bpp = file_bytes * 8 / (256 * 256)
-    return y_decoded, {
+    return y_hat, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
-        "format": "Kakeya Hyperprior v3",
+        "format": "Kakeya Hyperprior v4",
+        "bytes": file_bytes,
+        "payload_bytes": file_bytes - len(z_strings[0]) - 4,
+        "header_bytes": 4 + len(z_strings[0]),
+        "bpp": bitstream_bpp,
+        "requires_checkpoint": True,
+        "checkpoint": "checkpoints/final.pt",
+    }
+
+
+def reference_codec_baselines() -> list[dict[str, Any]]:
+    source_image = Image.open(TEST_IMAGE).convert("RGB")
+    source = torch.from_numpy(
+        np.asarray(source_image, dtype=np.float32) / 255.0
+    ).permute(2, 0, 1).unsqueeze(0)
+    rows: list[dict[str, Any]] = [
+        {
+            "codec": "Original PNG",
+            "settings": "source",
+            "bytes": TEST_IMAGE.stat().st_size,
+            "mse": 0.0,
+            "psnr": 99.0,
+            "ssim": 1.0,
+        }
+    ]
+    variants = (
+        ("PNG", "optimized", "PNG", {"optimize": True}),
+        ("JPEG", "quality 90", "JPEG", {"quality": 90, "optimize": True}),
+        ("WebP", "quality 90", "WEBP", {"quality": 90, "method": 6}),
+    )
+    for codec, settings, image_format, options in variants:
+        buffer = BytesIO()
+        source_image.save(buffer, format=image_format, **options)
+        payload = buffer.getvalue()
+        decoded = Image.open(BytesIO(payload)).convert("RGB")
+        decoded_tensor = torch.from_numpy(
+            np.asarray(decoded, dtype=np.float32) / 255.0
+        ).permute(2, 0, 1).unsqueeze(0)
+        mse = float(F.mse_loss(decoded_tensor, source))
+        rows.append(
+            {
+                "codec": codec,
+                "settings": settings,
+                "bytes": len(payload),
+                "mse": mse,
+                "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+                "ssim": float(_ssim(decoded_tensor, source)),
+            }
+        )
+    rows.extend(_compressai_baselines(source, source_image))
+    return rows
+
+
+def _compressai_baselines(
+    source: torch.Tensor, source_image: Image.Image
+) -> list[dict[str, Any]]:
+    try:
+        from compressai.zoo import mbt2018_mean
+    except ImportError:
+        return []
+    import ssl
+
+    original_context = ssl._create_default_https_context
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except Exception:
+        pass
+    results: list[dict[str, Any]] = []
+    try:
+        for quality in (2, 4, 6):
+            try:
+                net = mbt2018_mean(
+                    quality=quality, metric="mse", pretrained=True
+                )
+            except Exception:
+                continue
+            net.eval()
+            net = net.to(source.device)
+            with torch.no_grad():
+                compressed = net.compress(source)
+                strings = compressed["strings"]
+                out = net.decompress(strings, compressed["shape"])
+                x_hat = out["x_hat"].clamp(0, 1)
+            total_bytes = sum(
+                len(s) for string_list in strings for s in string_list
+            )
+            total_bytes += 64
+            mse = float(F.mse_loss(x_hat, source))
+            results.append(
+                {
+                    "codec": "CompressAI mbt2018",
+                    "settings": f"quality {quality} (mse)",
+                    "bytes": total_bytes,
+                    "mse": mse,
+                    "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
+                    "ssim": float(_ssim(x_hat, source)),
+                    "learned": True,
+                }
+            )
+    finally:
+        try:
+            ssl._create_default_https_context = original_context
+        except Exception:
+            pass
+    return results
+
+
+def _ssim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    mu_x = F.avg_pool2d(x, 11, stride=1, padding=5)
+    mu_y = F.avg_pool2d(y, 11, stride=1, padding=5)
+    sigma_x = F.avg_pool2d(x * x, 11, 1, 5) - mu_x.square()
+    sigma_y = F.avg_pool2d(y * y, 11, 1, 5) - mu_y.square()
+    sigma_xy = F.avg_pool2d(x * y, 11, 1, 5) - mu_x * mu_y
+    c1, c2 = 0.01**2, 0.03**2
+    return (
+        ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2))
+        / ((mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2))
+    ).mean()
+
+
+def _edges(image: torch.Tensor) -> torch.Tensor:
+    horizontal = image[:, :, :, 1:] - image[:, :, :, :-1]
+    vertical = image[:, :, 1:, :] - image[:, :, :-1, :]
+    return torch.cat(
+        (
+            F.pad(horizontal.abs(), (0, 1, 0, 0)),
+            F.pad(vertical.abs(), (0, 0, 0, 1)),
+        ),
+        dim=1,
+    )
+
+
+_SRGB_TO_LIN_COEFF = 1.0 / 12.92
+_SRGB_TO_LIN_EXP = 1.0 / 2.4
+_SRGB_TO_LIN_OFFSET = 0.055
+_SRGB_TO_LIN_SCALE = 1.055
+
+_LAB_DELTA = 6.0 / 29.0
+_LAB_DELTA_CUBED = _LAB_DELTA ** 3
+_LAB_FACTOR = 3.0 * _LAB_DELTA ** 2
+
+_D65_XYZ = torch.tensor([0.95047, 1.0, 1.08883])
+
+_XYZ_TO_LAB = torch.tensor([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+])
+
+
+def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    if rgb.max() <= 1.5:
+        srgb = rgb.clamp(0, 1)
+    else:
+        srgb = (rgb / 255.0).clamp(0, 1)
+    lin = torch.where(
+        srgb <= 0.04045,
+        srgb * _SRGB_TO_LIN_COEFF,
+        ((srgb + _SRGB_TO_LIN_OFFSET) / _SRGB_TO_LIN_SCALE).pow(_SRGB_TO_LIN_EXP),
+    )
+    if lin.size(1) == 3:
+        rgb_ch = lin.permute(0, 2, 3, 1)
+        xyz = (rgb_ch @ _XYZ_TO_LAB.to(lin.device).T).permute(0, 3, 1, 2)
+    else:
+        xyz = lin
+    ref = _D65_XYZ.to(lin.device).view(1, 3, 1, 1)
+    xyz_norm = xyz / ref
+    f = torch.where(
+        xyz_norm > _LAB_DELTA_CUBED,
+        xyz_norm.pow(1.0 / 3.0),
+        xyz_norm / _LAB_FACTOR + 4.0 / 29.0,
+    )
+    L = 116.0 * f[:, 1:2, :, :] - 16.0
+    a = 500.0 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
+    b = 200.0 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
+    return torch.cat([L, a, b], dim=1)
+
+
+def _lab_losses(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """CIELAB-based color losses: ΔE, hue, and saturation.
+
+    All returns are normalized to ~O(1) scale so that stage weights stay
+    on the same order as other loss weights.
+    """
+    rec_lab = _rgb_to_lab(reconstructed)
+    tgt_lab = _rgb_to_lab(target)
+    diff = rec_lab - tgt_lab
+    L = tgt_lab[:, 0:1, :, :]
+    chroma_weight = 1.0 + 2.0 * ((50.0 - L.clamp(0.0, 50.0)) / 50.0)
+    delta_e = torch.sqrt(
+        0.25 * diff[:, 0:1, :, :].pow(2)
+        + chroma_weight * diff[:, 1:2, :, :].pow(2)
+        + chroma_weight * diff[:, 2:3, :, :].pow(2)
+        + 1e-8,
+    ).mean() / 7.0
+    # Hue: 1 - cos(Δh) handles angular wraparound, range [0, 2].
+    a_rec, b_rec = rec_lab[:, 1:2, :, :], rec_lab[:, 2:3, :, :]
+    a_tgt, b_tgt = tgt_lab[:, 1:2, :, :], tgt_lab[:, 2:3, :, :]
+    h_rec = torch.atan2(b_rec, a_rec)
+    h_tgt = torch.atan2(b_tgt, a_tgt)
+    hue = (1.0 - torch.cos(h_rec - h_tgt)).mean() / 2.0
+    # Saturation: |Δchroma|, typical chroma scale 0-50.
+    C_rec = torch.sqrt(a_rec.pow(2) + b_rec.pow(2) + 1e-8)
+    C_tgt = torch.sqrt(a_tgt.pow(2) + b_tgt.pow(2) + 1e-8)
+    saturation = (C_rec - C_tgt).abs().mean() / 10.0
+    return {"delta_e": delta_e, "hue": hue, "saturation": saturation}
+
+
+def _detail_weight(image: torch.Tensor) -> torch.Tensor:
+    """Emphasize edges and text strokes instead of flat backgrounds."""
+    grayscale = image.mean(dim=1, keepdim=True)
+    horizontal = F.pad(
+        (grayscale[:, :, :, 1:] - grayscale[:, :, :, :-1]).abs(),
+        (0, 1, 0, 0),
+    )
+    vertical = F.pad(
+        (grayscale[:, :, 1:, :] - grayscale[:, :, :-1, :]).abs(),
+        (0, 0, 0, 1),
+    )
+    edge_attention = ((horizontal + vertical) * 8).clamp(0, 1)
+    dark_foreground = ((0.75 - grayscale) * 2).clamp(0, 1)
+    return 1 + 3 * torch.maximum(edge_attention, dark_foreground)
+
+
+def _multiscale_l1(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    cur = min(reconstructed.shape[-1], target.shape[-1])
+    orig_weight = 0.5
+    orig_loss = F.l1_loss(reconstructed, target)
+    losses = [(orig_loss, orig_weight)]
+    for size in (128, 64):
+        if cur <= size:
+            continue
+        reconstructed_level = F.interpolate(
+            reconstructed, size=(size, size), mode="bilinear", align_corners=False
+        )
+        target_level = F.interpolate(
+            target, size=(size, size), mode="bilinear", align_corners=False
+        )
+        losses.append((F.l1_loss(reconstructed_level, target_level), 0.25))
+    if len(losses) == 1:
+        return losses[0][0]
+    total_weight = sum(w for _, w in losses)
+    return sum(loss * w for loss, w in losses) / total_weight
+
+
+def _run_directory(config: ExperimentConfig) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = config.output_dir / config.method / timestamp
+    suffix = 1
+    while run_dir.exists():
+        run_dir = config.output_dir / config.method / f"{timestamp}-{suffix}"
+        suffix += 1
+    for name in ("checkpoints", "metrics", "reports"):
+        (run_dir / name).mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _encode_bitstream(
+    model: KakeyaHyperpriorCodec,
+    latent: torch.Tensor,
+    run_dir: Path,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Encode latent as bitstream: z via EntropyBottleneck, y as gzip-compressed int8."""
+    import gzip as _gzip
+    import struct as _struct
+    model.eval()
+    model.update()
+
+    # z: entropy-coded through hyperprior EntropyBottleneck
+    z = model.h_a(latent)
+    z_strings = model.entropy_bottleneck.compress(z)
+
+    # y: entropy-coded through y_entropy_bottleneck (16 channels)
+    y_strings = model.y_entropy_bottleneck.compress(latent)
+    y_hat = model.y_entropy_bottleneck.decompress(y_strings, latent.size()[-2:])
+
+    # Pack: [z_len:4B][z_data][y_len:4B][y_data]
+    payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
+    payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
+
+    file_bytes = len(payload)
+    bitstream_path = run_dir / "reports/reconstruction.kky"
+    bitstream_path.write_bytes(payload)
+    bitstream_bpp = file_bytes * 8 / (256 * 256)
+    return y_hat, {
+        "path": "reports/reconstruction.kky",
+        "filename": "reconstruction.kky",
+        "format": "Kakeya Hyperprior v4",
         "bytes": file_bytes,
         "payload_bytes": file_bytes - len(z_strings[0]) - 4,
         "header_bytes": 4 + len(z_strings[0]),

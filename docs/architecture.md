@@ -260,7 +260,8 @@ graph TD
         HA1 --> HA2[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA2 --> HA3[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA3 --> EB[EntropyBottleneck<br/>8 通道]
-        EB --> HD1[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
+        EB --> ATTN[Self-Attention<br/>8×8 → 64 tokens<br/>4 heads × 8-dim<br/>1×1 proj 8→32→8<br/>residual add]
+        ATTN --> HD1[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
         HD1 --> HD2[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
         HD2 --> HD3[Conv 3x3<br/>8→32]
         HD3 --> H_SPLIT[chunk 2 dim=1<br/>→ scale + mean]
@@ -333,8 +334,8 @@ graph LR
 | 下采样 | SpaceToDepth x 3 = 8x（保持文字精度） |
 | 损失函数 | MSE + lambda·rate + lambdaₖ·kakeya（单阶段） |
 | 训练阶段 | 单阶段端到端 |
+| h_s 增强 | Self-Attention（8×8→64 tokens, 4 heads, 1×1 proj, residual）— Cheng2020 路线 |
 | 潜空间 | 16 通道, ±3 bound |
-
 ---
 
 ## 3. 损失函数组成
