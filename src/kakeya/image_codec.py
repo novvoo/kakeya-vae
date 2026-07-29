@@ -81,6 +81,16 @@ class DepthToSpace(nn.Module):
         return self.net(value)
 
 
+class BilinearUpsample(nn.Module):
+    """2× bilinear spatial upsampling as a nn.Module wrapper for nn.Sequential."""
+
+    def __init__(self, scale_factor: int = 2) -> None:
+        super().__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(value, scale_factor=self.scale_factor, mode="bilinear", align_corners=False)
+
 class ResidualBlockGDN(nn.Module):
     """Residual block with GDN activation."""
 
@@ -121,7 +131,6 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
-            ResidualBlockGDN(32),                    # deeper at 32ch
             weight_norm(nn.Conv2d(32, 64, 1)),      # expand to 64ch bottleneck
             ResidualBlockGDN(64),
             weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),  # squeeze to latent
@@ -161,8 +170,8 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(64),
             weight_norm(nn.Conv2d(64, 32, 3, padding=1)),           # squeeze to 32ch
             ResidualBlockGDN(32),
-            ResidualBlockGDN(32),                                    # deeper at 32ch
-            DepthToSpace(32, 24),
+            BilinearUpsample(2),                                     # 64→128 smooth
+            weight_norm(nn.Conv2d(32, 24, 3, padding=1)),           # mix to 24ch
             ResidualBlockGDN(24),
             DepthToSpace(24, 12),
             weight_norm(nn.Conv2d(12, 24, 3, padding=1)),

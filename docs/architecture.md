@@ -248,20 +248,22 @@ graph TD
         S2D1 --> RB1[ResidualBlockGDN<br/>24]
         RB1 --> S2D2[SpaceToDepth<br/>24→32, /2]
         S2D2 --> RB2[ResidualBlockGDN<br/>32]
-        RB2 --> CONV[weight_norm Conv 1x1<br/>32→32]
-        CONV --> SPLIT[chunk 2 dim=1<br/>→ mu + log_var]
+        RB2 --> CONV[weight_norm Conv 1x1<br/>32→64]
+        CONV --> RB64[ResidualBlockGDN<br/>64]
+        RB64 --> PROJ[weight_norm Conv 1x1<br/>64→16]
+        PROJ --> SPLIT[chunk 2 dim=1<br/>→ mu 8ch]
     end
 
     subgraph 超先验 Hyperprior
-        SPLIT -->|mu| TANH[tanh bound ±3<br/>mu_bounded 16×64×64]
-        TANH --> HA1[Conv 3x3 stride1<br/>16→8]
+        SPLIT -->|mu| TANH[tanh bound ±5<br/>mu_bounded 8×64×64]
+        TANH --> HA1[Conv 3x3 stride1<br/>8→8]
         HA1 --> HA2[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA2 --> HA3[Conv 5x5 stride2<br/>8, 下采样 /2]
         HA3 --> EB[EntropyBottleneck<br/>8 通道]
         EB --> ATTN[Self-Attention<br/>16×16 → 256 tokens<br/>4 heads × 8-dim<br/>1×1 proj 8→32→8<br/>residual add]
         ATTN --> HD1[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
         HD1 --> HD2[ConvTranspose 5x5 stride2<br/>8, 上采样 x2]
-        HD2 --> HD3[Conv 3x3<br/>8→32]
+        HD2 --> HD3[Conv 3x3<br/>8→16]
         HD3 --> H_SPLIT[chunk 2 dim=1<br/>→ scale + mean]
     end
 
@@ -273,12 +275,16 @@ graph TD
     end
     subgraph g_s — 综合变换
 
-        Y_HAT --> S2D0[weight_norm Conv 3x3<br/>16→32]
-        S2D0 --> DRB2[ResidualBlockGDN<br/>32]
-        DRB2 --> D2S2[DepthToSpace<br/>32→24, x2]
-        D2S2 --> DRB3[ResidualBlockGDN<br/>24]
-        DRB3 --> D2S3[DepthToSpace<br/>24→12, x2]
-        D2S3 --> DC1[weight_norm Conv 3x3<br/>12→24]
+        Y_HAT --> D0[weight_norm Conv 3x3<br/>8→64]
+        D0 --> DRB64[ResidualBlockGDN<br/>64]
+        DRB64 --> D1[weight_norm Conv 3x3<br/>64→32]
+        D1 --> DRB32a[ResidualBlockGDN<br/>32]
+        DRB32a --> DRB32b[ResidualBlockGDN<br/>32]
+        DRB32b --> UPSMP[BilinearUpsample 2x<br/>64→128 平滑]
+        UPSMP --> D2[weight_norm Conv 3x3<br/>32→24]
+        D2 --> DRB24[ResidualBlockGDN<br/>24]
+        DRB24 --> D2S[DepthToSpace<br/>24→12, x2]
+        D2S --> DC1[weight_norm Conv 3x3<br/>12→24]
         DC1 --> SILU[SiLU]
         SILU --> DC2[weight_norm Conv 3x3<br/>24→3]
         DC2 --> SIG[Sigmoid]
@@ -319,19 +325,16 @@ graph LR
         ADD --> OUT3[Output]
     end
 ```
-
-### 核心架构特征
-
 | 维度 | 说明 |
 |---|---|
 | 熵模型 | EntropyBottleneck（超先验 z）+ GaussianConditional（条件高斯 y） |
 | 激活函数 | GDN / IGDN（压缩专用归一化） |
-| ResidualBlock | GDN 替代 InstanceNorm + SiLU |
+| ResidualBlock | GDN 替代 InstanceNorm + SiLU，瓶颈处双倍深度 |
 | 下采样 | SpaceToDepth x 2 = 4x（保持文字精度） |
-| 损失函数 | MSE + lambda·rate + lambdaₖ·kakeya（单阶段） |
-| 训练阶段 | 单阶段端到端 |
+| 上采样 | BilinearUpsample 2x + DepthToSpace x 2，64→128 用平滑插值避免色带 |
+| 损失函数 | MSE + edge + structural + multiscale + lab + hue + sat + λ·rate + λₖ·kakeya（三阶段权重调度） |
 | h_s 增强 | Self-Attention（16×16→256 tokens, 4 heads, 1×1 proj, residual）— Cheng2020 路线 |
-| 潜空间 | 16 通道, ±3 bound |
+| 潜空间 | 8 通道, ±5 bound, GaussianConditional 学习步长量化 |
 ---
 
 ## 3. 损失函数组成
