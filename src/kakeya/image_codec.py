@@ -123,6 +123,7 @@ class KakeyaHyperpriorCodec(nn.Module):
             ResidualBlockGDN(32),
             weight_norm(nn.Conv2d(32, 64, 1)),      # expand to 64ch bottleneck
             ResidualBlockGDN(64),
+            ResidualBlockGDN(64),                    # deeper at bottleneck
             weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),  # squeeze to latent
         )
 
@@ -154,11 +155,11 @@ class KakeyaHyperpriorCodec(nn.Module):
         # Entropy models
         self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
         self.y_entropy_bottleneck = EntropyBottleneck(latent_dim)
-        self.gaussian_conditional = GaussianConditional(None)  # scale table set after h_s output
         self.g_s = nn.Sequential(
             weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),  # expand to 64ch
             ResidualBlockGDN(64),
-            weight_norm(nn.Conv2d(64, 32, 3, padding=1)),          # squeeze to 32ch
+            ResidualBlockGDN(64),                                    # deeper at bottleneck
+            weight_norm(nn.Conv2d(64, 32, 3, padding=1)),           # squeeze to 32ch
             ResidualBlockGDN(32),
             DepthToSpace(32, 24),
             ResidualBlockGDN(24),
