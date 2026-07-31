@@ -7,11 +7,13 @@ import json
 import os
 import platform
 import subprocess
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import uvicorn
+import torch
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -24,8 +26,9 @@ from kakeya.job_manager import JobManager
 
 manager = JobManager()
 
+
 class ExperimentRequest(BaseModel):
-    method: Literal["image_codec", "hyperprior_kakeya"] = "image_codec"
+    method: Literal["image_codec"] = "image_codec"
     epochs: Annotated[int, Field(ge=1, le=500)] = 80
     latent_dim: Annotated[int, Field(ge=2, le=256)] = 8
     batch_size: Annotated[int, Field(ge=1, le=2048)] = 4
@@ -35,8 +38,6 @@ class ExperimentRequest(BaseModel):
     train_limit: Annotated[int, Field(ge=0, le=60_000)] = 128
     test_limit: Annotated[int, Field(ge=0, le=10_000)] = 0
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
-    beta: Annotated[float, Field(gt=0, le=100)] = 4.0
-    gamma: Annotated[float, Field(ge=0, le=1000)] = 10.0
     num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
     k: Annotated[int, Field(ge=1, le=4096)] = 3
     lambda_rate: Annotated[float, Field(gt=0, le=100)] = 0.01
@@ -48,9 +49,7 @@ class ExperimentRequest(BaseModel):
 
         minimum_samples = 32 if self.method == "image_codec" else 100
         if self.train_limit and self.train_limit < minimum_samples:
-            raise ValueError(
-                f"训练样本上限应为 0 或至少 {minimum_samples}"
-            )
+            raise ValueError(f"训练样本上限应为 0 或至少 {minimum_samples}")
         if self.test_limit and self.test_limit < 100:
             raise ValueError("测试样本上限应为 0 或至少 100")
         if self.device == "cuda" and not torch.cuda.is_available():
@@ -72,7 +71,9 @@ class ExperimentRequest(BaseModel):
         # Users can override specific weights via the objective.stage_weights field
         # when constructing requests programmatically.  The web UI sends the defaults
         # to make them visible before training starts.
-        stage_weights = DEFAULT_STAGE_WEIGHTS.copy() if self.method == "image_codec" else {}
+        stage_weights = (
+            DEFAULT_STAGE_WEIGHTS.copy() if self.method == "image_codec" else {}
+        )
         if stage_weights:
             objective["stage_weights"] = stage_weights
         config = ExperimentConfig(
@@ -92,11 +93,13 @@ class ExperimentRequest(BaseModel):
         )
         return config.to_dict()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
     yield
     manager.shutdown()
+
 
 app = FastAPI(
     title="Kakeya Lab API",
@@ -119,35 +122,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
 
 @app.get("/api/environment")
 def environment() -> dict[str, Any]:
     return manager.environment()
 
+
 @app.get("/api/defaults")
 def defaults() -> dict[str, Any]:
-    from kakeya.config import DEFAULT_STAGE_WEIGHTS
+    return {
+        "method": "image_codec",
+        "stage_weights": DEFAULT_STAGE_WEIGHTS,
+    }
+
 
 @app.get("/api/test-image")
 def test_image() -> FileResponse:
     return FileResponse(TEST_IMAGE, media_type="image/png", filename=TEST_IMAGE.name)
+
 
 @app.post("/api/environment/install", status_code=202)
 def install_dependencies() -> dict[str, str]:
     manager.install_dependencies()
     return {"status": "accepted"}
 
+
 @app.get("/api/experiments")
 def list_experiments() -> list[dict[str, Any]]:
     return manager.list()
+
 
 @app.post("/api/experiments", status_code=202)
 def create_experiment(request: ExperimentRequest) -> dict[str, Any]:
     record = manager.create(request.experiment_config(), request.device)
     return record.public()
+
 
 @app.get("/api/experiments/{job_id}")
 def get_experiment(job_id: str) -> dict[str, Any]:
@@ -156,12 +170,14 @@ def get_experiment(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="实验不存在")
     return record.public()
 
+
 @app.post("/api/experiments/{job_id}/stop", status_code=202)
 def stop_experiment(job_id: str) -> dict[str, Any]:
     record = manager.get(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="实验不存在")
     return manager.stop(job_id).public()
+
 
 @app.get("/api/experiments/{job_id}/result")
 def experiment_result(job_id: str) -> dict[str, Any]:
@@ -173,12 +189,17 @@ def experiment_result(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="实验结果尚未生成")
     return result
 
+
 @app.get("/api/experiments/{job_id}/image/{kind}")
 def experiment_image(
     job_id: str,
     kind: Literal[
-        "original", "reconstruction", "error",
-        "original_hd", "reconstruction_hd", "error_hd",
+        "original",
+        "reconstruction",
+        "error",
+        "original_hd",
+        "reconstruction_hd",
+        "error_hd",
     ],
 ) -> FileResponse:
     record = manager.get(job_id)
@@ -195,6 +216,7 @@ def experiment_image(
         raise HTTPException(status_code=404, detail="图像结果不存在")
     return FileResponse(image_path, media_type="image/png")
 
+
 @app.post("/api/experiments/{job_id}/regenerate", status_code=200)
 def regenerate_experiment(job_id: str) -> dict[str, Any]:
     """Re-run chart reconstruction on the trained checkpoint.
@@ -204,18 +226,16 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     bitstream, then returns updated metrics.  Idempotent — does not
     re-train.
     """
-    import io
     import math
 
     import numpy as np
     import torch
     import torch.nn.functional as F
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     from kakeya.image_codec import (
-        KakeyaHyperpriorCodec,
         TEST_IMAGE,
-        TEST_IMAGE_HD,
+        KakeyaHyperpriorCodec,
         _encode_bitstream,
         _evaluate_hd_chart,
         _ssim,
@@ -231,8 +251,10 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="检查点不存在，无法重新生成")
 
     device = torch.device(
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
         else "cpu"
     )
 
@@ -244,11 +266,16 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     ).to(device)
 
     skip_keys = {
-        "entropy_bottleneck._offset", "entropy_bottleneck._quantized_cdf",
-        "entropy_bottleneck._cdf_length", "y_entropy_bottleneck._offset",
-        "y_entropy_bottleneck._quantized_cdf", "y_entropy_bottleneck._cdf_length",
-        "gaussian_conditional._offset", "gaussian_conditional._quantized_cdf",
-        "gaussian_conditional._cdf_length", "gaussian_conditional.scale_table",
+        "entropy_bottleneck._offset",
+        "entropy_bottleneck._quantized_cdf",
+        "entropy_bottleneck._cdf_length",
+        "y_entropy_bottleneck._offset",
+        "y_entropy_bottleneck._quantized_cdf",
+        "y_entropy_bottleneck._cdf_length",
+        "gaussian_conditional._offset",
+        "gaussian_conditional._quantized_cdf",
+        "gaussian_conditional._cdf_length",
+        "gaussian_conditional.scale_table",
     }
     filtered_sd = {
         k: v for k, v in payload["model_state_dict"].items() if k not in skip_keys
@@ -319,9 +346,12 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
             old["image_codec"]["bitstream"] = bitstream
         dash_path = (run_dir / "reports" / "dashboard.json").resolve()
         if run_dir in dash_path.parents:
-            dash_path.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+            dash_path.write_text(
+                json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     return {"metrics": metrics, "bitstream": bitstream}
+
 
 @app.get("/api/experiments/{job_id}/artifact/bitstream")
 def experiment_bitstream(job_id: str) -> FileResponse:
@@ -329,9 +359,7 @@ def experiment_bitstream(job_id: str) -> FileResponse:
     if record is None or not record.run_dir:
         raise HTTPException(status_code=404, detail="实验不存在")
     result = manager.result(job_id)
-    bitstream = (
-        result.get("image_codec", {}).get("bitstream", {}) if result else {}
-    )
+    bitstream = result.get("image_codec", {}).get("bitstream", {}) if result else {}
     relative_path = bitstream.get("path")
     if not relative_path:
         raise HTTPException(status_code=404, detail="该实验没有压缩码流")
@@ -345,15 +373,14 @@ def experiment_bitstream(job_id: str) -> FileResponse:
         filename=bitstream.get("filename", "reconstruction.kky"),
     )
 
+
 @app.get("/api/experiments/{job_id}/artifact/checkpoint")
 def experiment_checkpoint(job_id: str) -> FileResponse:
     record = manager.get(job_id)
     if record is None or not record.run_dir:
         raise HTTPException(status_code=404, detail="实验不存在")
     result = manager.result(job_id)
-    bitstream = (
-        result.get("image_codec", {}).get("bitstream", {}) if result else {}
-    )
+    bitstream = result.get("image_codec", {}).get("bitstream", {}) if result else {}
     relative_path = bitstream.get("checkpoint", "checkpoints/final.pt")
     run_dir = (manager.project_root / record.run_dir).resolve()
     artifact_path = (run_dir / relative_path).resolve()
@@ -364,6 +391,7 @@ def experiment_checkpoint(job_id: str) -> FileResponse:
         media_type="application/octet-stream",
         filename="final.pt",
     )
+
 
 @app.post("/api/experiments/{job_id}/reconstruct")
 async def reconstruct_uploaded(
@@ -378,6 +406,7 @@ async def reconstruct_uploaded(
         raise HTTPException(status_code=404, detail="模型检查点不存在")
     image_bytes = await file.read()
     return _do_reconstruct(checkpoint_path, image_bytes)
+
 
 @app.post("/api/reconstruct-custom")
 async def reconstruct_custom_checkpoint(
@@ -399,15 +428,17 @@ async def reconstruct_custom_checkpoint(
         except OSError:
             pass
 
+
 def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]:
     import base64
     import io
     import math
+
     import numpy as np
     import torch
     import torch.nn.functional as F
 
-    from kakeya.image_codec import KakeyaHyperpriorCodec
+    from kakeya.image_codec import KakeyaHyperpriorCodec, _encode_bitstream
 
     try:
         source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -416,7 +447,9 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
 
     w, h = source_image.size
     if w > 4096 or h > 4096:
-        raise HTTPException(status_code=400, detail="图片尺寸过大（上限 4096×4096），请先缩小后再试")
+        raise HTTPException(
+            status_code=400, detail="图片尺寸过大（上限 4096×4096），请先缩小后再试"
+        )
     if w < 16 or h < 16:
         raise HTTPException(status_code=400, detail="图片尺寸过小（下限 16×16）")
 
@@ -435,9 +468,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
         else "cpu"
     )
     try:
-        payload = torch.load(
-            checkpoint_path, map_location=device, weights_only=False
-        )
+        payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except Exception:
         raise HTTPException(status_code=400, detail="无法加载模型检查点")
 
@@ -460,13 +491,14 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             "gaussian_conditional._cdf_length",
             "gaussian_conditional.scale_table",
         }
-        filtered_sd = {k: v for k, v in payload["model_state_dict"].items()
-                       if k not in skip_keys}
+        filtered_sd = {
+            k: v for k, v in payload["model_state_dict"].items() if k not in skip_keys
+        }
         model.load_state_dict(filtered_sd, strict=False)
         model.init_scale_table()
         model.update()
         model.eval()
-    except Exception as exc:
+    except Exception:
         raise HTTPException(
             status_code=400,
             detail="模型结构不匹配，请确认是 Kakeya image_codec 训练的 checkpoint",
@@ -479,7 +511,16 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     # model handles any resolution directly, so no tiling or rescaling is
     # needed; padding to a multiple of 8 (above) keeps the encoder happy.
     with torch.no_grad():
-        reconstructed = model.reconstruct(source).clamp(0, 1)
+        latent = model.encode(source)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        decoded_latent, bitstream = _encode_bitstream(
+            model, latent, Path(temp_dir), write_file=False
+        )
+    with torch.no_grad():
+        reconstructed = model.decode(decoded_latent).clamp(0, 1)
+    bitstream_bytes = int(bitstream["bytes"])
+    bpp = bitstream_bytes * 8 / (w * h)
 
     if pad_w or pad_h:
         reconstructed = reconstructed[:, :, :h, :w]
@@ -488,9 +529,6 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     mse = float(F.mse_loss(reconstructed, source))
     psnr = 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
     ssim = float(_ssim_torch(reconstructed, source))
-    out_h, out_w = source.shape[2], source.shape[3]
-    bitstream_bytes_estimate = 0
-    bpp = 0.0
     diff = (reconstructed - source).abs()[0]
     heat = torch.stack(
         (
@@ -515,11 +553,12 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             "mse": mse,
             "psnr": float(psnr),
             "ssim": ssim,
-            "bitstream_bytes": bitstream_bytes_estimate,
+            "bitstream_bytes": bitstream_bytes,
             "bpp": float(bpp),
             "downscaled": False,
         },
     }
+
 
 def _ssim_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     import torch.nn.functional as F
@@ -534,6 +573,7 @@ def _ssim_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2))
         / ((mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2))
     ).mean()
+
 
 @app.post("/api/experiments/{job_id}/artifact/open-checkpoint-dir")
 def open_checkpoint_dir(job_id: str) -> dict[str, Any]:
@@ -554,6 +594,7 @@ def open_checkpoint_dir(job_id: str) -> dict[str, Any]:
     else:
         raise HTTPException(status_code=400, detail="不支持的操作系统")
     return {"ok": True, "path": str(checkpoints_dir)}
+
 
 @app.get("/api/experiments/{job_id}/events")
 async def experiment_events(job_id: str, request: Request) -> StreamingResponse:
@@ -584,6 +625,7 @@ async def experiment_events(job_id: str, request: Request) -> StreamingResponse:
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+
 def main() -> None:
     uvicorn.run(
         "kakeya.web_api:app",
@@ -591,6 +633,7 @@ def main() -> None:
         port=int(os.environ.get("KAKEYA_API_PORT", "8000")),
         reload=False,
     )
+
 
 if __name__ == "__main__":
     main()

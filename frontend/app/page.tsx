@@ -3,11 +3,11 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 function FormattedDate({ dateString }: { dateString: string }) {
-  const [formatted, setFormatted] = useState<string>("");
-  useEffect(() => {
-    setFormatted(new Date(dateString).toLocaleString("zh-CN"));
-  }, [dateString]);
-  return <>{formatted || <span suppressHydrationWarning>—</span>}</>;
+  return (
+    <time suppressHydrationWarning>
+      {new Date(dateString).toLocaleString("zh-CN")}
+    </time>
+  );
 }
 
 const API_BASE =
@@ -73,8 +73,6 @@ type ExperimentConfig = {
   num_workers: number;
   train_limit: number;
   test_limit: number;
-  beta: number;
-  gamma: number;
   num_projections: number;
   k: number;
   lambda_rate: number;
@@ -147,8 +145,6 @@ const DEFAULT_CONFIG: ExperimentConfig = {
   num_workers: 0,
   train_limit: 128,
   test_limit: 0,
-  beta: 4,
-  gamma: 10,
   num_projections: 32,
   k: 3,
   lambda_rate: 1.0,
@@ -387,10 +383,6 @@ export default function Home() {
     ["queued", "running", "evaluating", "stopping"].includes(activeJob.status);
 
   function changeMethod(method: string) {
-    if (["beta_vae", "beta_tcvae", "factor_vae"].includes(method)) {
-      setConfig({ ...DEFAULT_CONFIG, method });
-      return;
-    }
     setConfig({ ...config, method });
   }
 
@@ -947,26 +939,6 @@ function ObjectiveFields({
     <div className="objective-box">
       <p>方法参数</p>
       <div className="field-grid">
-        {["beta_vae", "beta_tcvae"].includes(config.method) && (
-          <NumberField
-            label="β 权重"
-            value={config.beta}
-            min={0}
-            max={100}
-            step={0.1}
-            onChange={(beta) => setConfig({ ...config, beta })}
-          />
-        )}
-        {config.method === "factor_vae" && (
-          <NumberField
-            label="γ 权重"
-            value={config.gamma}
-            min={0}
-            max={1000}
-            step={0.5}
-            onChange={(gamma) => setConfig({ ...config, gamma })}
-          />
-        )}
         {config.method === "image_codec" && (
           <>
             <NumberField

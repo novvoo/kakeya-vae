@@ -31,6 +31,15 @@ def test_builtin_image_probe_is_available() -> None:
     assert response.content.startswith(b"\x89PNG")
 
 
+def test_defaults_endpoint_returns_image_codec_weights() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/defaults")
+
+    assert response.status_code == 200
+    assert response.json()["method"] == "image_codec"
+    assert "capacity" in response.json()["stage_weights"]
+
+
 def test_request_builds_method_specific_objective() -> None:
     request = ExperimentRequest(
         method="image_codec",

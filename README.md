@@ -8,9 +8,8 @@ Lebesgue 测度任意小却包含每一方向线段的 Kakeya 集（Besicovitch 
 
 将这一“方向覆盖”几何直觉迁移到 VAE 潜空间，得到本项目核心正则化思路：
 **通过随机投影方向上的最大间距最大化潜变量的方向覆盖**，促使潜空间各维度
-被充分且均匀地利用，避免后验坍缩与维度退化。这与 β-VAE、FactorVAE 等
-解耦方法形成互补——前者关注“每个维度是否有用”，Kakeya 正则关注“所有方向
-是否被覆盖”。
+被充分且均匀地利用，避免后验坍缩与维度退化。当前工程只维护图像压缩模型，
+不再提供通用 VAE 变体的训练入口。
 
 在这一框架下，项目实现了多种 VAE 变体的训练与对比，并将其扩展到 256×256
 RGB 图文压缩场景，用 CompressAI 熵瓶颈把潜变量量化为实际 `.kky` 码流，
@@ -19,16 +18,8 @@ RGB 图文压缩场景，用 CompressAI 熵瓶颈把潜变量量化为实际 `.k
 ## 平台概述
 
 一个可在网页中完成环境检查、参数配置、模型训练、实时监控和结果分析的
-VAE 实验工程。支持：
-
-- β-VAE
-- β-TCVAE
-- FactorVAE
-- 超先验 Kakeya VAE（GDN + Hyperprior，单阶段训练）
-- 图文 Kakeya VAE（多尺度 128²–768²，网页默认）
-
-网页实验台不使用 Baseline VAE 作为最终报告对照。Baseline 仅保留在命令行配置
-中，用于必要的消融实验。
+图像压缩实验工程。当前只支持图文 Kakeya 超先验模型（GDN + Hyperprior，
+多尺度 128²–768² 训练）。
 
 训练由独立 Python 进程执行，网页关闭不会直接破坏模型文件；每次运行都会
 保存独立的配置、checkpoint、指标、潜变量和可视化数据。
@@ -149,12 +140,15 @@ python start_lab.py --timeout 180
 
 | 参数 | 使用方法 | 作用 |
 |---|---|---|
-| β | β-VAE、β-TCVAE | 控制 KL 或总相关惩罚强度 |
-| γ | FactorVAE | 控制判别器估计的总相关惩罚 |
 | 随机投影数 | 图文模型、超先验 Kakeya | 每批次采样的投影方向数量 |
 | Top-k 间距 | 图文模型 | 用于覆盖正则的投影间距数量 |
 | 率失真 λ | 超先验 Kakeya VAE | 控制码率与失真的权衡 |
 | 挂谷 λₖ | 超先验 Kakeya VAE | 控制挂谷覆盖正则强度 |
+
+训练会按输入尺寸调整细节目标：256×256 及以下降低率惩罚、加强边缘与结构损失，
+并增加 Laplacian 高频监督；384×384 及以上保持原有率失真权重。最佳 checkpoint
+同时受 512×512 高清参考图保护，高清 PSNR/SSIM 超出允许回退范围时不会覆盖
+已有最佳模型。
 
 首次确认流程时，可以使用：
 
@@ -417,18 +411,7 @@ runs/{method}/{UTC run id}/
 
 ```bash
 python -m pip install -e .
-kakeya-run configs/baseline.yaml
-```
-
-同时比较多个方法：
-
-```bash
-kakeya-run \
-  configs/image-codec.yaml \
-  configs/beta-vae.yaml \
-  configs/beta-tcvae.yaml \
-  configs/factor-vae.yaml \
-  #  poly-kakeya.yaml 已移除（旧多项式方法）
+kakeya-run configs/image-codec.yaml
 ```
 
 兼容入口：

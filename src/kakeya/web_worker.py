@@ -8,14 +8,10 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from sklearn.decomposition import PCA
 
 from kakeya.config import ExperimentConfig
-from kakeya.data import get_mnist_dataloaders
-from kakeya.evaluation import evaluate_all
-from kakeya.image_codec import train_image_codec, _run_directory
+from kakeya.image_codec import _run_directory, train_image_codec
 
 
 def emit(event: str, **payload: Any) -> None:
@@ -50,7 +46,13 @@ def run(spec_path: Path) -> int:
         run_dir: Path,
     ) -> None:
         stage_num = train.get("stage", 1)
-        phase = "容量预训练" if stage_num == 1 else "过渡阶段" if stage_num == 2 else "压缩微调"
+        phase = (
+            "容量预训练"
+            if stage_num == 1
+            else "过渡阶段"
+            if stage_num == 2
+            else "压缩微调"
+        )
         gate = " · 闸门已通过" if train.get("capacity_gate_passed") else ""
         emit(
             "epoch",
@@ -142,81 +144,6 @@ def run(spec_path: Path) -> int:
             message="训练失败",
         )
         raise
-
-    result = train_model(
-        config,
-        device=device,
-        progress=False,
-        epoch_callback=on_epoch,
-    )
-    resolved_device = next(result.model.parameters()).device
-    emit("evaluating", message="正在计算最终指标")
-    _, test_loader = get_mnist_dataloaders(
-        config.batch_size,
-        config.data_dir,
-        num_workers=config.num_workers,
-        download=False,
-        seed=config.seed,
-        test_limit=config.test_limit,
-    )
-    metrics = evaluate_all(
-        result.model,
-        test_loader,
-        result.test_z,
-        result.test_labels,
-        resolved_device,
-    )
-    dashboard = _dashboard_payload(
-        config,
-        result.history,
-        metrics,
-        result.test_z,
-        result.test_labels,
-        str(resolved_device),
-    )
-    dashboard_path = result.run_dir / "reports" / "dashboard.json"
-    dashboard_path.write_text(
-        json.dumps(dashboard, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    emit(
-        "completed",
-        progress=1.0,
-        run_dir=str(result.run_dir),
-        result_path=str(dashboard_path),
-        metrics=metrics,
-        message="训练与评估已完成",
-    )
-    return 0
-
-
-def _dashboard_payload(
-    config: ExperimentConfig,
-    history: dict[str, Any],
-    metrics: dict[str, Any],
-    z: np.ndarray,
-    labels: np.ndarray,
-    device: str,
-) -> dict[str, Any]:
-    sample_size = min(800, len(z))
-    indices = np.linspace(0, len(z) - 1, sample_size, dtype=int)
-    sampled_z = z[indices]
-    projected = PCA(n_components=2, random_state=config.seed).fit_transform(sampled_z)
-    latent = [
-        {
-            "x": float(point[0]),
-            "y": float(point[1]),
-            "label": int(label),
-        }
-        for point, label in zip(projected, labels[indices])
-    ]
-    return {
-        "config": config.to_dict(),
-        "history": history,
-        "metrics": metrics,
-        "latent": latent,
-        "runtime": {"device": device},
-    }
 
 
 def _resolve_device(requested: str) -> torch.device:

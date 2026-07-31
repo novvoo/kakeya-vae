@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
 DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
     "capacity": {
         "mse": 3.0,
@@ -42,11 +43,6 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
 
 
 SUPPORTED_METHODS = {
-    "baseline",
-    "beta_vae",
-    "beta_tcvae",
-    "factor_vae",
-    "hyperprior_kakeya",
     "image_codec",
 }
 
