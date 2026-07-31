@@ -44,9 +44,10 @@ LATENT_MEAN_BOUND = 5.0
 # / data combination simply cannot reach the threshold.
 TARGET_RATE_BPP = 2.5
 BITSTREAM_MAGIC = b"KKEYA-EB1"
-COLOR_DOWNSAMPLE = 8
-COLOR_QUANTIZATION_GAIN = 32.0
-COLOR_CHANNELS = 2
+BASE_DOWNSAMPLE = 8
+BASE_QUANTIZATION_GAIN = 32.0
+BASE_SIGNAL_CHANNELS = 3
+BASE_LATENT_CHANNELS = 4
 SMALL_IMAGE_MAX_SIZE = 256
 SMALL_IMAGE_RATE_MULTIPLIER = 0.35
 SMALL_IMAGE_EDGE_WEIGHT = 5.0
@@ -72,62 +73,80 @@ TRAIN_MIX_CYCLE = (
 )
 
 
-def _rgb_to_ycocg_chroma(image: torch.Tensor) -> torch.Tensor:
-    """Return fixed opponent-color channels without altering luminance."""
+def _rgb_to_ycocg(image: torch.Tensor) -> torch.Tensor:
+    """Convert RGB to a reversible luminance/opponent-color representation."""
     red, green, blue = image.unbind(dim=1)
+    luminance = 0.25 * (red + 2.0 * green + blue)
     co = red - blue
     cg = green - 0.5 * (red + blue)
-    return torch.stack((co, cg), dim=1)
+    return torch.stack((luminance, co, cg), dim=1)
 
 
-def _ycocg_chroma_to_rgb(chroma: torch.Tensor) -> torch.Tensor:
-    """Map a Co/Cg delta to the corresponding zero-luminance RGB delta."""
-    co, cg = chroma.unbind(dim=1)
-    red = 0.5 * (co - cg)
-    green = 0.5 * cg
-    blue = -0.5 * (co + cg)
+def _ycocg_to_rgb(ycocg: torch.Tensor) -> torch.Tensor:
+    """Invert :func:`_rgb_to_ycocg` exactly apart from floating-point error."""
+    luminance, co, cg = ycocg.unbind(dim=1)
+    red = luminance + 0.5 * (co - cg)
+    green = luminance + 0.5 * cg
+    blue = luminance - 0.5 * (co + cg)
     return torch.stack((red, green, blue), dim=1)
 
 
-def _low_frequency_chroma(
+def _low_frequency_base(
     image: torch.Tensor, output_size: tuple[int, int]
 ) -> torch.Tensor:
-    chroma = _rgb_to_ycocg_chroma(image)
+    ycocg = _rgb_to_ycocg(image)
     if output_size == (
-        image.shape[-2] // COLOR_DOWNSAMPLE,
-        image.shape[-1] // COLOR_DOWNSAMPLE,
+        image.shape[-2] // BASE_DOWNSAMPLE,
+        image.shape[-1] // BASE_DOWNSAMPLE,
     ):
         return F.avg_pool2d(
-            chroma, kernel_size=COLOR_DOWNSAMPLE, stride=COLOR_DOWNSAMPLE
+            ycocg, kernel_size=BASE_DOWNSAMPLE, stride=BASE_DOWNSAMPLE
         )
-    return F.adaptive_avg_pool2d(chroma, output_size)
+    return F.adaptive_avg_pool2d(ycocg, output_size)
+
+
+def _rgb_to_ycocg_chroma(image: torch.Tensor) -> torch.Tensor:
+    """Return Co/Cg for color metrics that intentionally ignore luminance."""
+    return _rgb_to_ycocg(image)[:, 1:]
 
 
 def _chroma_mae(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Measure the low-frequency color error that causes green/yellow drift."""
-    height = max(1, target.shape[-2] // COLOR_DOWNSAMPLE)
-    width = max(1, target.shape[-1] // COLOR_DOWNSAMPLE)
+    height = max(1, target.shape[-2] // BASE_DOWNSAMPLE)
+    width = max(1, target.shape[-1] // BASE_DOWNSAMPLE)
     output_size = (height, width)
     return F.l1_loss(
-        _low_frequency_chroma(reconstructed, output_size),
-        _low_frequency_chroma(target, output_size),
+        _low_frequency_base(reconstructed, output_size)[:, 1:],
+        _low_frequency_base(target, output_size)[:, 1:],
     )
 
 
-def _restore_low_frequency_chroma(
-    reconstructed: torch.Tensor, color_latent: torch.Tensor
+def _base_mae(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Supervise all absolute low-frequency Y/Co/Cg statistics."""
+    output_size = (
+        max(1, target.shape[-2] // BASE_DOWNSAMPLE),
+        max(1, target.shape[-1] // BASE_DOWNSAMPLE),
+    )
+    return F.l1_loss(
+        _low_frequency_base(reconstructed, output_size),
+        _low_frequency_base(target, output_size),
+    )
+
+
+def _restore_low_frequency_base(
+    reconstructed: torch.Tensor, decoded_base: torch.Tensor
 ) -> torch.Tensor:
-    """Replace only low-frequency Co/Cg while preserving luminance and detail."""
-    color_size = color_latent.shape[-2:]
-    side_chroma = color_latent / COLOR_QUANTIZATION_GAIN
-    base_chroma = _low_frequency_chroma(reconstructed, color_size)
-    chroma_delta = F.interpolate(
-        side_chroma - base_chroma,
+    """Replace low-frequency Y/Co/Cg while preserving the Detail high-pass."""
+    base_size = decoded_base.shape[-2:]
+    detail_ycocg = _rgb_to_ycocg(reconstructed)
+    detail_low_frequency = F.adaptive_avg_pool2d(detail_ycocg, base_size)
+    base_delta = F.interpolate(
+        decoded_base - detail_low_frequency,
         size=reconstructed.shape[-2:],
         mode="bilinear",
         align_corners=False,
     )
-    return (reconstructed + _ycocg_chroma_to_rgb(chroma_delta)).clamp(0, 1)
+    return _ycocg_to_rgb(detail_ycocg + base_delta).clamp(0, 1)
 
 
 class BlendedInstanceNorm(nn.Module):
@@ -259,6 +278,60 @@ class MultiScaleResidualBlock(nn.Module):
         return value + self.residual_scale * fused
 
 
+class BaseAnalysisTransform(nn.Module):
+    """Encode absolute low-frequency Y/Co/Cg without normalization."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(BASE_SIGNAL_CHANNELS, BASE_LATENT_CHANNELS, 1)
+        self.refinement = nn.Sequential(
+            nn.Conv2d(BASE_SIGNAL_CHANNELS, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, BASE_LATENT_CHANNELS, 3, padding=1),
+        )
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        with torch.no_grad():
+            for channel in range(BASE_SIGNAL_CHANNELS):
+                self.projection.weight[channel, channel, 0, 0] = (
+                    BASE_QUANTIZATION_GAIN
+                )
+        nn.init.zeros_(self.refinement[-1].weight)
+        nn.init.zeros_(self.refinement[-1].bias)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.projection(value) + self.refinement(value)
+
+
+class BaseSynthesisTransform(nn.Module):
+    """Decode the Base latent to absolute low-frequency Y/Co/Cg."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Conv2d(BASE_LATENT_CHANNELS, BASE_SIGNAL_CHANNELS, 1)
+        self.refinement = nn.Sequential(
+            nn.Conv2d(BASE_LATENT_CHANNELS, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, BASE_SIGNAL_CHANNELS, 3, padding=1),
+        )
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        with torch.no_grad():
+            for channel in range(BASE_SIGNAL_CHANNELS):
+                self.projection.weight[channel, channel, 0, 0] = (
+                    1.0 / BASE_QUANTIZATION_GAIN
+                )
+        nn.init.zeros_(self.refinement[-1].weight)
+        nn.init.zeros_(self.refinement[-1].bias)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.projection(value) + self.refinement(value)
+
+
 class KakeyaHyperpriorCodec(nn.Module):
     """Document-oriented parallel hyperprior codec with Kakeya regularization.
 
@@ -314,7 +387,9 @@ class KakeyaHyperpriorCodec(nn.Module):
 
         # Entropy models
         self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
-        self.color_entropy_bottleneck = EntropyBottleneck(COLOR_CHANNELS)
+        self.base_entropy_bottleneck = EntropyBottleneck(BASE_LATENT_CHANNELS)
+        self.base_analysis = BaseAnalysisTransform()
+        self.base_synthesis = BaseSynthesisTransform()
         self.gaussian_conditional = GaussianConditional(
             None
         )  # scale table set after h_s output
@@ -345,25 +420,24 @@ class KakeyaHyperpriorCodec(nn.Module):
         latent = self.g_a(image)
         return LATENT_MEAN_BOUND * torch.tanh(latent / LATENT_MEAN_BOUND)
 
-    def _color_analysis(self, image: torch.Tensor) -> torch.Tensor:
+    def _base_analysis(self, image: torch.Tensor) -> torch.Tensor:
         output_size = (
-            max(1, image.shape[-2] // COLOR_DOWNSAMPLE),
-            max(1, image.shape[-1] // COLOR_DOWNSAMPLE),
+            max(1, image.shape[-2] // BASE_DOWNSAMPLE),
+            max(1, image.shape[-1] // BASE_DOWNSAMPLE),
         )
-        return (
-            _low_frequency_chroma(image, output_size) * COLOR_QUANTIZATION_GAIN
-        )
+        return self.base_analysis(_low_frequency_base(image, output_size))
 
     def _synthesis(
-        self, latent: torch.Tensor, color_latent: torch.Tensor | None = None
+        self, latent: torch.Tensor, base_latent: torch.Tensor | None = None
     ) -> torch.Tensor:
         features = self.g_s_features(latent)
         logits = self.rgb_head(features) + 0.25 * self.detail_head(features)
         reconstructed = torch.sigmoid(logits)
-        if color_latent is None:
+        if base_latent is None:
             return reconstructed
 
-        return _restore_low_frequency_chroma(reconstructed, color_latent)
+        decoded_base = self.base_synthesis(base_latent)
+        return _restore_low_frequency_base(reconstructed, decoded_base)
 
     def normalization_strength(self) -> float:
         strengths = [
@@ -376,7 +450,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
         """Encode an image with the learned hyperprior probability model."""
         mu = self._analysis(image)
-        color = self._color_analysis(image)
+        base = self._base_analysis(image)
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
@@ -392,12 +466,12 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_strings = self.gaussian_conditional.compress(mu, indexes, means=mean)
-        color_strings = self.color_entropy_bottleneck.compress(color)
+        base_strings = self.base_entropy_bottleneck.compress(base)
         return {
-            "strings": [y_strings, z_strings, color_strings],
+            "strings": [y_strings, z_strings, base_strings],
             "shape": z.size()[-2:],
             "y_shape": mu.size()[-2:],
-            "color_shape": color.size()[-2:],
+            "base_shape": base.size()[-2:],
         }
 
     def decompress(
@@ -405,10 +479,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         strings: list[list[bytes]],
         shape: tuple[int, int],
         y_shape: tuple[int, int],
-        color_shape: tuple[int, int],
+        base_shape: tuple[int, int],
     ) -> torch.Tensor:
         """Decode an image using z to reconstruct y's conditional distribution."""
-        y_strings, z_strings, color_strings = strings
+        y_strings, z_strings, base_strings = strings
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
@@ -422,10 +496,8 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=mean)
-        color_hat = self.color_entropy_bottleneck.decompress(
-            color_strings, color_shape
-        )
-        return self._synthesis(y_hat, color_hat)
+        base_hat = self.base_entropy_bottleneck.decompress(base_strings, base_shape)
+        return self._synthesis(y_hat, base_hat)
 
     def init_scale_table(
         self, min_scale: float = 0.11, max_scale: float = 256, levels: int = 64
@@ -510,15 +582,15 @@ class KakeyaHyperpriorCodec(nn.Module):
         torch.Tensor,
     ]:
         mu = self._analysis(image)
-        color = self._color_analysis(image)
+        base = self._base_analysis(image)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
-        color_hat, color_likelihoods = self.color_entropy_bottleneck(color)
-        reconstructed = self._synthesis(y_hat, color_hat)
+        base_hat, base_likelihoods = self.base_entropy_bottleneck(base)
+        reconstructed = self._synthesis(y_hat, base_hat)
         return (
             reconstructed,
             mu,
@@ -526,22 +598,22 @@ class KakeyaHyperpriorCodec(nn.Module):
             y_hat,
             y_likelihoods,
             z_likelihoods,
-            color_likelihoods,
+            base_likelihoods,
         )
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         return self._analysis(image)
 
     def decode(
-        self, latent: torch.Tensor, color_latent: torch.Tensor | None = None
+        self, latent: torch.Tensor, base_latent: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Decode latent tensor back to RGB image."""
-        return self._synthesis(latent, color_latent)
+        return self._synthesis(latent, base_latent)
 
     def update(self, force: bool = False) -> None:
         """Update entropy bottleneck CDF tables (required before compress)."""
         self.entropy_bottleneck.update(force=force)
-        self.color_entropy_bottleneck.update(force=force)
+        self.base_entropy_bottleneck.update(force=force)
         self.init_scale_table()
 
     def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
@@ -553,7 +625,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         to the 7 integer bins from rounding to [-3,-2,…,3].
         """
         mu = self._analysis(image)
-        color = self._color_analysis(image)
+        base = self._base_analysis(image)
         z = self.h_a(mu)
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
@@ -576,10 +648,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         #   y_hat = round((mu - mean) / scale) * scale + mean
         # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
         y_hat, _ = self.gaussian_conditional(mu, scale, mean)
-        color_hat = self.color_entropy_bottleneck.decompress(
-            self.color_entropy_bottleneck.compress(color), color.size()[-2:]
+        base_hat = self.base_entropy_bottleneck.decompress(
+            self.base_entropy_bottleneck.compress(base), base.size()[-2:]
         )
-        return self._synthesis(y_hat, color_hat)
+        return self._synthesis(y_hat, base_hat)
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -859,14 +931,14 @@ def _rate_consistency_check(
         )
         with torch.no_grad():
             # Get rate from forward pass
-            reconstructed, _, _, _, y_likelihoods, z_likelihoods, color_likelihoods = (
+            reconstructed, _, _, _, y_likelihoods, z_likelihoods, base_likelihoods = (
                 model(source)
             )
             rate_bpp = float(
                 (
                     -y_likelihoods.log2().sum()
                     - z_likelihoods.log2().sum()
-                    - color_likelihoods.log2().sum()
+                    - base_likelihoods.log2().sum()
                 )
                 / (source.shape[-1] * source.shape[-2])
             )
@@ -904,10 +976,11 @@ def _checkpoint(
             "config": config.to_dict(),
             "architecture": {
                 "name": "kakeya_multiscale_hyperprior",
-                "version": 4,
+                "version": 5,
                 "hyper_dim": model.hyper_dim,
-                "color_channels": COLOR_CHANNELS,
-                "color_downsample": COLOR_DOWNSAMPLE,
+                "base_channels": BASE_LATENT_CHANNELS,
+                "base_downsample": BASE_DOWNSAMPLE,
+                "base_transform": "full_ycocg_v2",
             },
             "epoch": epoch,
         },
@@ -961,7 +1034,7 @@ def _calibration_metrics(
     model: KakeyaHyperpriorCodec, source: torch.Tensor
 ) -> dict[str, float]:
     model.eval()
-    reconstructed, _, _, _, y_likelihoods, z_likelihoods, color_likelihoods = model(
+    reconstructed, _, _, _, y_likelihoods, z_likelihoods, base_likelihoods = model(
         source
     )
     reconstructed = reconstructed.clamp(0, 1)
@@ -970,7 +1043,7 @@ def _calibration_metrics(
         (
             -y_likelihoods.log2().sum()
             - z_likelihoods.log2().sum()
-            - color_likelihoods.log2().sum()
+            - base_likelihoods.log2().sum()
         )
         / (source.shape[-1] * source.shape[-2])
     )
@@ -1034,7 +1107,7 @@ def _hyperprior_epoch(
         "lab": 0.0,
         "hue": 0.0,
         "saturation": 0.0,
-        "chroma": 0.0,
+        "base": 0.0,
         "kakeya": 0.0,
         "rate": 0.0,
         "psnr": 0.0,
@@ -1059,13 +1132,13 @@ def _hyperprior_epoch(
                     y_hat,
                     y_likelihoods,
                     z_likelihoods,
-                    color_likelihoods,
+                    base_likelihoods,
                 ) = model(images)
                 loss_mse = F.mse_loss(reconstructed, images)
                 rate = (
                     -y_likelihoods.log2().sum()
                     - z_likelihoods.log2().sum()
-                    - color_likelihoods.log2().sum()
+                    - base_likelihoods.log2().sum()
                 ) / images.size(0)
                 bpp_bits = rate / (images.shape[-1] * images.shape[-2])
 
@@ -1091,7 +1164,7 @@ def _hyperprior_epoch(
                     lab = lab_losses["delta_e"]
                     hue = lab_losses["hue"]
                     sat = lab_losses["saturation"]
-                    chroma = _chroma_mae(reconstructed, images)
+                    base = _base_mae(reconstructed, images)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
 
                     total = (
@@ -1103,7 +1176,7 @@ def _hyperprior_epoch(
                         + sw["lab"] * lab
                         + sw["hue"] * hue
                         + sw["saturation"] * sat
-                        + sw["chroma"] * chroma
+                        + sw["base"] * base
                         + sw["kakeya"] * coverage
                         + effective_rate_weight * rate_penalty
                     )
@@ -1115,7 +1188,7 @@ def _hyperprior_epoch(
                     lab = torch.zeros_like(loss_mse)
                     hue = torch.zeros_like(loss_mse)
                     sat = torch.zeros_like(loss_mse)
-                    chroma = torch.zeros_like(loss_mse)
+                    base = torch.zeros_like(loss_mse)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
                     total = (
                         loss_mse + lambda_rate * rate_penalty + lambda_kakeya * coverage
@@ -1135,7 +1208,7 @@ def _hyperprior_epoch(
                         aux_optimizer.zero_grad(set_to_none=True)
                         aux_loss = (
                             model.entropy_bottleneck.loss()
-                            + model.color_entropy_bottleneck.loss()
+                            + model.base_entropy_bottleneck.loss()
                         )
                         aux_loss.backward()
                         auxiliary_parameters = [
@@ -1158,7 +1231,7 @@ def _hyperprior_epoch(
             totals["lab"] += float(lab.detach())
             totals["hue"] += float(hue.detach())
             totals["saturation"] += float(sat.detach())
-            totals["chroma"] += float(chroma.detach())
+            totals["base"] += float(base.detach())
             totals["kakeya"] += float(coverage.detach())
             totals["rate"] += float(rate.detach())
             totals["psnr"] += float(psnr)
@@ -1541,7 +1614,7 @@ def _evaluate_chart(
         "bitstream_bytes": float(bitstream["bytes"]),
         "bitstream_payload_bytes": float(bitstream["payload_bytes"]),
         "bitstream_bpp": float(bitstream["bpp"]),
-        "color_bytes": float(bitstream["color_bytes"]),
+        "base_bytes": float(bitstream["base_bytes"]),
     }
     metrics.update(hd_metrics)
     return (
@@ -1892,25 +1965,25 @@ def _encode_bitstream(
     *,
     write_file: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Encode structure and low-frequency chroma into the real v6 payload."""
+    """Encode Detail and learned low-frequency Base into the real v7 payload."""
     import struct as _struct
 
     model.eval()
     model.update()
 
     compressed = model.compress(image)
-    y_strings, z_strings, color_strings = compressed["strings"]
+    y_strings, z_strings, base_strings = compressed["strings"]
     reconstructed = model.decompress(
         compressed["strings"],
         compressed["shape"],
         compressed["y_shape"],
-        compressed["color_shape"],
+        compressed["base_shape"],
     )
 
-    # Pack: [z_len:4B][z_data][y_len:4B][y_data][color_len:4B][color_data]
+    # Pack: [z_len:4B][z_data][y_len:4B][y_data][base_len:4B][base_data]
     payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
     payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
-    payload += _struct.pack(">I", len(color_strings[0])) + color_strings[0]
+    payload += _struct.pack(">I", len(base_strings[0])) + base_strings[0]
 
     file_bytes = len(payload)
     if write_file:
@@ -1922,13 +1995,13 @@ def _encode_bitstream(
     return reconstructed, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
-        "format": "Kakeya Hyperprior v6",
+        "format": "Kakeya Hyperprior v7",
         "bytes": file_bytes,
         "payload_bytes": (
-            len(z_strings[0]) + len(y_strings[0]) + len(color_strings[0])
+            len(z_strings[0]) + len(y_strings[0]) + len(base_strings[0])
         ),
         "structure_bytes": len(z_strings[0]) + len(y_strings[0]) + 8,
-        "color_bytes": len(color_strings[0]) + 4,
+        "base_bytes": len(base_strings[0]) + 4,
         "header_bytes": 12,
         "bpp": bitstream_bpp,
         "requires_checkpoint": True,

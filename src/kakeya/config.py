@@ -17,7 +17,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "lab": 0.05,
         "hue": 0.05,
         "saturation": 0.05,
-        "chroma": 0.5,
+        "base": 0.5,
         "kakeya": 0.002,
     },
     "transition": {
@@ -28,7 +28,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "lab": 0.08,
         "hue": 0.08,
         "saturation": 0.08,
-        "chroma": 0.75,
+        "base": 0.75,
         "kakeya": 0.001,
     },
     "finetune": {
@@ -39,7 +39,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "lab": 0.12,
         "hue": 0.06,
         "saturation": 0.08,
-        "chroma": 1.0,
+        "base": 1.0,
         "kakeya": 0.0005,
     },
 }

@@ -369,9 +369,12 @@ EntropyBottleneck + GaussianConditional 构成并行超先验熵模型。
 InstanceNorm 采用按通道可学习的混合形式，初始保留 90% 归一化路径和 10%
 原始幅度路径，使网络能在多尺度稳定性与输入相关的亮度、对比度统计之间自行
 调整。RGB 合成端另有零初始化的高频残差头，
-架构 v4 另将 `/8` 低频 YCoCg Co/Cg 编入独立 EntropyBottleneck；解码端
-只替换低频色度，因此绕过 InstanceNorm 的幅度统计损失，同时不改动亮度、
-文字边缘和高频纹理。真实 `.kky` v6 码流包含 `[z, y, chroma]` 三段。
+架构 v5 将 `/8` 完整低频 YCoCg 交给无 InstanceNorm 的可学习 Base
+Analysis/Synthesis，并编码为 4 通道独立 EntropyBottleneck；解码端在 YCoCg 域
+组合 Base 低频和 Detail 高频，因此绝对亮度、对比度和色度均绕过 InstanceNorm，
+文字边缘和高频纹理仍由原清晰度主干承担。真实 `.kky` v7 码流使用
+`[z, y_detail, y_base]` 三段，不引入自回归联合熵模型。架构以实验效果为优先，
+明确不兼容旧 v4 checkpoint 和 v6 bitstream。
 在降采样时先把像素无损搬到通道维再做特征混合，减少细字和一像素线条被步幅
 卷积提前抹掉的风险。训练结束后会自动对包含
 中英文、街景、细线、灰阶和色块的测试卡执行确定性编码和还原，并展示：

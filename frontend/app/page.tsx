@@ -120,7 +120,7 @@ type ResultPayload = {
       bytes: number;
       payload_bytes: number;
       structure_bytes: number;
-      color_bytes: number;
+      base_bytes: number;
       header_bytes: number;
       bpp: number;
       requires_checkpoint: boolean;
@@ -991,12 +991,22 @@ function ObjectiveFields({
   );
 }
 
-const STAGE_LOSS_KEYS = ["mse", "edge", "structural", "multiscale", "lab", "hue", "saturation", "kakeya"];
+const STAGE_LOSS_KEYS = [
+  "mse",
+  "edge",
+  "structural",
+  "multiscale",
+  "lab",
+  "hue",
+  "saturation",
+  "base",
+  "kakeya",
+];
 
 const STAGE_DEFAULTS: Record<string, Record<string, number>> = {
-  capacity:  { mse: 1.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, kakeya: 0.002 },
-  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, kakeya: 0.001 },
-  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, kakeya: 0.0005 },
+  capacity:  { mse: 3.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, base: 0.5, kakeya: 0.002 },
+  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, base: 0.75, kakeya: 0.001 },
+  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, base: 1.0, kakeya: 0.0005 },
 };
 function StageWeightsEditor({
   config, setConfig,
@@ -1980,9 +1990,9 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
               <td>
                 图文 Kakeya VAE
                 <small>
-                  Hyperprior v6 · 条件高斯 + 低频色度 · {latentShape.join("×")}
-                  {bitstream?.color_bytes
-                    ? ` · 色度 ${formatBytes(bitstream.color_bytes)}`
+                  Hyperprior v7 · 条件高斯 + YCoCg Base · {latentShape.join("×")}
+                  {bitstream?.base_bytes
+                    ? ` · Base ${formatBytes(bitstream.base_bytes)}`
                     : ""}
                 </small>
               </td>

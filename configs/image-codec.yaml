@@ -24,7 +24,7 @@ objective:
       lab: 0.02
       hue: 0.02
       saturation: 0.02
-      chroma: 0.5
+      base: 0.5
     transition:
       kakeya: 0.001
       mse: 5.0
@@ -32,7 +32,7 @@ objective:
       lab: 0.05
       hue: 0.05
       saturation: 0.05
-      chroma: 0.75
+      base: 0.75
     finetune:
       kakeya: 0.0005
       mse: 5.0
@@ -40,4 +40,4 @@ objective:
       lab: 0.10
       hue: 0.10
       saturation: 0.10
-      chroma: 1.0
+      base: 1.0

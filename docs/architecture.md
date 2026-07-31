@@ -243,12 +243,13 @@ graph TD
         IMG[RGB Image<br/>H x W x 3]
     end
 
-    subgraph COLOR["低频色度旁路"]
-        IMG --> YCOCG[固定 RGB → YCoCg<br/>提取 Co / Cg]
-        YCOCG --> CPOOL[Area Pool /8<br/>2×H/8×W/8]
-        CPOOL --> CGAIN[固定增益 ×32]
-        CGAIN --> CEB[Color EntropyBottleneck<br/>独立真实码流]
-        CEB --> C_HAT[c_hat / 32<br/>低频 Co / Cg]
+    subgraph BASE_STREAM["完整低频 Base 分支（无 InstanceNorm）"]
+        IMG --> YCOCG[可逆 RGB → YCoCg<br/>保留 Y / Co / Cg]
+        YCOCG --> CPOOL[Area Pool /8<br/>3×H/8×W/8]
+        CPOOL --> BAE[Base Analysis<br/>3→4 幅度投影 + 两层残差细化]
+        BAE --> CEB[Base EntropyBottleneck<br/>独立概率模型 p(y_base)]
+        CEB --> BSD[Base Synthesis<br/>4→3 幅度投影 + 两层残差细化]
+        BSD --> C_HAT[低频 Y / Co / Cg]
     end
 
     subgraph ANALYSIS["g_a — 分析变换"]
@@ -302,7 +303,7 @@ graph TD
         BASE --> FUSE[base + 0.25 × detail]
         DETAIL --> FUSE
         FUSE --> SIG[Sigmoid<br/>基础 RGB]
-        SIG --> CFUSE[固定 YCoCg 融合<br/>只替换低频 Co/Cg]
+        SIG --> CFUSE[确定性频率分解<br/>Base 低频 + Detail 高频]
         C_HAT --> CFUSE
         CFUSE --> OUT[RGB Output<br/>H x W x 3]
     end
@@ -311,7 +312,7 @@ graph TD
     style HYPER fill:#e8eaf6
     style CONDITIONAL fill:#fce4ec
     style SYNTHESIS fill:#e8f5e9
-    style COLOR fill:#fff9c4
+    style BASE_STREAM fill:#fff9c4
 ```
 
 ### 关键组件细节
@@ -347,28 +348,30 @@ graph LR
         RES --> ADD
     end
 
-    subgraph LowFrequencyChromaSideStream
-        RGB[raw RGB] --> CO[固定 Co=R-B<br/>Cg=G-(R+B)/2]
-        CO --> POOL[Area Pool /8 + ×32]
-        POOL --> CODE[EntropyBottleneck]
-        CODE --> REPLACE[替换基础图低频 Co/Cg<br/>亮度与高频保持不变]
+    subgraph LearnedBaseBranch
+        RGB[raw RGB] --> CO[可逆 YCoCg<br/>Y=(R+2G+B)/4]
+        CO --> POOL[Area Pool /8]
+        POOL --> BA[Base Analysis<br/>无 IN；3→4 latent]
+        BA --> CODE[独立 EntropyBottleneck]
+        CODE --> BS[Base Synthesis<br/>无 IN；4→3 YCoCg]
+        BS --> REPLACE[替换全部低频 Y/Co/Cg<br/>Detail 高频保持不变]
     end
 ```
 
 | 维度 | 说明 |
 |---|---|
-| 熵模型 | EntropyBottleneck（z）+ GaussianConditional（y）+ Color EntropyBottleneck（Co/Cg） |
+| 熵模型 | 独立因子分解 `p(z)·p(y_detail\|z)·p(y_base)`：EntropyBottleneck（z/Base）+ GaussianConditional（Detail） |
 | 激活函数 | 分析侧 Residual GDN；合成侧 Residual IGDN |
 | 归一化 | BlendedInstanceNorm，初始 90% IN + 10% 原始幅度路径 |
 | 多尺度块 | 局部 3x3 与 dilation=2 分支融合 |
 | 下采样 | SpaceToDepth x 2 = 4x（保持文字精度） |
 | 上采样 | LearnedUpsample 2x + DepthToSpace 2x |
 | 输出 | 基础 RGB logits + 0.25 × 零初始化高频残差 |
-| 色度保护 | 固定 YCoCg、/8 低频 Co/Cg 独立码流；绕过 InstanceNorm，不修改亮度和高频 |
-| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + chroma + λ·rate + λₖ·kakeya |
+| Base 分支 | 完整低频 Y/Co/Cg、/8 采样、4 通道可学习 latent；无 IN，独立码流 |
+| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + low-frequency Base + λ·rate + λₖ·kakeya |
 | h_s 增强 | Self-Attention；大图使用 16x16 窗口 |
 | 潜空间 | 8 通道, ±5 bound, GaussianConditional 量化 |
-| checkpoint | 架构版本 4，Kakeya Hyperprior v6 `[z,y,chroma]`；旧主干明确不兼容 |
+| checkpoint | 架构版本 5，Kakeya Hyperprior v7 `[z,y_detail,y_base]`；明确不兼容旧架构 |
 ---
 
 ## 3. 损失函数组成
@@ -480,7 +483,7 @@ KakeyaHyperpriorCodec 使用 Capacity → Transition → Finetune 三阶段权�
 
 ```mermaid
 flowchart TD
-    START([开始训练]) --> INIT[初始化架构版本 4<br/>v3 主干 + 低频 Co/Cg 旁路]
+    START([开始训练]) --> INIT[初始化架构版本 5<br/>Detail 主干 + 完整 YCoCg Base]
     INIT --> SPLIT_OPT[分离优化器参数<br/>main 不含 quantiles<br/>aux 仅含 quantiles]
     SPLIT_OPT --> LOADERS[创建 DataLoaders<br/>Reference + Procedural + RealImage + Validation]
     LOADERS --> LOOP{每个 epoch<br/>1 → config.epochs}
@@ -492,7 +495,7 @@ flowchart TD
     VALID --> CALIB[_calibration_metrics<br/>确定性前向量化<br/>不构建 CDF]
     CALIB --> HD[512 高清校准<br/>PSNR/SSIM]
     HD --> CKPT{256 PSNR 创新高<br/>高清 PSNR/SSIM/Chroma<br/>回退均未越界?}
-    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 4]
+    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 5]
     SAVE --> LOOP
     CKPT -->|否| LOOP
 
@@ -515,7 +518,7 @@ flowchart TD
 5. `bpp = rate / (H * W)` — 每像素比特
 6. `coverage = kakeya_regularization(unit_normalized_latent, num_projections=32, k=3)` — 挂谷覆盖正则
 7. 按尺寸选择小图条件权重或原高清权重
-8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、低频 chroma、rate 与 Kakeya 总损失
+8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、完整低频 Base、rate 与 Kakeya 总损失
 9. `total.backward()` 后检查梯度有限性并裁剪到 5，再更新主参数
 10. `aux_loss` 只更新 EntropyBottleneck 的 `quantiles`
 
@@ -532,7 +535,7 @@ flowchart TD
     SIZE_CHK -->|过小| ERR2[400: 图片过小]
     SIZE_CHK -->|OK| PAD[8 倍数对齐<br/>保证结构/色度网格一致]
 
-    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 4]
+    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 5]
     LOAD_CKPT --> MODEL[KakeyaHyperpriorCodec<br/>eval mode]
 
     MODEL --> ENCODE[y = model.encode(img)]
@@ -812,11 +815,18 @@ graph LR
 
 ### 9.5 高清大图颜色与亮度问题
 
-#### 当前方案：结构与低频色度分离
+#### 当前方案：可学习的 Base / Detail 分解
 
-架构 v4 保留已经验证的大图清晰度主干，同时把 `/8` 低频 Co/Cg 作为独立熵码流。
-解码端只替换基础图的低频色度，亮度和高频纹理由原 IGDN/高频头保留。该设计针对
-BlendedInstanceNorm 无法可靠携带输入通道均值的问题，不依赖网络重新学习颜色映射。
+架构 v5 保留已经验证的大图 Detail 主干，但不再把低频亮度留给 InstanceNorm
+路径。RGB 先可逆转换为 YCoCg，完整的 `/8` 低频 Y/Co/Cg 由不含 InstanceNorm
+的 Base Analysis / Synthesis 编码为 4 通道潜变量。解码端在 YCoCg 域执行严格的
+频率分解：Base 提供全部绝对低频统计，原 IGDN/高频头只提供 Detail 高频。因此
+亮度、对比度和绿色/蓝色色度不再依赖被归一化的特征，同时保留高清边缘路径。
+
+熵模型刻意保持为 `p(z)·p(y_detail|z)·p(y_base)`，没有引入联合上下文或串行
+自回归依赖。`.kky` v7 使用 `[z,y_detail,y_base]` 三段，仍可并行解码。项目以实验
+效果优先，架构版本提升到 5，旧 checkpoint 与 v6 bitstream 明确不兼容，避免让
+兼容逻辑限制 Base 表示能力。
 
 训练数据通过 step mixer 按实际优化步骤执行 40% reference / 30% procedural /
 30% real；checkpoint 除 PSNR/SSIM 外还保护高清 chroma MAE。

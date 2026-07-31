@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from kakeya.image_codec import (
+    BASE_LATENT_CHANNELS,
     TRAIN_MIX_CYCLE,
     BlendedInstanceNorm,
     DepthToSpace,
@@ -14,12 +15,14 @@ from kakeya.image_codec import (
     _hyperprior_epoch,
     _lab_losses,
     _laplacian,
+    _low_frequency_base,
     _optimizer_parameter_groups,
-    _restore_low_frequency_chroma,
+    _restore_low_frequency_base,
     _rgb_to_lab,
-    _rgb_to_ycocg_chroma,
+    _rgb_to_ycocg,
     _scale_conditioned_objective,
     _training_step_count,
+    _ycocg_to_rgb,
 )
 from kakeya.models import VAE
 
@@ -48,13 +51,13 @@ def test_image_codec_forward_pass() -> None:
     image = torch.rand(1, 3, 256, 256)
 
     mu = model.encode(image)
-    recon, _, _, _, yl, _, color_likelihoods = model(image)
+    recon, _, _, _, yl, _, base_likelihoods = model(image)
     assert recon.shape == image.shape
     assert mu.shape == (1, 8, 64, 64)
     assert mu.abs().max() <= 3.0
     assert yl.shape == (1, 8, 64, 64)
     assert torch.isfinite(yl).all()
-    assert color_likelihoods.shape == (1, 2, 32, 32)
+    assert base_likelihoods.shape == (1, BASE_LATENT_CHANNELS, 32, 32)
 
 
 def test_image_codec_finite_reconstruction() -> None:
@@ -116,36 +119,86 @@ def test_hyperprior_bitstream_round_trip_uses_conditional_model(
 
     assert decoded.shape == image.shape
     assert torch.isfinite(decoded).all()
-    assert metadata["format"] == "Kakeya Hyperprior v6"
+    assert metadata["format"] == "Kakeya Hyperprior v7"
     assert metadata["bytes"] == (tmp_path / "reports/reconstruction.kky").stat().st_size
     assert metadata["bytes"] > metadata["header_bytes"]
-    assert metadata["color_bytes"] > 4
+    assert metadata["base_bytes"] > 4
 
 
-def test_color_side_stream_restores_chroma_without_changing_luminance() -> None:
+def test_base_stream_restores_low_frequency_luminance_and_chroma() -> None:
     target = torch.zeros(1, 3, 32, 32)
     target[:, 0] = 0.2
     target[:, 1] = 0.7
     target[:, 2] = 0.3
     base = torch.full_like(target, 0.4)
-    color = torch.nn.functional.adaptive_avg_pool2d(
-        _rgb_to_ycocg_chroma(target), (4, 4)
-    ) * 32.0
+    decoded_base = torch.nn.functional.adaptive_avg_pool2d(_rgb_to_ycocg(target), (4, 4))
 
-    restored = _restore_low_frequency_chroma(base, color)
-    base_error = torch.nn.functional.l1_loss(
-        _rgb_to_ycocg_chroma(base), _rgb_to_ycocg_chroma(target)
-    )
+    restored = _restore_low_frequency_base(base, decoded_base)
+    base_error = torch.nn.functional.l1_loss(_rgb_to_ycocg(base), _rgb_to_ycocg(target))
     restored_error = torch.nn.functional.l1_loss(
-        _rgb_to_ycocg_chroma(restored), _rgb_to_ycocg_chroma(target)
+        _rgb_to_ycocg(restored), _rgb_to_ycocg(target)
     )
-    base_luminance = (base[:, 0] + 2 * base[:, 1] + base[:, 2]) / 4
+    target_luminance = (target[:, 0] + 2 * target[:, 1] + target[:, 2]) / 4
     restored_luminance = (
         restored[:, 0] + 2 * restored[:, 1] + restored[:, 2]
     ) / 4
 
     assert restored_error < base_error * 0.01
-    torch.testing.assert_close(restored_luminance, base_luminance)
+    torch.testing.assert_close(restored_luminance, target_luminance)
+
+
+def test_ycocg_base_fusion_preserves_detail_high_pass() -> None:
+    reconstructed = torch.full((1, 3, 32, 32), 0.4)
+    checkerboard = (
+        (torch.arange(32)[:, None] + torch.arange(32)[None, :]) % 2
+    ).float()
+    reconstructed += (checkerboard * 0.1 - 0.05)[None, None]
+    decoded_base = torch.zeros(1, 3, 4, 4)
+    decoded_base[:, 0] = 0.5
+
+    restored = _restore_low_frequency_base(reconstructed, decoded_base)
+    detail_ycocg = _rgb_to_ycocg(reconstructed)
+    detail_low = torch.nn.functional.interpolate(
+        _low_frequency_base(reconstructed, (4, 4)),
+        size=(32, 32),
+        mode="bilinear",
+        align_corners=False,
+    )
+    decoded_up = torch.nn.functional.interpolate(
+        decoded_base, size=(32, 32), mode="bilinear", align_corners=False
+    )
+
+    torch.testing.assert_close(
+        _rgb_to_ycocg(restored) - decoded_up,
+        detail_ycocg - detail_low,
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
+def test_ycocg_transform_is_reversible() -> None:
+    image = torch.rand(2, 3, 17, 19)
+    torch.testing.assert_close(_ycocg_to_rgb(_rgb_to_ycocg(image)), image)
+
+
+def test_learned_base_branch_starts_as_full_ycocg_transform() -> None:
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8)
+    image = torch.rand(1, 3, 32, 32)
+    expected = torch.nn.functional.avg_pool2d(
+        _rgb_to_ycocg(image), kernel_size=8, stride=8
+    )
+
+    encoded = model._base_analysis(image)
+    decoded = model.base_synthesis(encoded)
+    decoded.mean().backward()
+
+    torch.testing.assert_close(decoded, expected)
+    assert model.base_analysis.projection.weight.grad is not None
+    assert model.base_analysis.refinement[-1].weight.grad is not None
+    assert model.base_synthesis.refinement[-1].weight.grad is not None
+    assert torch.isfinite(model.base_analysis.projection.weight.grad).all()
+    assert torch.isfinite(model.base_analysis.refinement[-1].weight.grad).all()
+    assert torch.isfinite(model.base_synthesis.refinement[-1].weight.grad).all()
 
 
 def test_small_image_objective_preserves_hd_weights() -> None:
@@ -237,12 +290,12 @@ def test_lab_losses_have_finite_gradients_for_achromatic_pixels() -> None:
 def test_kakeya_hyperprior_forward_pass() -> None:
     model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4)
     x = torch.rand(1, 3, 128, 128)
-    recon, mu, _, _, y_likelihoods, _, color_likelihoods = model(x)
+    recon, mu, _, _, y_likelihoods, _, base_likelihoods = model(x)
     assert recon.shape == (1, 3, 128, 128)
     assert mu.shape == (1, 4, 32, 32)
     assert torch.isfinite(recon).all()
     assert torch.isfinite(y_likelihoods).all()
-    assert torch.isfinite(color_likelihoods).all()
+    assert torch.isfinite(base_likelihoods).all()
 
 
 def test_custom_backbone_detail_head_receives_gradients() -> None:
