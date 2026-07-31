@@ -1977,7 +1977,9 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
             <tr className="highlight-row">
               <td>
                 图文 Kakeya VAE
-                <small>EntropyBottleneck · {latentShape.join("×")}</small>
+                <small>
+                  Hyperprior v5 · 条件高斯 · {latentShape.join("×")}
+                </small>
               </td>
               <td>
                 <span className={`effect-badge effect-${modelEffectTone}`}>

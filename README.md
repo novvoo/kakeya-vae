@@ -190,8 +190,9 @@ python start_lab.py --timeout 180
 1. **同图本机实测**：对同一张 256×256 图文测试卡重新编码为优化 PNG、
    JPEG quality 90 和 WebP quality 90，比较实际文件大小、PSNR 与 SSIM。
    网页会直接给出“有效 / 有限 / 无效”、肉眼质量和相对原图节省比例；PSNR 与
-   SSIM 仅作为可选技术指标。Kakeya 模型使用 CompressAI EntropyBottleneck
-   量化并生成实际 `.kky` 码流，报告还原图由该码流解码得到。只有“画质达到
+   SSIM 仅作为可选技术指标。Kakeya 模型使用超先验 EntropyBottleneck 编码
+   `z`，再由条件高斯模型编码 `y` 并生成实际 `.kky` 码流，报告还原图由该码流
+   解码得到。只有“画质达到
    最低要求”且“实际文件小于原始 PNG”时，网页才标记为有效。
 2. **图像压缩前沿参照**：对照 SAAF（CVPR 2026）、Diff-ICMH
    （NeurIPS 2025）、DC-AE（ICLR 2025）和面向文字区域的 Selective Detail +
@@ -356,11 +357,13 @@ rehearsal，降低从容量阶段切到程序化图文阶段时的画质坍塌�
 训练损失混成一条看似异常的验证曲线。
 
 该模式使用程序生成的 RGB 图文卡片训练，并把网页测试卡作为明确标注的
-同分布校准样本。模型采用
-32×32 空间潜变量、残差卷积块和 PixelUnshuffle / PixelShuffle 空间重排。
-超先验版本（`KakeyaHyperpriorCodec`）额外使用 GDN/IGDN 激活函数
-（替代 InstanceNorm）和超先验熵模型（EntropyBottleneck +
-GaussianConditional），支持单阶段端到端率失真训练。，
+同分布校准样本。模型采用空间潜变量、多尺度残差块和 PixelUnshuffle /
+PixelShuffle 空间重排。`KakeyaHyperpriorCodec` 保留已验证的大图
+InstanceNorm 路径，在分析变换使用 GDN、合成变换使用 IGDN，并以
+EntropyBottleneck + GaussianConditional 构成并行超先验熵模型。
+InstanceNorm 采用按通道可学习的混合形式，初始保留 90% 归一化路径和 10%
+原始幅度路径，使网络能在多尺度稳定性与输入相关的亮度、对比度统计之间自行
+调整。RGB 合成端另有零初始化的高频残差头，
 在降采样时先把像素无损搬到通道维再做特征混合，减少细字和一像素线条被步幅
 卷积提前抹掉的风险。训练结束后会自动对包含
 中英文、街景、细线、灰阶和色块的测试卡执行确定性编码和还原，并展示：

@@ -53,6 +53,34 @@ SMALL_IMAGE_HIGH_FREQUENCY_WEIGHT = 1.0
 HD_CHECKPOINT_SIZE = 512
 HD_PSNR_MAX_REGRESSION = 0.1
 HD_SSIM_MAX_REGRESSION = 0.001
+MAX_GRAD_NORM = 5.0
+
+
+class BlendedInstanceNorm(nn.Module):
+    """Learnable blend of raw amplitudes and per-instance normalization.
+
+    The initial 0.9 strength stays close to the empirically successful
+    InstanceNorm path while preserving a direct route for image-specific
+    brightness, contrast, and low-frequency statistics.
+    """
+
+    def __init__(self, channels: int, initial_strength: float = 0.9) -> None:
+        super().__init__()
+        if not 0.0 < initial_strength < 1.0:
+            raise ValueError("initial_strength must be between 0 and 1")
+        self.norm = nn.InstanceNorm2d(channels, affine=True)
+        initial_logit = math.log(initial_strength / (1.0 - initial_strength))
+        self.strength_logit = nn.Parameter(
+            torch.full((1, channels, 1, 1), initial_logit)
+        )
+
+    @property
+    def strength(self) -> torch.Tensor:
+        return self.strength_logit.sigmoid()
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        strength = self.strength
+        return value + strength * (self.norm(value) - value)
 
 
 class SpaceToDepth(nn.Module):
@@ -63,7 +91,7 @@ class SpaceToDepth(nn.Module):
         self.net = nn.Sequential(
             nn.PixelUnshuffle(2),
             weight_norm(nn.Conv2d(input_channels * 4, output_channels, 3, padding=1)),
-            nn.InstanceNorm2d(output_channels, affine=True),
+            BlendedInstanceNorm(output_channels),
             nn.SiLU(),
         )
 
@@ -79,7 +107,7 @@ class DepthToSpace(nn.Module):
         self.net = nn.Sequential(
             weight_norm(nn.Conv2d(input_channels, output_channels * 4, 3, padding=1)),
             nn.PixelShuffle(2),
-            nn.InstanceNorm2d(output_channels, affine=True),
+            BlendedInstanceNorm(output_channels),
             nn.SiLU(),
         )
 
@@ -112,14 +140,14 @@ class LearnedUpsample(nn.Module):
 
 
 class ResidualBlockGDN(nn.Module):
-    """Residual block with GDN activation."""
+    """Residual transform using GDN for analysis and IGDN for synthesis."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, *, inverse: bool = False) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            GDN(channels),
+            GDN(channels, inverse=inverse),
             weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
-            GDN(channels),
+            GDN(channels, inverse=inverse),
             weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
         )
 
@@ -127,35 +155,60 @@ class ResidualBlockGDN(nn.Module):
         return value + self.net(value)
 
 
+class MultiScaleResidualBlock(nn.Module):
+    """Fuse local strokes and wider document context without extra downsampling."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.local = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.Conv2d(channels, channels, 1),
+            nn.SiLU(),
+        )
+        self.context = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                3,
+                padding=2,
+                dilation=2,
+                groups=channels,
+            ),
+            nn.Conv2d(channels, channels, 1),
+            nn.SiLU(),
+        )
+        self.fuse = nn.Conv2d(channels * 2, channels, 1)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        fused = self.fuse(torch.cat((self.local(value), self.context(value)), dim=1))
+        return value + self.residual_scale * fused
+
+
 class KakeyaHyperpriorCodec(nn.Module):
-    """Hyperprior codec combining CompressAI MeanScaleHyperprior architecture
-    with Kakeya coverage regularization.
+    """Document-oriented parallel hyperprior codec with Kakeya regularization.
 
-    Architecture inherits from mbt2018:
-    - ``g_a`` encoder with GDN activations
-    - ``hyper_encoder`` / ``hyper_decoder`` for spatial entropy modelling
-    - ``g_s`` decoder with IGDN activations
-    - ``entropy_bottleneck`` / ``gaussian_conditional`` for rate estimation
-
-    Novel additions:
-    - Kakeya coverage regularization on unit-normalized latent points
-    - SpaceToDepth / DepthToSpace preserve spatial precision for document text
-    - Single-stage training (no capacity/transition/finetune)
+    The analysis transform keeps the empirically useful InstanceNorm-based
+    space-to-depth path. Multi-scale residual blocks preserve both thin strokes
+    and wider layout context. The synthesis transform uses inverse GDN and a
+    learned high-frequency RGB residual instead of an autoregressive decoder.
     """
 
-    def __init__(self, latent_dim: int = 8, hyper_dim: int = 8) -> None:
+    def __init__(self, latent_dim: int = 8, hyper_dim: int | None = None) -> None:
         super().__init__()
         self.latent_dim = latent_dim
+        hyper_dim = hyper_dim or max(8, latent_dim)
+        self.hyper_dim = hyper_dim
         # Analysis transform: SpaceToDepth × 2 → 4× downscale to 64×64
-        # GDN replaces InstanceNorm for better compression statistics.
         self.g_a = nn.Sequential(
             SpaceToDepth(3, 24),
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
-            weight_norm(nn.Conv2d(32, 64, 1)),  # expand to 64ch bottleneck
+            weight_norm(nn.Conv2d(32, 64, 1)),
+            MultiScaleResidualBlock(64),
             ResidualBlockGDN(64),
-            weight_norm(nn.Conv2d(64, latent_dim * 2, 1)),  # squeeze to latent
+            weight_norm(nn.Conv2d(64, latent_dim, 1)),
         )
 
         # Hyperprior — spatially adaptive entropy model.
@@ -190,26 +243,49 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.gaussian_conditional = GaussianConditional(
             None
         )  # scale table set after h_s output
-        self.g_s = nn.Sequential(
-            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),  # expand to 64ch
-            ResidualBlockGDN(64),
-            weight_norm(nn.Conv2d(64, 32, 3, padding=1)),  # squeeze to 32ch
-            ResidualBlockGDN(32),
-            LearnedUpsample(32),  # bilinear + sharp residual
-            weight_norm(nn.Conv2d(32, 24, 3, padding=1)),  # mix to 24ch
-            ResidualBlockGDN(24),
+        self.g_s_features = nn.Sequential(
+            weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
+            MultiScaleResidualBlock(64),
+            ResidualBlockGDN(64, inverse=True),
+            weight_norm(nn.Conv2d(64, 32, 3, padding=1)),
+            ResidualBlockGDN(32, inverse=True),
+            LearnedUpsample(32),
+            weight_norm(nn.Conv2d(32, 24, 3, padding=1)),
+            ResidualBlockGDN(24, inverse=True),
             DepthToSpace(24, 12),
             weight_norm(nn.Conv2d(12, 24, 3, padding=1)),
             nn.SiLU(),
-            weight_norm(nn.Conv2d(24, 3, 3, padding=1)),
-            nn.Sigmoid(),
         )
+        self.rgb_head = weight_norm(nn.Conv2d(24, 3, 3, padding=1))
+        self.detail_head = nn.Sequential(
+            nn.Conv2d(24, 24, 3, padding=1, groups=24),
+            nn.Conv2d(24, 24, 1),
+            nn.SiLU(),
+            nn.Conv2d(24, 3, 3, padding=1),
+        )
+        nn.init.zeros_(self.detail_head[-1].weight)
+        nn.init.zeros_(self.detail_head[-1].bias)
+
+    def _analysis(self, image: torch.Tensor) -> torch.Tensor:
+        latent = self.g_a(image)
+        return LATENT_MEAN_BOUND * torch.tanh(latent / LATENT_MEAN_BOUND)
+
+    def _synthesis(self, latent: torch.Tensor) -> torch.Tensor:
+        features = self.g_s_features(latent)
+        logits = self.rgb_head(features) + 0.25 * self.detail_head(features)
+        return torch.sigmoid(logits)
+
+    def normalization_strength(self) -> float:
+        strengths = [
+            module.strength.detach().mean()
+            for module in self.modules()
+            if isinstance(module, BlendedInstanceNorm)
+        ]
+        return float(torch.stack(strengths).mean()) if strengths else 0.0
 
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
         """Encode an image with the learned hyperprior probability model."""
-        raw = self.g_a(image)
-        mu, _ = raw.chunk(2, dim=1)
-        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
+        mu = self._analysis(image)
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
@@ -252,7 +328,7 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=mean)
-        return self.g_s(y_hat)
+        return self._synthesis(y_hat)
 
     def init_scale_table(
         self, min_scale: float = 0.11, max_scale: float = 256, levels: int = 64
@@ -335,27 +411,22 @@ class KakeyaHyperpriorCodec(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        raw = self.g_a(image)
-        mu, _ = raw.chunk(2, dim=1)
-        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
+        mu = self._analysis(image)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
-        reconstructed = self.g_s(y_hat)
+        reconstructed = self._synthesis(y_hat)
         return reconstructed, mu, None, y_hat, y_likelihoods, z_likelihoods
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
-        raw = self.g_a(image)
-        mu, _ = raw.chunk(2, dim=1)
-        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
-        return mu
+        return self._analysis(image)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode latent tensor back to RGB image."""
-        return self.g_s(latent)
+        return self._synthesis(latent)
 
     def update(self, force: bool = False) -> None:
         """Update entropy bottleneck CDF tables (required before compress)."""
@@ -370,9 +441,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         gives much finer quantization steps (~scale, typically ~0.1) compared
         to the 7 integer bins from rounding to [-3,-2,…,3].
         """
-        raw = self.g_a(image)
-        mu, _ = raw.chunk(2, dim=1)
-        mu = LATENT_MEAN_BOUND * torch.tanh(mu / LATENT_MEAN_BOUND)
+        mu = self._analysis(image)
         z = self.h_a(mu)
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
@@ -395,7 +464,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         #   y_hat = round((mu - mean) / scale) * scale + mean
         # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
         y_hat, _ = self.gaussian_conditional(mu, scale, mean)
-        return self.g_s(y_hat)
+        return self._synthesis(y_hat)
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -681,10 +750,39 @@ def _checkpoint(
         {
             "model_state_dict": model.state_dict(),
             "config": config.to_dict(),
+            "architecture": {
+                "name": "kakeya_multiscale_hyperprior",
+                "version": 3,
+                "hyper_dim": model.hyper_dim,
+            },
             "epoch": epoch,
         },
         path,
     )
+
+
+def _optimizer_parameter_groups(
+    model: KakeyaHyperpriorCodec,
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Keep entropy quantiles exclusively in the auxiliary optimizer."""
+    main_parameters: list[nn.Parameter] = []
+    auxiliary_parameters: list[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.endswith(".quantiles"):
+            auxiliary_parameters.append(parameter)
+        else:
+            main_parameters.append(parameter)
+    return main_parameters, auxiliary_parameters
+
+
+def _clip_finite_gradients(
+    parameters: list[nn.Parameter], max_norm: float = MAX_GRAD_NORM
+) -> None:
+    grad_norm = nn.utils.clip_grad_norm_(parameters, max_norm)
+    if not bool(torch.isfinite(grad_norm).item()):
+        raise FloatingPointError("检测到非有限梯度，已在更新模型参数前停止训练")
 
 
 def _append(target: dict[str, list[float]], values: dict[str, float]) -> None:
@@ -709,11 +807,9 @@ def _calibration_metrics(
     model: KakeyaHyperpriorCodec, source: torch.Tensor
 ) -> dict[str, float]:
     model.eval()
-    model.update()
-    reconstructed = model.reconstruct(source).clamp(0, 1)
+    reconstructed, _, _, _, y_likelihoods, z_likelihoods = model(source)
+    reconstructed = reconstructed.clamp(0, 1)
     mse = float(F.mse_loss(reconstructed, source))
-    # Rate from forward pass
-    _, _, _, _, y_likelihoods, z_likelihoods = model(source)
     rate_bpp = float(
         (-y_likelihoods.log2().sum() - z_likelihoods.log2().sum())
         / (source.shape[-1] * source.shape[-2])
@@ -781,6 +877,7 @@ def _hyperprior_epoch(
         "psnr": 0.0,
         "rate_bpp": 0.0,
         "latent_rms": 0.0,
+        "normalization_strength": 0.0,
     }
     steps = 0
 
@@ -851,11 +948,23 @@ def _hyperprior_epoch(
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
                     total.backward()
+                    main_parameters = [
+                        parameter
+                        for group in optimizer.param_groups
+                        for parameter in group["params"]
+                    ]
+                    _clip_finite_gradients(main_parameters)
                     optimizer.step()
                     if aux_optimizer is not None:
                         aux_optimizer.zero_grad(set_to_none=True)
                         aux_loss = model.entropy_bottleneck.loss()
                         aux_loss.backward()
+                        auxiliary_parameters = [
+                            parameter
+                            for group in aux_optimizer.param_groups
+                            for parameter in group["params"]
+                        ]
+                        _clip_finite_gradients(auxiliary_parameters)
                         aux_optimizer.step()
 
             with torch.no_grad():
@@ -875,6 +984,7 @@ def _hyperprior_epoch(
             totals["psnr"] += float(psnr)
             totals["rate_bpp"] += float(bpp_bits.detach())
             totals["latent_rms"] += float(y_hat.square().mean().sqrt().detach())
+            totals["normalization_strength"] += model.normalization_strength()
             steps += 1
 
     return {k: v / max(steps, 1) for k, v in totals.items()}
@@ -901,7 +1011,7 @@ def train_image_codec(
     ) = None,
     run_dir: Path | None = None,
 ) -> ImageCodecResult:
-    """Single-stage rate-distortion training for KakeyaHyperpriorCodec.
+    """Stage-scheduled rate-distortion training for KakeyaHyperpriorCodec.
 
     Total = MSE + lambda_rate * bpp + lambda_kakeya * kakeya_coverage.
     """
@@ -932,16 +1042,14 @@ def train_image_codec(
         collate_fn=_size_aware_collate,
     )
 
-    hyper_dim = max(4, config.latent_dim // 2)
+    hyper_dim = max(8, config.latent_dim)
     model = KakeyaHyperpriorCodec(latent_dim=config.latent_dim, hyper_dim=hyper_dim).to(
         device
     )
     model.init_scale_table()
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
-    aux_optimizer = optim.Adam(
-        [p for n, p in model.named_parameters() if n.endswith(".quantiles")],
-        lr=1e-3,
-    )
+    main_parameters, auxiliary_parameters = _optimizer_parameter_groups(model)
+    optimizer = optim.AdamW(main_parameters, lr=config.learning_rate)
+    aux_optimizer = optim.Adam(auxiliary_parameters, lr=1e-3)
 
     lambda_rate = float(config.objective.get("lambda_rate", RATE_LOSS_WEIGHT))
     lambda_kakeya = float(config.objective.get("lambda_kakeya", 0.001))
@@ -1195,6 +1303,7 @@ def train_image_codec(
         "final_stage": "finetune" if gate_epoch else "capacity",
         "lambda_rate": lambda_rate,
         "lambda_kakeya": lambda_kakeya,
+        "normalization_strength": model.normalization_strength(),
         "config": config.to_dict(),
         "capacity_gate_passed": gate_epoch is not None,
         "capacity_gate_forced": gate_forced,
@@ -1475,7 +1584,7 @@ def _laplacian(image: torch.Tensor) -> torch.Tensor:
 
 
 _SRGB_TO_LIN_COEFF = 1.0 / 12.92
-_SRGB_TO_LIN_EXP = 1.0 / 2.4
+_SRGB_TO_LIN_EXP = 2.4
 _SRGB_TO_LIN_OFFSET = 0.055
 _SRGB_TO_LIN_SCALE = 1.055
 
@@ -1511,9 +1620,14 @@ def _rgb_to_lab(rgb: torch.Tensor) -> torch.Tensor:
         xyz = lin
     ref = _D65_XYZ.to(lin.device).view(1, 3, 1, 1)
     xyz_norm = xyz / ref
+    # torch.where evaluates both branches.  Feeding zero or a tiny negative
+    # MPS rounding result to x ** (1/3) leaves an infinite/NaN derivative in
+    # the inactive branch.  Values below LAB_DELTA_CUBED use the linear branch,
+    # so clamping only the cubic-root input is mathematically equivalent.
+    cubic_input = xyz_norm.clamp_min(_LAB_DELTA_CUBED)
     f = torch.where(
         xyz_norm > _LAB_DELTA_CUBED,
-        xyz_norm.pow(1.0 / 3.0),
+        cubic_input.pow(1.0 / 3.0),
         xyz_norm / _LAB_FACTOR + 4.0 / 29.0,
     )
     L = 116.0 * f[:, 1:2, :, :] - 16.0
@@ -1544,15 +1658,15 @@ def _lab_losses(
         ).mean()
         / 7.0
     )
-    # Hue: 1 - cos(Δh) handles angular wraparound, range [0, 2].
+    # Hue cosine distance handles angular wraparound without the undefined
+    # atan2(0, 0) gradient of neutral/low-chroma pixels.
     a_rec, b_rec = rec_lab[:, 1:2, :, :], rec_lab[:, 2:3, :, :]
     a_tgt, b_tgt = tgt_lab[:, 1:2, :, :], tgt_lab[:, 2:3, :, :]
-    h_rec = torch.atan2(b_rec, a_rec)
-    h_tgt = torch.atan2(b_tgt, a_tgt)
-    hue = (1.0 - torch.cos(h_rec - h_tgt)).mean() / 2.0
-    # Saturation: |Δchroma|, typical chroma scale 0-50.
     C_rec = torch.sqrt(a_rec.pow(2) + b_rec.pow(2) + 1e-8)
     C_tgt = torch.sqrt(a_tgt.pow(2) + b_tgt.pow(2) + 1e-8)
+    hue_cosine = (a_rec * a_tgt + b_rec * b_tgt) / (C_rec * C_tgt)
+    hue = ((1.0 - hue_cosine.clamp(-1.0, 1.0)) / 2.0).mean()
+    # Saturation: |Δchroma|, typical chroma scale 0-50.
     saturation = (C_rec - C_tgt).abs().mean() / 10.0
     return {"delta_e": delta_e, "hue": hue, "saturation": saturation}
 

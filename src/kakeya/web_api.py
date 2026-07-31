@@ -12,8 +12,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-import uvicorn
 import torch
+import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -260,9 +260,16 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
+    if architecture.get("version") != 3:
+        raise HTTPException(
+            status_code=409,
+            detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
+        )
     latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     model = KakeyaHyperpriorCodec(
-        latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
+        latent_dim=latent_dim,
+        hyper_dim=int(architecture.get("hyper_dim", max(8, latent_dim))),
     ).to(device)
 
     skip_keys = {
@@ -473,10 +480,17 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
         raise HTTPException(status_code=400, detail="无法加载模型检查点")
 
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
+    architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
+    if architecture.get("version") != 3:
+        raise HTTPException(
+            status_code=409,
+            detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
+        )
     latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     try:
         model = KakeyaHyperpriorCodec(
-            latent_dim=latent_dim, hyper_dim=max(4, latent_dim // 2)
+            latent_dim=latent_dim,
+            hyper_dim=int(architecture.get("hyper_dim", max(8, latent_dim))),
         ).to(device)
         # Exclude CDF buffers that mismatch shapes; update() repopulates them.
         skip_keys = {
