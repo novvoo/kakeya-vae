@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from kakeya.image_codec import (
+    TRAIN_MIX_CYCLE,
     BlendedInstanceNorm,
     DepthToSpace,
     KakeyaHyperpriorCodec,
@@ -14,8 +15,11 @@ from kakeya.image_codec import (
     _lab_losses,
     _laplacian,
     _optimizer_parameter_groups,
+    _restore_low_frequency_chroma,
     _rgb_to_lab,
+    _rgb_to_ycocg_chroma,
     _scale_conditioned_objective,
+    _training_step_count,
 )
 from kakeya.models import VAE
 
@@ -44,12 +48,13 @@ def test_image_codec_forward_pass() -> None:
     image = torch.rand(1, 3, 256, 256)
 
     mu = model.encode(image)
-    recon, _, _, _, yl, _ = model(image)
+    recon, _, _, _, yl, _, color_likelihoods = model(image)
     assert recon.shape == image.shape
     assert mu.shape == (1, 8, 64, 64)
     assert mu.abs().max() <= 3.0
     assert yl.shape == (1, 8, 64, 64)
     assert torch.isfinite(yl).all()
+    assert color_likelihoods.shape == (1, 2, 32, 32)
 
 
 def test_image_codec_finite_reconstruction() -> None:
@@ -72,11 +77,20 @@ def test_space_depth_blocks_preserve_expected_shapes() -> None:
     assert up(down(image)).shape == image.shape
 
 
+def test_training_mix_is_real_optimizer_step_ratio() -> None:
+    assert len(TRAIN_MIX_CYCLE) == 10
+    assert TRAIN_MIX_CYCLE.count("reference") == 4
+    assert TRAIN_MIX_CYCLE.count("procedural") == 3
+    assert TRAIN_MIX_CYCLE.count("real") == 3
+    assert _training_step_count(128) == 100
+    assert _training_step_count(32) == 30
+
+
 def test_hyperprior_rate_is_computable() -> None:
     model = KakeyaHyperpriorCodec(latent_dim=4)
     image = torch.rand(1, 3, 256, 256)
-    _, _, _, _, yl, zl = model(image)
-    total_rate = (-yl.log().sum() - zl.log().sum()) / image.size(0)
+    _, _, _, _, yl, zl, cl = model(image)
+    total_rate = (-yl.log().sum() - zl.log().sum() - cl.log().sum()) / image.size(0)
     assert total_rate > 0
     assert torch.isfinite(total_rate)
 
@@ -98,15 +112,40 @@ def test_hyperprior_bitstream_round_trip_uses_conditional_model(
     model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4).eval()
     model.update()
     image = torch.rand(1, 3, 32, 32)
-    latent = model.encode(image)
+    decoded, metadata = _encode_bitstream(model, image, tmp_path)
 
-    decoded, metadata = _encode_bitstream(model, latent, tmp_path)
-
-    assert decoded.shape == latent.shape
+    assert decoded.shape == image.shape
     assert torch.isfinite(decoded).all()
-    assert metadata["format"] == "Kakeya Hyperprior v5"
+    assert metadata["format"] == "Kakeya Hyperprior v6"
     assert metadata["bytes"] == (tmp_path / "reports/reconstruction.kky").stat().st_size
     assert metadata["bytes"] > metadata["header_bytes"]
+    assert metadata["color_bytes"] > 4
+
+
+def test_color_side_stream_restores_chroma_without_changing_luminance() -> None:
+    target = torch.zeros(1, 3, 32, 32)
+    target[:, 0] = 0.2
+    target[:, 1] = 0.7
+    target[:, 2] = 0.3
+    base = torch.full_like(target, 0.4)
+    color = torch.nn.functional.adaptive_avg_pool2d(
+        _rgb_to_ycocg_chroma(target), (4, 4)
+    ) * 32.0
+
+    restored = _restore_low_frequency_chroma(base, color)
+    base_error = torch.nn.functional.l1_loss(
+        _rgb_to_ycocg_chroma(base), _rgb_to_ycocg_chroma(target)
+    )
+    restored_error = torch.nn.functional.l1_loss(
+        _rgb_to_ycocg_chroma(restored), _rgb_to_ycocg_chroma(target)
+    )
+    base_luminance = (base[:, 0] + 2 * base[:, 1] + base[:, 2]) / 4
+    restored_luminance = (
+        restored[:, 0] + 2 * restored[:, 1] + restored[:, 2]
+    ) / 4
+
+    assert restored_error < base_error * 0.01
+    torch.testing.assert_close(restored_luminance, base_luminance)
 
 
 def test_small_image_objective_preserves_hd_weights() -> None:
@@ -198,11 +237,12 @@ def test_lab_losses_have_finite_gradients_for_achromatic_pixels() -> None:
 def test_kakeya_hyperprior_forward_pass() -> None:
     model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4)
     x = torch.rand(1, 3, 128, 128)
-    recon, mu, _, _, y_likelihoods, _ = model(x)
+    recon, mu, _, _, y_likelihoods, _, color_likelihoods = model(x)
     assert recon.shape == (1, 3, 128, 128)
     assert mu.shape == (1, 4, 32, 32)
     assert torch.isfinite(recon).all()
     assert torch.isfinite(y_likelihoods).all()
+    assert torch.isfinite(color_likelihoods).all()
 
 
 def test_custom_backbone_detail_head_receives_gradients() -> None:

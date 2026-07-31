@@ -261,7 +261,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != 3:
+    if architecture.get("version") != 4:
         raise HTTPException(
             status_code=409,
             detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
@@ -276,6 +276,9 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
         "entropy_bottleneck._offset",
         "entropy_bottleneck._quantized_cdf",
         "entropy_bottleneck._cdf_length",
+        "color_entropy_bottleneck._offset",
+        "color_entropy_bottleneck._quantized_cdf",
+        "color_entropy_bottleneck._cdf_length",
         "y_entropy_bottleneck._offset",
         "y_entropy_bottleneck._quantized_cdf",
         "y_entropy_bottleneck._cdf_length",
@@ -298,9 +301,8 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     source_image = Image.open(TEST_IMAGE).convert("RGB")
     source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
     source = source.permute(2, 0, 1).unsqueeze(0).to(device)
-    mu = model.encode(source)
-    decoded_latent, bitstream = _encode_bitstream(model, mu, run_dir)
-    reconstructed = model.decode(decoded_latent.to(device)).clamp(0, 1)
+    reconstructed, bitstream = _encode_bitstream(model, source, run_dir)
+    reconstructed = reconstructed.clamp(0, 1)
     mse = float(F.mse_loss(reconstructed, source))
     psnr = 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
     ssim = float(_ssim(reconstructed, source))
@@ -334,6 +336,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
         "bitstream_bytes": float(bitstream["bytes"]),
         "bitstream_payload_bytes": float(bitstream["payload_bytes"]),
         "bitstream_bpp": float(bitstream["bpp"]),
+        "color_bytes": float(bitstream["color_bytes"]),
     }
     metrics.update(hd_metrics)
 
@@ -481,7 +484,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
 
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != 3:
+    if architecture.get("version") != 4:
         raise HTTPException(
             status_code=409,
             detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
@@ -497,6 +500,9 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             "entropy_bottleneck._offset",
             "entropy_bottleneck._quantized_cdf",
             "entropy_bottleneck._cdf_length",
+            "color_entropy_bottleneck._offset",
+            "color_entropy_bottleneck._quantized_cdf",
+            "color_entropy_bottleneck._cdf_length",
             "y_entropy_bottleneck._offset",
             "y_entropy_bottleneck._quantized_cdf",
             "y_entropy_bottleneck._cdf_length",
@@ -525,14 +531,11 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     # model handles any resolution directly, so no tiling or rescaling is
     # needed; padding to a multiple of 8 (above) keeps the encoder happy.
     with torch.no_grad():
-        latent = model.encode(source)
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        decoded_latent, bitstream = _encode_bitstream(
-            model, latent, Path(temp_dir), write_file=False
-        )
-    with torch.no_grad():
-        reconstructed = model.decode(decoded_latent).clamp(0, 1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reconstructed, bitstream = _encode_bitstream(
+                model, source, Path(temp_dir), write_file=False
+            )
+        reconstructed = reconstructed.clamp(0, 1)
     bitstream_bytes = int(bitstream["bytes"])
     bpp = bitstream_bytes * 8 / (w * h)
 
@@ -568,6 +571,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             "psnr": float(psnr),
             "ssim": ssim,
             "bitstream_bytes": bitstream_bytes,
+            "color_bytes": int(bitstream["color_bytes"]),
             "bpp": float(bpp),
             "downscaled": False,
         },

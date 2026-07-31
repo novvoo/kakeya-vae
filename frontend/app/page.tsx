@@ -119,6 +119,8 @@ type ResultPayload = {
       format: string;
       bytes: number;
       payload_bytes: number;
+      structure_bytes: number;
+      color_bytes: number;
       header_bytes: number;
       bpp: number;
       requires_checkpoint: boolean;
@@ -1978,7 +1980,10 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
               <td>
                 图文 Kakeya VAE
                 <small>
-                  Hyperprior v5 · 条件高斯 · {latentShape.join("×")}
+                  Hyperprior v6 · 条件高斯 + 低频色度 · {latentShape.join("×")}
+                  {bitstream?.color_bytes
+                    ? ` · 色度 ${formatBytes(bitstream.color_bytes)}`
+                    : ""}
                 </small>
               </td>
               <td>

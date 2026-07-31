@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -44,6 +44,9 @@ LATENT_MEAN_BOUND = 5.0
 # / data combination simply cannot reach the threshold.
 TARGET_RATE_BPP = 2.5
 BITSTREAM_MAGIC = b"KKEYA-EB1"
+COLOR_DOWNSAMPLE = 8
+COLOR_QUANTIZATION_GAIN = 32.0
+COLOR_CHANNELS = 2
 SMALL_IMAGE_MAX_SIZE = 256
 SMALL_IMAGE_RATE_MULTIPLIER = 0.35
 SMALL_IMAGE_EDGE_WEIGHT = 5.0
@@ -53,7 +56,78 @@ SMALL_IMAGE_HIGH_FREQUENCY_WEIGHT = 1.0
 HD_CHECKPOINT_SIZE = 512
 HD_PSNR_MAX_REGRESSION = 0.1
 HD_SSIM_MAX_REGRESSION = 0.001
+HD_CHROMA_MAX_REGRESSION = 0.005
 MAX_GRAD_NORM = 5.0
+TRAIN_MIX_CYCLE = (
+    "reference",
+    "procedural",
+    "real",
+    "reference",
+    "procedural",
+    "real",
+    "reference",
+    "procedural",
+    "real",
+    "reference",
+)
+
+
+def _rgb_to_ycocg_chroma(image: torch.Tensor) -> torch.Tensor:
+    """Return fixed opponent-color channels without altering luminance."""
+    red, green, blue = image.unbind(dim=1)
+    co = red - blue
+    cg = green - 0.5 * (red + blue)
+    return torch.stack((co, cg), dim=1)
+
+
+def _ycocg_chroma_to_rgb(chroma: torch.Tensor) -> torch.Tensor:
+    """Map a Co/Cg delta to the corresponding zero-luminance RGB delta."""
+    co, cg = chroma.unbind(dim=1)
+    red = 0.5 * (co - cg)
+    green = 0.5 * cg
+    blue = -0.5 * (co + cg)
+    return torch.stack((red, green, blue), dim=1)
+
+
+def _low_frequency_chroma(
+    image: torch.Tensor, output_size: tuple[int, int]
+) -> torch.Tensor:
+    chroma = _rgb_to_ycocg_chroma(image)
+    if output_size == (
+        image.shape[-2] // COLOR_DOWNSAMPLE,
+        image.shape[-1] // COLOR_DOWNSAMPLE,
+    ):
+        return F.avg_pool2d(
+            chroma, kernel_size=COLOR_DOWNSAMPLE, stride=COLOR_DOWNSAMPLE
+        )
+    return F.adaptive_avg_pool2d(chroma, output_size)
+
+
+def _chroma_mae(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Measure the low-frequency color error that causes green/yellow drift."""
+    height = max(1, target.shape[-2] // COLOR_DOWNSAMPLE)
+    width = max(1, target.shape[-1] // COLOR_DOWNSAMPLE)
+    output_size = (height, width)
+    return F.l1_loss(
+        _low_frequency_chroma(reconstructed, output_size),
+        _low_frequency_chroma(target, output_size),
+    )
+
+
+def _restore_low_frequency_chroma(
+    reconstructed: torch.Tensor, color_latent: torch.Tensor
+) -> torch.Tensor:
+    """Replace only low-frequency Co/Cg while preserving luminance and detail."""
+    color_size = color_latent.shape[-2:]
+    side_chroma = color_latent / COLOR_QUANTIZATION_GAIN
+    base_chroma = _low_frequency_chroma(reconstructed, color_size)
+    chroma_delta = F.interpolate(
+        side_chroma - base_chroma,
+        size=reconstructed.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return (reconstructed + _ycocg_chroma_to_rgb(chroma_delta)).clamp(0, 1)
 
 
 class BlendedInstanceNorm(nn.Module):
@@ -240,6 +314,7 @@ class KakeyaHyperpriorCodec(nn.Module):
 
         # Entropy models
         self.entropy_bottleneck = EntropyBottleneck(hyper_dim)
+        self.color_entropy_bottleneck = EntropyBottleneck(COLOR_CHANNELS)
         self.gaussian_conditional = GaussianConditional(
             None
         )  # scale table set after h_s output
@@ -270,10 +345,25 @@ class KakeyaHyperpriorCodec(nn.Module):
         latent = self.g_a(image)
         return LATENT_MEAN_BOUND * torch.tanh(latent / LATENT_MEAN_BOUND)
 
-    def _synthesis(self, latent: torch.Tensor) -> torch.Tensor:
+    def _color_analysis(self, image: torch.Tensor) -> torch.Tensor:
+        output_size = (
+            max(1, image.shape[-2] // COLOR_DOWNSAMPLE),
+            max(1, image.shape[-1] // COLOR_DOWNSAMPLE),
+        )
+        return (
+            _low_frequency_chroma(image, output_size) * COLOR_QUANTIZATION_GAIN
+        )
+
+    def _synthesis(
+        self, latent: torch.Tensor, color_latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         features = self.g_s_features(latent)
         logits = self.rgb_head(features) + 0.25 * self.detail_head(features)
-        return torch.sigmoid(logits)
+        reconstructed = torch.sigmoid(logits)
+        if color_latent is None:
+            return reconstructed
+
+        return _restore_low_frequency_chroma(reconstructed, color_latent)
 
     def normalization_strength(self) -> float:
         strengths = [
@@ -286,6 +376,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
         """Encode an image with the learned hyperprior probability model."""
         mu = self._analysis(image)
+        color = self._color_analysis(image)
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
@@ -301,10 +392,12 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_strings = self.gaussian_conditional.compress(mu, indexes, means=mean)
+        color_strings = self.color_entropy_bottleneck.compress(color)
         return {
-            "strings": [y_strings, z_strings],
+            "strings": [y_strings, z_strings, color_strings],
             "shape": z.size()[-2:],
             "y_shape": mu.size()[-2:],
+            "color_shape": color.size()[-2:],
         }
 
     def decompress(
@@ -312,9 +405,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         strings: list[list[bytes]],
         shape: tuple[int, int],
         y_shape: tuple[int, int],
+        color_shape: tuple[int, int],
     ) -> torch.Tensor:
         """Decode an image using z to reconstruct y's conditional distribution."""
-        y_strings, z_strings = strings
+        y_strings, z_strings, color_strings = strings
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
@@ -328,7 +422,10 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=mean)
-        return self._synthesis(y_hat)
+        color_hat = self.color_entropy_bottleneck.decompress(
+            color_strings, color_shape
+        )
+        return self._synthesis(y_hat, color_hat)
 
     def init_scale_table(
         self, min_scale: float = 0.11, max_scale: float = 256, levels: int = 64
@@ -410,27 +507,41 @@ class KakeyaHyperpriorCodec(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         mu = self._analysis(image)
+        color = self._color_analysis(image)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
-        reconstructed = self._synthesis(y_hat)
-        return reconstructed, mu, None, y_hat, y_likelihoods, z_likelihoods
+        color_hat, color_likelihoods = self.color_entropy_bottleneck(color)
+        reconstructed = self._synthesis(y_hat, color_hat)
+        return (
+            reconstructed,
+            mu,
+            None,
+            y_hat,
+            y_likelihoods,
+            z_likelihoods,
+            color_likelihoods,
+        )
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         return self._analysis(image)
 
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self, latent: torch.Tensor, color_latent: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Decode latent tensor back to RGB image."""
-        return self._synthesis(latent)
+        return self._synthesis(latent, color_latent)
 
     def update(self, force: bool = False) -> None:
         """Update entropy bottleneck CDF tables (required before compress)."""
         self.entropy_bottleneck.update(force=force)
+        self.color_entropy_bottleneck.update(force=force)
         self.init_scale_table()
 
     def reconstruct(self, image: torch.Tensor) -> torch.Tensor:
@@ -442,6 +553,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         to the 7 integer bins from rounding to [-3,-2,…,3].
         """
         mu = self._analysis(image)
+        color = self._color_analysis(image)
         z = self.h_a(mu)
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
@@ -464,7 +576,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         #   y_hat = round((mu - mean) / scale) * scale + mean
         # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
         y_hat, _ = self.gaussian_conditional(mu, scale, mean)
-        return self._synthesis(y_hat)
+        color_hat = self.color_entropy_bottleneck.decompress(
+            self.color_entropy_bottleneck.compress(color), color.size()[-2:]
+        )
+        return self._synthesis(y_hat, color_hat)
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -686,6 +801,39 @@ def _size_aware_collate(
     return mini_batches
 
 
+def _training_step_count(train_size: int) -> int:
+    """Scale the default 100-step epoch while keeping complete 10-step cycles."""
+    return max(10, math.ceil((100 * train_size / 128) / 10) * 10)
+
+
+def _cycle_mini_batches(
+    loader: DataLoader,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    while True:
+        for batch in loader:
+            if isinstance(batch, list) and batch and isinstance(batch[0], (tuple, list)):
+                yield from batch
+            else:
+                yield batch
+
+
+def _balanced_training_batches(
+    reference_loader: DataLoader,
+    procedural_loader: DataLoader,
+    real_loader: DataLoader,
+    total_steps: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Interleave actual optimizer steps at the documented 40/30/30 ratio."""
+    iterators = {
+        "reference": _cycle_mini_batches(reference_loader),
+        "procedural": _cycle_mini_batches(procedural_loader),
+        "real": _cycle_mini_batches(real_loader),
+    }
+    for step in range(total_steps):
+        source = TRAIN_MIX_CYCLE[step % len(TRAIN_MIX_CYCLE)]
+        yield next(iterators[source])
+
+
 EpochCallback = Callable[[int, int, dict[str, float], dict[str, float], Path], None]
 
 
@@ -710,15 +858,19 @@ def _rate_consistency_check(
             .to(device)
         )
         with torch.no_grad():
-            mu = model.encode(source)
             # Get rate from forward pass
-            _, _, _, _, y_likelihoods, z_likelihoods = model(source)
+            reconstructed, _, _, _, y_likelihoods, z_likelihoods, color_likelihoods = (
+                model(source)
+            )
             rate_bpp = float(
-                (-y_likelihoods.log().sum() - z_likelihoods.log().sum())
+                (
+                    -y_likelihoods.log2().sum()
+                    - z_likelihoods.log2().sum()
+                    - color_likelihoods.log2().sum()
+                )
                 / (source.shape[-1] * source.shape[-2])
             )
-            quantized = model.decode(mu.round()).clamp(0, 1)
-            mse = float(F.mse_loss(quantized, source))
+            mse = float(F.mse_loss(reconstructed.clamp(0, 1), source))
         entry = {
             "scale": scale,
             "size": w,
@@ -752,8 +904,10 @@ def _checkpoint(
             "config": config.to_dict(),
             "architecture": {
                 "name": "kakeya_multiscale_hyperprior",
-                "version": 3,
+                "version": 4,
                 "hyper_dim": model.hyper_dim,
+                "color_channels": COLOR_CHANNELS,
+                "color_downsample": COLOR_DOWNSAMPLE,
             },
             "epoch": epoch,
         },
@@ -807,18 +961,26 @@ def _calibration_metrics(
     model: KakeyaHyperpriorCodec, source: torch.Tensor
 ) -> dict[str, float]:
     model.eval()
-    reconstructed, _, _, _, y_likelihoods, z_likelihoods = model(source)
+    reconstructed, _, _, _, y_likelihoods, z_likelihoods, color_likelihoods = model(
+        source
+    )
     reconstructed = reconstructed.clamp(0, 1)
     mse = float(F.mse_loss(reconstructed, source))
     rate_bpp = float(
-        (-y_likelihoods.log2().sum() - z_likelihoods.log2().sum())
+        (
+            -y_likelihoods.log2().sum()
+            - z_likelihoods.log2().sum()
+            - color_likelihoods.log2().sum()
+        )
         / (source.shape[-1] * source.shape[-2])
     )
+    chroma_mae = float(_chroma_mae(reconstructed, source))
     return {
         "mse": mse,
         "psnr": 99.0 if mse == 0 else 10 * math.log10(1.0 / mse),
         "ssim": float(_ssim(reconstructed, source)),
         "rate_bpp": rate_bpp,
+        "chroma_mae": chroma_mae,
     }
 
 
@@ -844,7 +1006,7 @@ def _scale_conditioned_objective(
 
 def _hyperprior_epoch(
     model: KakeyaHyperpriorCodec,
-    loader: DataLoader,
+    loader: Iterable[Any],
     device: torch.device,
     lambda_rate: float = 1.0,
     lambda_kakeya: float = 0.001,
@@ -872,6 +1034,7 @@ def _hyperprior_epoch(
         "lab": 0.0,
         "hue": 0.0,
         "saturation": 0.0,
+        "chroma": 0.0,
         "kakeya": 0.0,
         "rate": 0.0,
         "psnr": 0.0,
@@ -889,10 +1052,20 @@ def _hyperprior_epoch(
         for images, _ in mini_batches:
             images = images.to(device)
             with torch.set_grad_enabled(optimizer is not None):
-                reconstructed, _, _, y_hat, y_likelihoods, z_likelihoods = model(images)
+                (
+                    reconstructed,
+                    _,
+                    _,
+                    y_hat,
+                    y_likelihoods,
+                    z_likelihoods,
+                    color_likelihoods,
+                ) = model(images)
                 loss_mse = F.mse_loss(reconstructed, images)
                 rate = (
-                    -y_likelihoods.log2().sum() - z_likelihoods.log2().sum()
+                    -y_likelihoods.log2().sum()
+                    - z_likelihoods.log2().sum()
+                    - color_likelihoods.log2().sum()
                 ) / images.size(0)
                 bpp_bits = rate / (images.shape[-1] * images.shape[-2])
 
@@ -918,6 +1091,7 @@ def _hyperprior_epoch(
                     lab = lab_losses["delta_e"]
                     hue = lab_losses["hue"]
                     sat = lab_losses["saturation"]
+                    chroma = _chroma_mae(reconstructed, images)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
 
                     total = (
@@ -929,6 +1103,7 @@ def _hyperprior_epoch(
                         + sw["lab"] * lab
                         + sw["hue"] * hue
                         + sw["saturation"] * sat
+                        + sw["chroma"] * chroma
                         + sw["kakeya"] * coverage
                         + effective_rate_weight * rate_penalty
                     )
@@ -940,6 +1115,7 @@ def _hyperprior_epoch(
                     lab = torch.zeros_like(loss_mse)
                     hue = torch.zeros_like(loss_mse)
                     sat = torch.zeros_like(loss_mse)
+                    chroma = torch.zeros_like(loss_mse)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
                     total = (
                         loss_mse + lambda_rate * rate_penalty + lambda_kakeya * coverage
@@ -957,7 +1133,10 @@ def _hyperprior_epoch(
                     optimizer.step()
                     if aux_optimizer is not None:
                         aux_optimizer.zero_grad(set_to_none=True)
-                        aux_loss = model.entropy_bottleneck.loss()
+                        aux_loss = (
+                            model.entropy_bottleneck.loss()
+                            + model.color_entropy_bottleneck.loss()
+                        )
                         aux_loss.backward()
                         auxiliary_parameters = [
                             parameter
@@ -979,6 +1158,7 @@ def _hyperprior_epoch(
             totals["lab"] += float(lab.detach())
             totals["hue"] += float(hue.detach())
             totals["saturation"] += float(sat.detach())
+            totals["chroma"] += float(chroma.detach())
             totals["kakeya"] += float(coverage.detach())
             totals["rate"] += float(rate.detach())
             totals["psnr"] += float(psnr)
@@ -1073,8 +1253,10 @@ def train_image_codec(
     best_psnr = float("-inf")
     best_hd_psnr_seen = float("-inf")
     best_hd_ssim_seen = float("-inf")
+    best_hd_chroma_seen = float("inf")
     selected_hd_psnr: float | None = None
     selected_hd_ssim: float | None = None
+    selected_hd_chroma: float | None = None
     best_epoch: int | None = None
     gate_epoch: int | None = None
     gate_forced: bool = False
@@ -1142,58 +1324,26 @@ def train_image_codec(
             "stage_weights": sw,
         }
 
-        if capacity_stage:
-            # Capacity stage: train on reference card, procedural, real images
-            ref_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=capacity_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            prog_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=train_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            real_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=real_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            train_metrics = {
-                key: 0.4 * ref_metrics[key]
-                + 0.3 * prog_metrics[key]
-                + 0.3 * real_metrics[key]
-                for key in ref_metrics
+        training_steps = _training_step_count(train_size)
+        train_metrics = _hyperprior_epoch(
+            **epoch_kw,
+            loader=_balanced_training_batches(
+                capacity_loader,
+                train_loader,
+                real_loader,
+                training_steps,
+            ),
+            optimizer=optimizer,
+            aux_optimizer=aux_optimizer,
+        )
+        train_metrics.update(
+            {
+                "training_steps": float(training_steps),
+                "reference_step_fraction": 0.4,
+                "procedural_step_fraction": 0.3,
+                "real_step_fraction": 0.3,
             }
-        else:
-            # Finetune/transition: train on procedural + real + rehearsal (reference card)
-            ref_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=capacity_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            prog_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=train_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            real_metrics = _hyperprior_epoch(
-                **epoch_kw,
-                loader=real_loader,
-                optimizer=optimizer,
-                aux_optimizer=aux_optimizer,
-            )
-            train_metrics = {
-                key: 0.25 * ref_metrics[key]
-                + 0.375 * prog_metrics[key]
-                + 0.375 * real_metrics[key]
-                for key in ref_metrics
-            }
+        )
 
         validation_metrics = _hyperprior_epoch(
             **epoch_kw,
@@ -1204,6 +1354,9 @@ def train_image_codec(
         hd_calibration = _calibration_metrics(model, hd_reference)
         best_hd_psnr_seen = max(best_hd_psnr_seen, hd_calibration["psnr"])
         best_hd_ssim_seen = max(best_hd_ssim_seen, hd_calibration["ssim"])
+        best_hd_chroma_seen = min(
+            best_hd_chroma_seen, hd_calibration["chroma_mae"]
+        )
 
         # Capacity gate check (only when still in capacity stage)
         if capacity_stage:
@@ -1219,6 +1372,8 @@ def train_image_codec(
         hd_quality_preserved = (
             hd_calibration["psnr"] >= best_hd_psnr_seen - HD_PSNR_MAX_REGRESSION
             and hd_calibration["ssim"] >= best_hd_ssim_seen - HD_SSIM_MAX_REGRESSION
+            and hd_calibration["chroma_mae"]
+            <= best_hd_chroma_seen + HD_CHROMA_MAX_REGRESSION
         )
         if (
             calibration["psnr"] > best_psnr
@@ -1229,6 +1384,7 @@ def train_image_codec(
             best_epoch = epoch
             selected_hd_psnr = hd_calibration["psnr"]
             selected_hd_ssim = hd_calibration["ssim"]
+            selected_hd_chroma = hd_calibration["chroma_mae"]
             _checkpoint(run_dir / "checkpoints/best.pt", model, config, epoch)
 
         train_metrics.update(
@@ -1240,8 +1396,10 @@ def train_image_codec(
                 "calibration_psnr": calibration["psnr"],
                 "calibration_ssim": calibration["ssim"],
                 "calibration_rate_bpp": calibration["rate_bpp"],
+                "calibration_chroma_mae": calibration["chroma_mae"],
                 "hd_calibration_psnr": hd_calibration["psnr"],
                 "hd_calibration_ssim": hd_calibration["ssim"],
+                "hd_calibration_chroma_mae": hd_calibration["chroma_mae"],
                 "hd_quality_preserved": float(hd_quality_preserved),
             }
         )
@@ -1254,8 +1412,10 @@ def train_image_codec(
                 "calibration_psnr": calibration["psnr"],
                 "calibration_ssim": calibration["ssim"],
                 "calibration_rate_bpp": calibration["rate_bpp"],
+                "calibration_chroma_mae": calibration["chroma_mae"],
                 "hd_calibration_psnr": hd_calibration["psnr"],
                 "hd_calibration_ssim": hd_calibration["ssim"],
+                "hd_calibration_chroma_mae": hd_calibration["chroma_mae"],
                 "hd_quality_preserved": float(hd_quality_preserved),
             }
         )
@@ -1294,10 +1454,12 @@ def train_image_codec(
         "selected_checkpoint_psnr": best_psnr if best_epoch else None,
         "selected_checkpoint_hd_psnr": selected_hd_psnr,
         "selected_checkpoint_hd_ssim": selected_hd_ssim,
+        "selected_checkpoint_hd_chroma_mae": selected_hd_chroma,
         "hd_checkpoint_guard": {
             "size": HD_CHECKPOINT_SIZE,
             "max_psnr_regression": HD_PSNR_MAX_REGRESSION,
             "max_ssim_regression": HD_SSIM_MAX_REGRESSION,
+            "max_chroma_regression": HD_CHROMA_MAX_REGRESSION,
         },
         "target_rate_bpp": TARGET_RATE_BPP,
         "final_stage": "finetune" if gate_epoch else "capacity",
@@ -1339,12 +1501,12 @@ def _evaluate_chart(
     source_image = Image.open(TEST_IMAGE).convert("RGB")
     source = torch.from_numpy(np.asarray(source_image, dtype=np.float32) / 255.0)
     source = source.permute(2, 0, 1).unsqueeze(0).to(device)
-    mu = model.encode(source)
-    decoded_latent, bitstream = _encode_bitstream(model, mu, run_dir)
-    reconstructed = model.decode(decoded_latent.to(device)).clamp(0, 1)
+    reconstructed, bitstream = _encode_bitstream(model, source, run_dir)
+    reconstructed = reconstructed.clamp(0, 1)
     mse = float(F.mse_loss(reconstructed, source))
     psnr = 99.0 if mse == 0 else 10 * math.log10(1.0 / mse)
     ssim = float(_ssim(reconstructed, source))
+    chroma_mae = float(_chroma_mae(reconstructed, source))
 
     report_dir = run_dir / "reports"
     original_path = report_dir / "original.png"
@@ -1373,11 +1535,13 @@ def _evaluate_chart(
         "mse": mse,
         "psnr": psnr,
         "ssim": ssim,
+        "chroma_mae": chroma_mae,
         "latent_dim": float(model.latent_dim),
         "source_bytes": float(TEST_IMAGE.stat().st_size),
         "bitstream_bytes": float(bitstream["bytes"]),
         "bitstream_payload_bytes": float(bitstream["payload_bytes"]),
         "bitstream_bpp": float(bitstream["bpp"]),
+        "color_bytes": float(bitstream["color_bytes"]),
     }
     metrics.update(hd_metrics)
     return (
@@ -1410,10 +1574,10 @@ def _evaluate_hd_chart(
     if not TEST_IMAGE_HD.is_file():
         return {}
     hd_image = Image.open(TEST_IMAGE_HD).convert("RGB")
-    # Pad to a multiple of 4 (2× PixelShuffle requires divisibility by 4).
+    # Pad to a multiple of 8 so structure and chroma grids align.
     w, h = hd_image.size
-    pad_w = (4 - w % 4) % 4
-    pad_h = (4 - h % 4) % 4
+    pad_w = (8 - w % 8) % 8
+    pad_h = (8 - h % 8) % 8
     if pad_w or pad_h:
         hd_image = ImageOps.expand(
             hd_image, border=(0, 0, pad_w, pad_h), fill=(0, 0, 0)
@@ -1421,14 +1585,14 @@ def _evaluate_hd_chart(
     hd_tensor = torch.from_numpy(np.asarray(hd_image, dtype=np.float32) / 255.0)
     hd_tensor = hd_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
     with torch.no_grad():
-        mu_hd = model.encode(hd_tensor)
-        decoded_hd, hd_bitstream = _encode_bitstream(
-            model, mu_hd, run_dir, write_file=False
+        recon_hd, hd_bitstream = _encode_bitstream(
+            model, hd_tensor, run_dir, write_file=False
         )
-        recon_hd = model.decode(decoded_hd).clamp(0, 1)
+        recon_hd = recon_hd.clamp(0, 1)
     mse_hd = float(F.mse_loss(recon_hd, hd_tensor))
     psnr_hd = 99.0 if mse_hd == 0 else 10 * math.log10(1.0 / mse_hd)
     ssim_hd = float(_ssim(recon_hd, hd_tensor))
+    chroma_mae_hd = float(_chroma_mae(recon_hd, hd_tensor))
     pixels = w * h
     hd_image.save(report_dir / "original_hd.png")
     _to_image(recon_hd[0]).save(report_dir / "reconstruction_hd.png")
@@ -1445,6 +1609,7 @@ def _evaluate_hd_chart(
         "hd_psnr": psnr_hd,
         "hd_ssim": ssim_hd,
         "hd_mse": mse_hd,
+        "hd_chroma_mae": chroma_mae_hd,
         "hd_width": float(w),
         "hd_height": float(h),
         "hd_pixels": float(pixels),
@@ -1722,52 +1887,49 @@ def _run_directory(config: ExperimentConfig) -> Path:
 
 def _encode_bitstream(
     model: KakeyaHyperpriorCodec,
-    latent: torch.Tensor,
+    image: torch.Tensor,
     run_dir: Path,
     *,
     write_file: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Encode y with parameters reconstructed from the entropy-coded z."""
+    """Encode structure and low-frequency chroma into the real v6 payload."""
     import struct as _struct
 
     model.eval()
     model.update()
 
-    z = model.h_a(latent)
-    z_strings = model.entropy_bottleneck.compress(z)
-    z_hat = model.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-    params = model._apply_h_s(z_hat)
-    scale, mean = params.chunk(2, dim=1)
-    scale = scale.abs() + 1e-6
-    if scale.shape[-2:] != latent.shape[-2:]:
-        scale = F.interpolate(
-            scale, size=latent.shape[-2:], mode="bilinear", align_corners=False
-        )
-        mean = F.interpolate(
-            mean, size=latent.shape[-2:], mode="bilinear", align_corners=False
-        )
-    indexes = model.gaussian_conditional.build_indexes(scale)
-    y_strings = model.gaussian_conditional.compress(latent, indexes, means=mean)
-    y_hat = model.gaussian_conditional.decompress(y_strings, indexes, means=mean)
+    compressed = model.compress(image)
+    y_strings, z_strings, color_strings = compressed["strings"]
+    reconstructed = model.decompress(
+        compressed["strings"],
+        compressed["shape"],
+        compressed["y_shape"],
+        compressed["color_shape"],
+    )
 
-    # Pack: [z_len:4B][z_data][y_len:4B][y_data]
+    # Pack: [z_len:4B][z_data][y_len:4B][y_data][color_len:4B][color_data]
     payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
     payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
+    payload += _struct.pack(">I", len(color_strings[0])) + color_strings[0]
 
     file_bytes = len(payload)
     if write_file:
         bitstream_path = run_dir / "reports/reconstruction.kky"
         bitstream_path.parent.mkdir(parents=True, exist_ok=True)
         bitstream_path.write_bytes(payload)
-    height, width = latent.shape[-2] * 4, latent.shape[-1] * 4
+    height, width = image.shape[-2:]
     bitstream_bpp = file_bytes * 8 / (height * width)
-    return y_hat, {
+    return reconstructed, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
-        "format": "Kakeya Hyperprior v5",
+        "format": "Kakeya Hyperprior v6",
         "bytes": file_bytes,
-        "payload_bytes": len(z_strings[0]) + len(y_strings[0]),
-        "header_bytes": 8,
+        "payload_bytes": (
+            len(z_strings[0]) + len(y_strings[0]) + len(color_strings[0])
+        ),
+        "structure_bytes": len(z_strings[0]) + len(y_strings[0]) + 8,
+        "color_bytes": len(color_strings[0]) + 4,
+        "header_bytes": 12,
         "bpp": bitstream_bpp,
         "requires_checkpoint": True,
         "checkpoint": "checkpoints/final.pt",

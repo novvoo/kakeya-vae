@@ -243,6 +243,14 @@ graph TD
         IMG[RGB Image<br/>H x W x 3]
     end
 
+    subgraph COLOR["低频色度旁路"]
+        IMG --> YCOCG[固定 RGB → YCoCg<br/>提取 Co / Cg]
+        YCOCG --> CPOOL[Area Pool /8<br/>2×H/8×W/8]
+        CPOOL --> CGAIN[固定增益 ×32]
+        CGAIN --> CEB[Color EntropyBottleneck<br/>独立真实码流]
+        CEB --> C_HAT[c_hat / 32<br/>低频 Co / Cg]
+    end
+
     subgraph ANALYSIS["g_a — 分析变换"]
         IMG --> S2D1[SpaceToDepth<br/>PixelUnshuffle + Conv<br/>3→24, /2]
         S2D1 --> BIN1[BlendedInstanceNorm<br/>初始 90% IN + 10% raw]
@@ -293,14 +301,17 @@ graph TD
         SILU --> DETAIL[零初始化高频残差头<br/>depthwise + pointwise]
         BASE --> FUSE[base + 0.25 × detail]
         DETAIL --> FUSE
-        FUSE --> SIG[Sigmoid]
-        SIG --> OUT[RGB Output<br/>H x W x 3]
+        FUSE --> SIG[Sigmoid<br/>基础 RGB]
+        SIG --> CFUSE[固定 YCoCg 融合<br/>只替换低频 Co/Cg]
+        C_HAT --> CFUSE
+        CFUSE --> OUT[RGB Output<br/>H x W x 3]
     end
     style INPUT fill:#e1f5fe
     style ANALYSIS fill:#f3e5f5
     style HYPER fill:#e8eaf6
     style CONDITIONAL fill:#fce4ec
     style SYNTHESIS fill:#e8f5e9
+    style COLOR fill:#fff9c4
 ```
 
 ### 关键组件细节
@@ -335,21 +346,29 @@ graph LR
         M --> ADD[+]
         RES --> ADD
     end
+
+    subgraph LowFrequencyChromaSideStream
+        RGB[raw RGB] --> CO[固定 Co=R-B<br/>Cg=G-(R+B)/2]
+        CO --> POOL[Area Pool /8 + ×32]
+        POOL --> CODE[EntropyBottleneck]
+        CODE --> REPLACE[替换基础图低频 Co/Cg<br/>亮度与高频保持不变]
+    end
 ```
 
 | 维度 | 说明 |
 |---|---|
-| 熵模型 | EntropyBottleneck（超先验 z）+ GaussianConditional（条件高斯 y） |
+| 熵模型 | EntropyBottleneck（z）+ GaussianConditional（y）+ Color EntropyBottleneck（Co/Cg） |
 | 激活函数 | 分析侧 Residual GDN；合成侧 Residual IGDN |
 | 归一化 | BlendedInstanceNorm，初始 90% IN + 10% 原始幅度路径 |
 | 多尺度块 | 局部 3x3 与 dilation=2 分支融合 |
 | 下采样 | SpaceToDepth x 2 = 4x（保持文字精度） |
 | 上采样 | LearnedUpsample 2x + DepthToSpace 2x |
 | 输出 | 基础 RGB logits + 0.25 × 零初始化高频残差 |
-| 损失函数 | MSE + edge + structural + multiscale + Laplacian + color + λ·rate + λₖ·kakeya |
+| 色度保护 | 固定 YCoCg、/8 低频 Co/Cg 独立码流；绕过 InstanceNorm，不修改亮度和高频 |
+| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + chroma + λ·rate + λₖ·kakeya |
 | h_s 增强 | Self-Attention；大图使用 16x16 窗口 |
 | 潜空间 | 8 通道, ±5 bound, GaussianConditional 量化 |
-| checkpoint | 架构版本 3；旧主干明确不兼容 |
+| checkpoint | 架构版本 4，Kakeya Hyperprior v6 `[z,y,chroma]`；旧主干明确不兼容 |
 ---
 
 ## 3. 损失函数组成
@@ -358,7 +377,7 @@ graph LR
 
 ```math
 L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
-  + w_{hf}·Laplacian + w_l·ΔE + w_h·Hue + w_{sat}·Sat
+  + w_{hf}·Laplacian + w_l·ΔE + w_h·Hue + w_{sat}·Sat + w_c·Chroma
   + λₖ·Kakeya + λ·max(0, bpp - 2.5)
 ```
 
@@ -368,6 +387,7 @@ L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
 - Multiscale: 多尺度 L1（256/128/64 加权）
 - Laplacian: 256 及以下启用的二阶高频损失
 - LAB: CIELAB ΔE 色差 + 色相 + 饱和度
+- Chroma: /8 低频 opponent-color L1，直接约束 `R-G` 与 `B-G` 漂移
 - Kakeya: 潜空间方向覆盖正则化
 - Rate: 熵编码码率（`log2`），超出 2.5 bpp 的部分产生惩罚
 - λ = 0.01（默认），λₖ = 0.001（默认）
@@ -439,6 +459,12 @@ flowchart LR
         L3[validation_loader<br/>ProceduralDocumentDataset<br/>16-64 样本]
     end
 
+
+    L1 --> MIXER[Balanced step mixer<br/>每 10 个真实优化步骤]
+    L2 --> MIXER
+    CC2 --> MIXER
+    MIXER --> RATIO[4 reference + 3 procedural + 3 real<br/>真实梯度比例 40/30/30]
+
     COLLATE --> L1
     COLLATE --> L2
     COLLATE --> L3
@@ -454,19 +480,19 @@ KakeyaHyperpriorCodec 使用 Capacity → Transition → Finetune 三阶段权�
 
 ```mermaid
 flowchart TD
-    START([开始训练]) --> INIT[初始化架构版本 3<br/>BlendedIN + GDN/IGDN]
+    START([开始训练]) --> INIT[初始化架构版本 4<br/>v3 主干 + 低频 Co/Cg 旁路]
     INIT --> SPLIT_OPT[分离优化器参数<br/>main 不含 quantiles<br/>aux 仅含 quantiles]
-    SPLIT_OPT --> LOADERS[创建 DataLoaders<br/>ProceduralDocument + RealImage + Validation]
+    SPLIT_OPT --> LOADERS[创建 DataLoaders<br/>Reference + Procedural + RealImage + Validation]
     LOADERS --> LOOP{每个 epoch<br/>1 → config.epochs}
 
-    LOOP -->|是| PROC[_hyperprior_epoch<br/>Procedural 数据<br/>train=True]
-    PROC --> REAL[_hyperprior_epoch<br/>RealImage 数据<br/>train=True]
-    REAL --> CLIP[finite gradient check<br/>clip norm ≤ 5]
+    LOOP -->|是| MIX[Balanced step mixer<br/>4 ref + 3 proc + 3 real]
+    MIX --> TRAIN[_hyperprior_epoch<br/>100 个实际优化步骤]
+    TRAIN --> CLIP[finite gradient check<br/>clip norm ≤ 5]
     CLIP --> VALID[_hyperprior_epoch<br/>验证集<br/>train=False]
     VALID --> CALIB[_calibration_metrics<br/>确定性前向量化<br/>不构建 CDF]
     CALIB --> HD[512 高清校准<br/>PSNR/SSIM]
-    HD --> CKPT{256 PSNR 创新高<br/>且高清回退未越界?}
-    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 3]
+    HD --> CKPT{256 PSNR 创新高<br/>高清 PSNR/SSIM/Chroma<br/>回退均未越界?}
+    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 4]
     SAVE --> LOOP
     CKPT -->|否| LOOP
 
@@ -489,7 +515,7 @@ flowchart TD
 5. `bpp = rate / (H * W)` — 每像素比特
 6. `coverage = kakeya_regularization(unit_normalized_latent, num_projections=32, k=3)` — 挂谷覆盖正则
 7. 按尺寸选择小图条件权重或原高清权重
-8. 计算 MSE、edge、SSIM、multiscale、Laplacian、颜色、rate 与 Kakeya 总损失
+8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、低频 chroma、rate 与 Kakeya 总损失
 9. `total.backward()` 后检查梯度有限性并裁剪到 5，再更新主参数
 10. `aux_loss` 只更新 EntropyBottleneck 的 `quantiles`
 
@@ -504,9 +530,9 @@ flowchart TD
     PARSE --> SIZE_CHK{尺寸检查<br/>16-4096px}
     SIZE_CHK -->|过大| ERR1[400: 图片过大]
     SIZE_CHK -->|过小| ERR2[400: 图片过小]
-    SIZE_CHK -->|OK| PAD[4 倍数对齐<br/>黑色填充]
+    SIZE_CHK -->|OK| PAD[8 倍数对齐<br/>保证结构/色度网格一致]
 
-    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 3]
+    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 4]
     LOAD_CKPT --> MODEL[KakeyaHyperpriorCodec<br/>eval mode]
 
     MODEL --> ENCODE[y = model.encode(img)]
@@ -515,8 +541,11 @@ flowchart TD
     ZCODE --> PARAMS[h_s + Attention<br/>生成 mean/scale]
     ENCODE --> YCODE[GaussianConditional<br/>条件编码 y]
     PARAMS --> YCODE
+    MODEL --> CCODE[Color EntropyBottleneck<br/>解码 c_hat]
     YCODE --> RECONSTRUCT[IGDN 主干 + 高频头<br/>decode y_hat]
-    RECONSTRUCT --> CLAMP[clamp 0, 1]
+    RECONSTRUCT --> CFUSE[替换低频 Co/Cg]
+    CCODE --> CFUSE
+    CFUSE --> CLAMP[clamp 0, 1]
 
     CLAMP --> CROP[去除 padding<br/>恢复原始尺寸]
     CROP --> METRICS[计算真实 bytes / bpp<br/>PSNR / SSIM]
@@ -678,12 +707,12 @@ graph TD
         NEW_CAP_REAL[real_loader<br/>真实高清图<br/>assets/hd_images/<br/>多样色彩与纹理]
         NEW_REH[rehearsal_loader<br/>参考图多尺寸<br/>8 steps]
 
-        NEW_CAP_REF --> MERGE[合并训练<br/>40% ref + 30% prog + 30% real]
+        NEW_CAP_REF --> MERGE[交错训练步骤<br/>每 10 步: 4 ref + 3 prog + 3 real]
         NEW_CAP_PROG --> MERGE
         NEW_CAP_REAL --> MERGE
         MERGE --> NEW_REH
         NEW_REH -->|保证| GATE[闸门可通过<br/>参考图 PSNR≥26<br/>或 epoch≥40 强制过闸]
-        MERGE -->|保证| GEN[泛化能力<br/>多内容多尺度<br/>颜色分布广]
+        MERGE -->|保证| GEN[真实梯度比例 40/30/30<br/>不再只是指标加权]
     end
 
     OVERFIT -.->|修复| MERGE
@@ -697,15 +726,15 @@ graph TD
 
 ### 9.3 高清大图推理流程
 
-推理时不分块、不缩放，整图通过模型（padding 到 4 的倍数）：
+推理时不分块、不缩放，整图通过模型（padding 到 8 的倍数）：
 
 ```mermaid
 flowchart TD
     INPUT([输入图片<br/>任意尺寸 WxH]) --> CHK{尺寸检查}
     CHK -->|W or H > 4096| REJECT[拒绝: 超过 4096px]
-    CHK -->|OK| PAD[4 倍数对齐<br/>pad_w = (4 - W%4) % 4<br/>pad_h = (4 - H%4) % 4<br/>黑色填充]
+    CHK -->|OK| PAD[8 倍数对齐<br/>结构与色度网格共同对齐]
 
-    PAD --> LOAD[加载 architecture v3 checkpoint]
+    PAD --> LOAD[加载 architecture v4 checkpoint]
     LOAD --> ENCODE[分析主干<br/>→ H/4 x W/4 x 8]
     ENCODE --> Y[y = tanh bound ±5]
     Y --> HA[h_a → z]
@@ -713,9 +742,13 @@ flowchart TD
     ZCODE --> PARAMS[h_s + Attention<br/>mean / scale]
     Y --> YCODE[GaussianConditional<br/>条件编码并解码 y]
     PARAMS --> YCODE
+    PAD --> COLOR[RGB → Co/Cg<br/>/8 + ×32]
+    COLOR --> CCODE[Color EntropyBottleneck<br/>独立编码并解码]
     YCODE --> DECODE[IGDN 多尺度合成主干<br/>+ 高频 RGB 残差]
+    DECODE --> CFUSE[替换基础图低频 Co/Cg]
+    CCODE --> CFUSE
 
-    DECODE --> CLAMP[clamp 0, 1]
+    CFUSE --> CLAMP[clamp 0, 1]
     CLAMP --> CROP[去除 padding<br/>恢复 WxH]
     CROP --> OUT([输出重建图<br/>+ PSNR/SSIM/bpp])
 
@@ -761,6 +794,7 @@ graph LR
         ARCH3[全卷积<br/>无全连接层<br/>任意尺寸]
         ARCH4[PixelShuffle/Unshuffle<br/>2x 空间重排<br/>尺寸无关]
         ARCH5[512 高清 checkpoint 闸门<br/>PSNR/SSIM 回退保护]
+        ARCH6[低频 Co/Cg 独立码流<br/>绕过 InstanceNorm]
     end
 
     ARCH1 -.->|支持| I_LARGE
@@ -768,6 +802,7 @@ graph LR
     ARCH3 -.->|支持| I_LARGE
     ARCH4 -.->|支持| I_LARGE
     ARCH5 -.->|保护| I_LARGE
+    ARCH6 -.->|保护颜色| I_LARGE
 
     style S256 fill:#c8e6c9
     style I_SMALL fill:#c8e6c9
@@ -776,6 +811,15 @@ graph LR
 ```
 
 ### 9.5 高清大图颜色与亮度问题
+
+#### 当前方案：结构与低频色度分离
+
+架构 v4 保留已经验证的大图清晰度主干，同时把 `/8` 低频 Co/Cg 作为独立熵码流。
+解码端只替换基础图的低频色度，亮度和高频纹理由原 IGDN/高频头保留。该设计针对
+BlendedInstanceNorm 无法可靠携带输入通道均值的问题，不依赖网络重新学习颜色映射。
+
+训练数据通过 step mixer 按实际优化步骤执行 40% reference / 30% procedural /
+30% real；checkpoint 除 PSNR/SSIM 外还保护高清 chroma MAE。
 
 #### 9.5.1 历史诊断：过拟合导致颜色丢失
 

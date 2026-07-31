@@ -130,7 +130,7 @@ python start_lab.py --timeout 180
 | 训练模型 | 默认使用 256×256 RGB 图文模型 | `image_codec` |
 | 训练轮次 | 最大训练轮次 | 80 |
 | Batch size | 压缩微调阶段每个优化步骤使用的样本数 | 4 |
-| 空间潜在通道 | 32×32 潜变量的通道数 | 16 |
+| 空间潜在通道 | 256 输入对应 64×64 结构潜变量的通道数 | 8 |
 | 学习率 | AdamW 优化器学习率 | 0.0005 |
 | 随机种子 | 控制初始化、采样和数据子集 | 42 |
 | 计算设备 | 自动、CPU、MPS 或 CUDA | 自动 |
@@ -297,7 +297,7 @@ python scripts/codec_cli.py decode \
 ## 图文测试卡与训练配置
 
 网页默认选择"256 图文 Kakeya VAE"，并使用适合 Mac MPS 的起始参数
-（最大 80 轮、128 张训练卡、batch size 4、空间潜在通道 16），首页直接显示
+（最大 80 轮、128 张训练卡、batch size 4、空间潜在通道 8），首页直接显示
 内置测试图。验证仅在首轮、偶数轮和末轮执行，验证集最多 64 张；容量阶段固定
 `batch size = 1`、每轮 32 个优化步骤，避免把同一张卡复制成大 batch 消耗
 内存却没有增加更新次数。默认最大轮次为 80；模型一旦通过容量闸门就会自动切换
@@ -313,6 +313,9 @@ python scripts/codec_cli.py decode \
 | 参考图文卡 | 40% | Kakeya Codec Test Card v2，校准基准 |
 | 程序化图文卡 | 30% | 程序生成的随机图文样本 |
 | 真实高清图 | 30% | `assets/hd_images/` 目录下的真实图片 |
+
+上述比例由 step mixer 按实际反向传播步骤执行：每 10 步固定包含 4 步参考卡、
+3 步程序图和 3 步真实图，不是仅在汇总指标时乘权重。
 
 **强烈建议**在 `assets/hd_images/` 目录中放置 **10–30 张真实高清图**
 （512–1024px 或更高，JPG/PNG/WebP 均可），覆盖以下场景：
@@ -336,7 +339,9 @@ python scripts/codec_cli.py decode \
 但颜色与细节泛化效果会受限。
 
 传统图文模型（`ImageCodecVAE`）采用容量闸门控制的两阶段训练。
-超先验模型（`KakeyaHyperpriorCodec`）使用单阶段端到端训练，无需容量闸门或阶段切换。开始时关闭 KL 和 Kakeya，使用
+超先验模型（`KakeyaHyperpriorCodec`）使用 Capacity → Transition → Finetune
+三阶段权重调度。容量阶段优先建立结构与颜色还原能力，过闸后逐步加入完整码率
+约束。训练使用
 CompressAI EntropyBottleneck 的同一套中心量化路径做 straight-through 训练，
 让训练、验证和最终 `.kky` 解码看到一致的离散潜变量，并只优化文字加权重建、
 MSE、边缘、结构与多尺度损失；量化测试卡达到 PSNR 30 且结构保真 97% 后，
@@ -364,6 +369,9 @@ EntropyBottleneck + GaussianConditional 构成并行超先验熵模型。
 InstanceNorm 采用按通道可学习的混合形式，初始保留 90% 归一化路径和 10%
 原始幅度路径，使网络能在多尺度稳定性与输入相关的亮度、对比度统计之间自行
 调整。RGB 合成端另有零初始化的高频残差头，
+架构 v4 另将 `/8` 低频 YCoCg Co/Cg 编入独立 EntropyBottleneck；解码端
+只替换低频色度，因此绕过 InstanceNorm 的幅度统计损失，同时不改动亮度、
+文字边缘和高频纹理。真实 `.kky` v6 码流包含 `[z, y, chroma]` 三段。
 在降采样时先把像素无损搬到通道维再做特征混合，减少细字和一像素线条被步幅
 卷积提前抹掉的风险。训练结束后会自动对包含
 中英文、街景、细线、灰阶和色块的测试卡执行确定性编码和还原，并展示：
