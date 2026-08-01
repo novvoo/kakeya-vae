@@ -4,9 +4,9 @@
 
 ---
 
-## 1. 挂谷猜想 (Kakeya Conjecture) 与潜空间正则化
+## 1. 挂谷猜想 (Kakeya Conjecture) 与图像细管约束
 
-> 本项目的核心创新。受挂谷猜想启发，通过随机投影方向上的最大间距最大化潜变量的方向覆盖，避免 VAE 后验坍缩。
+> 本项目不再把 Kakeya 仅作为“潜变量均匀化”的名字，而是把它落实为图像域的多方向、多尺度细管响应：在紧凑支撑上保留目标图像已有的线段方向与连续性。
 
 ### 1.1 挂谷猜想的几何直觉
 
@@ -21,11 +21,11 @@ graph TD
         K2 --> K3
     end
 
-    subgraph 迁移到VAE潜空间
-        V1[潜变量 z ∈ R^d<br/>d 维潜在空间]
-        V2[问题: 后验坍缩<br/>部分维度失效<br/>信息集中在少数维度]
-        V3[挂谷正则思路<br/>通过随机投影方向上的<br/>最大间距最大化<br/>潜变量的方向覆盖]
-        V4[目标: 所有维度<br/>被充分且均匀利用<br/>避免维度退化]
+    subgraph 迁移到图像压缩
+        V1[目标图像<br/>文字、枝条、轮廓和纹理]
+        V2[问题: 小图量化后<br/>细线断裂、方向偏移<br/>或平滑区产生伪边缘]
+        V3[挂谷细管思路<br/>固定方向线核测量<br/>局部线段的连续支撑]
+        V4[目标: 保留目标已有方向<br/>同时限制无依据的细管泄漏]
 
         V1 --> V2
         V2 --> V3
@@ -34,8 +34,8 @@ graph TD
     end
 
     subgraph 与其他方法对比
-        C1[β-VAE / FactorVAE<br/>关注: 每个维度是否有用<br/>解耦表示]
-        C2[挂谷正则<br/>关注: 所有方向是否被覆盖<br/>方向覆盖完备性]
+        C1[普通像素/边缘损失<br/>关注: 点误差和局部梯度]
+        C2[挂谷细管损失<br/>关注: 方向线段跨尺度连续性<br/>及紧凑支撑]
         C1 -.->|互补| C2
     end
 
@@ -44,58 +44,32 @@ graph TD
     style C2 fill:#e1f5fe
 ```
 
-### 1.2 挂谷正则化算法 (kakeya_regularization)
+### 1.2 目标条件的多尺度细管损失
 
 ```mermaid
 flowchart TD
-    subgraph 输入
-        LATENT[潜变量 latent<br/>B x C x H x W<br/>C=config.latent_dim, 默认 8]
-        RESHAP[重塑为点集<br/>permute → B*H*W x C<br/>每个像素位置一个 C 维向量]
-        NORM[L2 归一化<br/>F.normalize dim=1<br/>投影到单位球面]
-        LATENT --> RESHAP
-        RESHAP --> NORM
-    end
+    REC[重建图] --> RE[RGB 一阶边缘强度]
+    TAR[目标图] --> TE[RGB 一阶边缘强度<br/>目标分支 detach]
+    K[固定抗锯齿线核<br/>12 个方向 × 长度 5/9/17]
+    RE --> RC[多尺度方向卷积响应]
+    TE --> TC[多尺度方向卷积响应]
+    K --> RC
+    K --> TC
+    RC --> L1[Tube: Smooth-L1<br/>保持局部线段响应]
+    TC --> L1
+    RC --> L2[Direction: 方向直方图 L1<br/>匹配目标中实际存在的方向]
+    TC --> L2
+    RC --> L3[Leakage: 目标条件的超额响应<br/>抑制平滑区伪线与光晕]
+    TC --> L3
+    L1 --> OUT[TubeLoss = Tube + 0.25 Direction + 0.25 Leakage]
+    L2 --> OUT
+    L3 --> OUT
 
-    subgraph 随机投影方向
-        DIR[生成 num_projections 个<br/>随机方向向量<br/>32 x C<br/>config: num_projections=32]
-        NORM_DIR[归一化到单位球面<br/>F.normalize dim=1]
-        DIR --> NORM_DIR
-    end
-
-    subgraph 投影与排序
-        PROJ[z @ directions.T<br/>N x num_projections<br/>每个点在各方向的投影值]
-        SORT[按方向排序<br/>torch.sort dim=0]
-        PROJ --> SORT
-    end
-
-    NORM --> PROJ
-    NORM_DIR --> PROJ
-
-    subgraph 间距计算
-        DIFF[相邻投影差<br/>sorted.diff dim=0<br/>N-1 x num_projections]
-        TOPK[取 top-k 最大间距<br/>k=min config.k=3, N-1<br/>torch.topk dim=0]
-        MEAN[取均值<br/>负号: 最大化间距]
-        SORT --> DIFF
-        DIFF --> TOPK
-        TOPK --> MEAN
-    end
-
-    MEAN --> OUT[coverage loss<br/>标量<br/>负的 top-k 间距均值]
-
-    subgraph 直觉解释
-        INT1[间距大 = 该方向上<br/>潜变量分布稀疏<br/>存在未覆盖区域]
-        INT2[最大化间距最小化<br/>= 填补稀疏方向<br/>均匀覆盖所有方向]
-        INT1 --> INT2
-    end
-
-    OUT -.-> INT2
-
-    style LATENT fill:#e1f5fe
-    style NORM fill:#f3e5f5
-    style PROJ fill:#fff3e0
+    style K fill:#fff3e0
     style OUT fill:#c8e6c9
-    style INT2 fill:#fff9c4
 ```
+
+`num_projections` 现在表示固定细管方向数（默认 12），`k` 表示启用的尺度数（默认 3），不再进行每批随机潜空间投影。目标条件化很重要：模型只需保存输入本来具有的方向，不会被迫在天空、色块等区域“凑齐所有方向”。
 
 ### 1.3 挂谷正则在训练中的集成
 
@@ -112,69 +86,42 @@ graph TD
         QUANT --> DEC
     end
 
-    subgraph 挂谷正则计算路径
-        L1[y_hat: B x C x H/4 x W/4<br/>C 默认 8]
-        L2[permute → B x H/4 x W/4 x C]
-        L3[reshape → B*H/4*W/4 x C<br/>每个空间位置一个 C 维点]
-        L4[F.normalize dim=1<br/>归一化到单位球面]
-        L5[kakeya_regularization<br/>32 方向投影 + top-k 间距]
-        L6[coverage = -mean top-k gaps<br/>负号: 最大化覆盖]
-
-        L1 --> L2
-        L2 --> L3
-        L3 --> L4
-        L4 --> L5
-        L5 --> L6
+    subgraph 挂谷细管计算路径（仅 ≤256）
+        L1[重建与目标 RGB 边缘]
+        L2[12 方向 × 3 尺度固定卷积]
+        L3[Tube + Direction + Leakage]
+        L4[可微 TubeLoss<br/>梯度回到 decoder、latent 与 encoder]
+        L1 --> L2 --> L3 --> L4
     end
 
-    QUANT -.->|latent| L1
+    DEC --> L1
+    IMG --> L1
 
     subgraph 损失加权
-        KW[kakeya_weight = config.lambda_kakeya<br/>默认 0.001]
-        KC[kakeya_contribution<br/>= lambda_kakeya * coverage]
+        KW[lambda_kakeya 默认 0.1<br/>阶段倍率 0.5 → 0.75 → 1.0]
+        KC[kakeya_contribution<br/>= lambda_kakeya * TubeLoss]
         TOTAL[total loss<br/>= MSE + lambda·rate + lambda_k·kakeya]
 
-        L6 --> KC
+        L4 --> KC
         KW --> KC
         KC --> TOTAL
     end
 ```
 
-### 1.4 挂谷正则对潜空间的影响
+### 1.4 反向传播与维数监控的边界
 
 ```mermaid
-graph LR
-    subgraph 无挂谷正则
-        BAD1[潜空间分布<br/>部分维度坍缩<br/>信息集中]
-        BAD2[方向覆盖<br/>存在大量未覆盖方向<br/>投影间距大]
-        BAD3[重建效果<br/>潜在容量浪费<br/>泛化能力差]
-        BAD1 --> BAD2
-        BAD2 --> BAD3
-    end
+flowchart LR
+    TL[连续细管响应损失] -->|有梯度| DEC2[decoder]
+    DEC2 --> LAT[量化潜变量与 encoder]
+    DIM[Box-counting 维数代理<br/>edge threshold + max-pool<br/>尺度 1/2/4] -->|no_grad，仅指标| LOG[训练日志<br/>dimension / error]
+    DIM -.->|不进入 total loss| DEC2
 
-    subgraph 有挂谷正则
-        GOOD1[潜空间分布<br/>各维度充分利用<br/>分布均匀]
-        GOOD2[方向覆盖<br/>所有方向被覆盖<br/>投影间距小]
-        GOOD3[重建效果<br/>潜在容量最大化<br/>泛化能力强]
-        GOOD1 --> GOOD2
-        GOOD2 --> GOOD3
-    end
-
-    BAD2 -.->|挂谷正则<br/>最大化方向覆盖| GOOD2
-
-    subgraph 可视化说明
-        VIZ1[2D 示意: 潜变量在单位球面上的分布]
-        VIZ2[无正则: 点集中在少数区域<br/>大块空白方向]
-        VIZ3[有正则: 点均匀散布<br/>所有方向有覆盖]
-        VIZ1 --> VIZ2
-        VIZ1 --> VIZ3
-    end
-
-    style BAD2 fill:#ffcdd2
-    style GOOD2 fill:#c8e6c9
-    style VIZ2 fill:#fce4ec
-    style VIZ3 fill:#c8e6c9
+    style TL fill:#c8e6c9
+    style DIM fill:#fff9c4
 ```
+
+细管损失必须参与反向传播，否则不能改善重建。维数代理刻意不参与：它包含硬阈值与占据计数，几乎处处零梯度；若改成软计数，模型又可通过抬高背景噪声来虚增“维数”。因此它只用于观察结构复杂度是否偏离目标。
 
 ### 1.5 挂谷猜想 → 图像编解码 完整链路
 
@@ -189,21 +136,19 @@ flowchart TD
     end
 
     subgraph 算法实现
-        A1[潜变量点集<br/>latent → N x C 点<br/>L2 归一化到球面]
-        A2[随机投影方向<br/>num_projections=32<br/>随机单位向量]
-        A3[投影排序求间距<br/>sort → diff → top-k<br/>k=3]
-        A4[覆盖损失<br/>-mean top-k gaps<br/>最大化最小间距]
-        A1 --> A2
-        A2 --> A3
-        A3 --> A4
+        A1[目标与重建的边缘场]
+        A2[固定方向细管响应<br/>12 方向]
+        A3[多尺度线段支撑<br/>长度 5/9/17]
+        A4[连续性 + 方向分布 + 泄漏损失]
+        A1 --> A2 --> A3 --> A4
     end
 
     M3 -.->|方向覆盖思想| A2
-    M3 -.->|最小化最大间距| A4
+    M3 -.->|紧凑支撑思想| A4
 
     subgraph 训练集成 (KakeyaHyperpriorCodec)
         T1[图像 → encoder → latent]
-        T2[latent → 挂谷覆盖损失]
+        T2[重建 + 目标 → 挂谷细管损失]
         T3[latent → decoder → 重建]
         T4[尺度条件总损失<br/>重建 + 高频 + 颜色 + λ·rate + λₖ·kakeya<br/>Capacity → Transition → Finetune]
         T1 --> T2
@@ -215,10 +160,10 @@ flowchart TD
     A4 -.-> T2
 
     subgraph 最终效果
-        F1[潜空间充分利用<br/>C 维方向覆盖更均匀]
-        F2[目标: 提升重建质量<br/>在给定码率下提高信息利用率]
-        F3[码率稳定<br/>熵编码效率优]
-        F4[泛化能力强<br/>多尺度多内容]
+        F1[细线跨像素连续<br/>方向不易偏转]
+        F2[目标: 提升 256 及以下<br/>文字、枝条与轮廓还原]
+        F3[目标条件化<br/>不强迫生成不存在的方向]
+        F4[高清路径隔离<br/>384 及以上权重与计算均不变]
         F1 --> F2
         F1 --> F3
         F1 --> F4
@@ -392,7 +337,7 @@ graph LR
 | Detail 输入 | `YCoCg - upsample(low-frequency YCoCg)`；不再重复编码 Base |
 | Detail 输出 | `2·tanh` 有符号 YCoCg 残差，直接与 expanded Base 相加；无 Sigmoid |
 | Base 分支 | 完整低频 Y/Co/Cg、/8 采样、4 通道可学习 latent；无 IN，独立码流 |
-| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + Base + Detail high-pass + λ·rate + λₖ·kakeya |
+| 损失函数 | MSE + edge + structural + multiscale + Laplacian + flat-region anti-ringing + LAB + Base + Detail + λ·rate + λₖ·kakeya |
 | h_s 增强 | Self-Attention；大图使用 16x16 窗口 |
 | 潜空间 | 8 通道, ±5 bound, GaussianConditional 量化 |
 | checkpoint | 架构版本 8，Kakeya Hyperprior v10 `[z,y_detail,y_base]`；明确不兼容旧架构 |
@@ -404,7 +349,7 @@ graph LR
 
 ```math
 L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
-  + w_{hf}·Laplacian + w_l·ΔE + w_h·Hue + w_{sat}·Sat
+  + w_{hf}·Laplacian + w_f·FlatHF + w_l·ΔE + w_h·Hue + w_{sat}·Sat
   + w_b·BaseL1 + w_d·DetailL1
   + λₖ·Kakeya + λ·max(0, bpp - 2.5)
 ```
@@ -414,14 +359,16 @@ L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
 - Structural: 1 - SSIM 结构相似性
 - Multiscale: 多尺度 L1（256/128/64 加权）
 - Laplacian: 256 及以下启用的二阶高频损失
+- FlatHF: 仅在目标局部平滑区域约束 Laplacian 误差，抑制色块伪纹理和边缘光晕
 - LAB: CIELAB ΔE 色差 + 色相 + 饱和度
 - BaseL1: `/8` 低频 Y/Co/Cg L1，约束绝对亮度、对比度和色度
 - DetailL1: 去除 Base 后的有符号高频 Y/Co/Cg L1，直接监督文字与纹理
-- Kakeya: 潜空间方向覆盖正则化
+- Kakeya: 目标条件的多方向、多尺度细管响应损失；仅 256 及以下参与优化
+- Kakeya dimension: box-counting 结构维数代理，仅记录指标，不参与反向传播
 - Rate: 熵编码码率（`log2`），超出 2.5 bpp 的部分产生惩罚
-- λ = 0.01（默认），λₖ = 0.001（默认）
+- λ = 0.01（默认），λₖ = 0.1（默认）；阶段 `kakeya` 是 0.5/0.75/1.0 倍率
 - 各阶段权重由 `config.stage_weights()` 管理
-- 256 及以下：rate ×0.35、edge ≥5、structural ≥1.2、multiscale ≤0.2
+- 256 及以下：rate ×0.35、edge ≥4、structural ≥1.2、multiscale ≤0.2、Laplacian 0.5、FlatHF 0.5
 - 384 及以上：保持原阶段权重
 ---
 ---
@@ -542,9 +489,9 @@ flowchart TD
 3. `loss_mse = F.mse_loss(reconstructed, images)` — 重建损失
 4. `rate = (-log p(y_hat) - log p(z_hat)) / batch_size` — 熵编码码率
 5. `bpp = rate / (H * W)` — 每像素比特
-6. `coverage = kakeya_regularization(unit_normalized_latent, num_projections=32, k=3)` — 挂谷覆盖正则
+6. 对 256 及以下计算 `TubeLoss(reconstructed, target, directions=12, scales=3)`；Tube/Direction/Leakage 参与反向传播，box-counting 维数代理仅监控
 7. 按尺寸选择小图条件权重或原高清权重
-8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、Base、Detail high-pass、rate 与 Kakeya 总损失
+8. 计算 MSE、edge、SSIM、multiscale、Laplacian、FlatHF anti-ringing、LAB、Base、Detail、rate 与 Kakeya 总损失
 9. `total.backward()` 后检查梯度有限性并裁剪到 5，再更新主参数
 10. `aux_loss` 只更新 EntropyBottleneck 的 `quantiles`
 
@@ -597,8 +544,8 @@ flowchart TD
 4. `rate = (-log2 p(y_hat) - log2 p(z_hat)) / batch_size` — 熵编码码率（bits）
 5. `bpp_bits = rate / (H * W)` — 每像素比特
 6. `rate_penalty = ReLU(bpp_bits - 2.5)` — 仅超出目标的码率产生惩罚
-7. 感知损失：edge、structural、multiscale、Laplacian、lab、hue、saturation
-8. `total = w_m·MSE + w_e·edge + w_s·structural + ... + λₖ·coverage + λ·rate_penalty` — 总损失
+7. 感知损失：edge、structural、multiscale、Laplacian、FlatHF anti-ringing、lab、hue、saturation
+8. `total = w_m·MSE + w_e·edge + w_s·structural + ... + λₖ·stage_k·TubeLoss + λ·rate_penalty` — 总损失
 9. 主损失反向传播后检查有限性、裁剪梯度，再更新非 quantiles 参数
 10. `aux_loss` 仅更新 EntropyBottleneck 的 quantiles
 
@@ -945,9 +892,9 @@ flowchart TD
 
 | 阶段 | 损失权重 (config.stage_weights) | kakeya | 设计意图 |
 |------|--------------------------------|--------|----------|
-| Capacity | mse 3.0 / structural 0.1 / lab 0.02 | 0.002 | 专注方向覆盖，mse/structural/lab 用低权重做"种子" |
-| Transition | mse 5.0 / structural 0.25 / lab 0.05 | 0.001 | 权重递增，感知约束逐步强化 |
-| Finetune | mse 5.0 / structural 0.5 / lab 0.10 + rate | 0.0005 | 全部权重最高，协同优化码率与画质 |
+| Capacity | mse 3.0 / edge 1.0 / structural 0.2 / lab 0.05 | 0.5 | 先以半强度建立细管连续性 |
+| Transition | mse 2.0 / edge 1.5 / structural 0.4 / lab 0.08 | 0.75 | 平滑递增方向与泄漏约束 |
+| Finetune | mse 3.0 / edge 2.0 / structural 0.6 / lab 0.12 + rate | 1.0 | 使用完整 λₖ 协同优化小图画质 |
 
 ```mermaid
 flowchart TD
@@ -963,10 +910,10 @@ flowchart TD
         R1 --> R2 --> R3
     end
 
-    subgraph 解决方案：所有损失全程参与，权重递增
-        S1[Capacity: 全部损失参与<br/>mse 3.0 / structural 0.1 / lab 0.02<br/>kakeya 0.002]
-        S2[Transition: 权重递增<br/>mse 5.0 / structural 0.25 / lab 0.05<br/>kakeya 0.001]
-        S3[Finetune: 权重最高<br/>structural 0.5 / lab 0.10 + rate<br/>kakeya 0.0005]
+    subgraph 解决方案：所有损失全程参与，分阶段调整侧重
+        S1[Capacity<br/>mse 3.0 / edge 1.0 / structural 0.2<br/>kakeya multiplier 0.5]
+        S2[Transition<br/>mse 2.0 / edge 1.5 / structural 0.4<br/>kakeya multiplier 0.75]
+        S3[Finetune + rate<br/>mse 3.0 / edge 2.0 / structural 0.6<br/>kakeya multiplier 1.0]
         S1 --> S2 --> S3
     end
 

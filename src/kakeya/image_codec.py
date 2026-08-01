@@ -7,6 +7,7 @@ import random
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
@@ -22,7 +23,6 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import DataLoader, Dataset
 
 from kakeya.config import ExperimentConfig
-from kakeya.objectives import kakeya_regularization
 from kakeya.training import seed_everything
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -54,10 +54,14 @@ BASE_LATENT_CHANNELS = 4
 DETAIL_RESIDUAL_BOUND = 2.0
 SMALL_IMAGE_MAX_SIZE = 256
 SMALL_IMAGE_RATE_MULTIPLIER = 0.35
-SMALL_IMAGE_EDGE_WEIGHT = 5.0
+SMALL_IMAGE_EDGE_WEIGHT = 4.0
 SMALL_IMAGE_STRUCTURAL_WEIGHT = 1.2
 SMALL_IMAGE_MULTISCALE_WEIGHT = 0.2
-SMALL_IMAGE_HIGH_FREQUENCY_WEIGHT = 1.0
+SMALL_IMAGE_HIGH_FREQUENCY_WEIGHT = 0.5
+SMALL_IMAGE_FLAT_REGION_WEIGHT = 0.5
+KAKEYA_TUBE_LENGTHS = (5, 9, 17)
+KAKEYA_DIRECTION_WEIGHT = 0.25
+KAKEYA_LEAKAGE_WEIGHT = 0.25
 HD_CHECKPOINT_SIZE = 512
 HD_PSNR_MAX_REGRESSION = 0.1
 HD_SSIM_MAX_REGRESSION = 0.001
@@ -1330,10 +1334,10 @@ def _scale_conditioned_objective(
     image_size: int,
     stage_weights: dict[str, float],
     lambda_rate: float,
-) -> tuple[dict[str, float], float, float]:
+) -> tuple[dict[str, float], float, float, float]:
     """Strengthen small-image detail without changing the HD objective."""
     if image_size > SMALL_IMAGE_MAX_SIZE:
-        return stage_weights, lambda_rate, 0.0
+        return stage_weights, lambda_rate, 0.0, 0.0
 
     weights = dict(stage_weights)
     weights["edge"] = max(weights["edge"], SMALL_IMAGE_EDGE_WEIGHT)
@@ -1343,6 +1347,7 @@ def _scale_conditioned_objective(
         weights,
         lambda_rate * SMALL_IMAGE_RATE_MULTIPLIER,
         SMALL_IMAGE_HIGH_FREQUENCY_WEIGHT,
+        SMALL_IMAGE_FLAT_REGION_WEIGHT,
     )
 
 
@@ -1351,8 +1356,8 @@ def _hyperprior_epoch(
     loader: Iterable[Any],
     device: torch.device,
     lambda_rate: float = 1.0,
-    lambda_kakeya: float = 0.001,
-    num_projections: int = 32,
+    lambda_kakeya: float = 0.1,
+    num_projections: int = 12,
     k: int = 3,
     optimizer: optim.Optimizer | None = None,
     aux_optimizer: optim.Optimizer | None = None,
@@ -1362,8 +1367,8 @@ def _hyperprior_epoch(
 
     When stage_weights is provided, the loss is a weighted sum of MSE, edge,
     structural (1-SSIM), multiscale L1, LAB color (delta_e, hue, saturation),
-    kakeya coverage, and rate.  Without stage_weights, falls back to basic
-    MSE + lambda_rate*bpp + lambda_kakeya*coverage.
+    target-conditioned Kakeya tube preservation, and rate. Without
+    stage_weights, falls back to the basic weighted objective.
     """
     model.train(optimizer is not None)
     totals: dict[str, float] = {
@@ -1373,12 +1378,18 @@ def _hyperprior_epoch(
         "structural": 0.0,
         "multiscale": 0.0,
         "high_frequency": 0.0,
+        "flat_region": 0.0,
         "lab": 0.0,
         "hue": 0.0,
         "saturation": 0.0,
         "base": 0.0,
         "detail": 0.0,
         "kakeya": 0.0,
+        "kakeya_tube": 0.0,
+        "kakeya_direction": 0.0,
+        "kakeya_leakage": 0.0,
+        "kakeya_dimension": 0.0,
+        "kakeya_dimension_error": 0.0,
         "rate": 0.0,
         "psnr": 0.0,
         "rate_bpp": 0.0,
@@ -1412,23 +1423,45 @@ def _hyperprior_epoch(
                 ) / images.size(0)
                 bpp_bits = rate / (images.shape[-1] * images.shape[-2])
 
-                lp = y_hat.permute(0, 2, 3, 1).reshape(-1, y_hat.size(1))
-                norm = F.normalize(lp, dim=1)
-                coverage = kakeya_regularization(
-                    norm, num_projections=num_projections, k=k
-                )
+                image_size = max(images.shape[-2:])
+                if image_size <= SMALL_IMAGE_MAX_SIZE:
+                    kakeya_components = _kakeya_tube_loss(
+                        reconstructed,
+                        images,
+                        num_directions=max(4, min(num_projections, 24)),
+                        num_scales=max(1, min(k, len(KAKEYA_TUBE_LENGTHS))),
+                    )
+                    kakeya_loss = kakeya_components["total"]
+                    dimension = _kakeya_dimension_proxy(reconstructed.detach())
+                    target_dimension = _kakeya_dimension_proxy(images)
+                    dimension_error = (dimension - target_dimension).abs()
+                else:
+                    kakeya_loss = torch.zeros_like(loss_mse)
+                    kakeya_components = {
+                        "tube": torch.zeros_like(loss_mse),
+                        "direction": torch.zeros_like(loss_mse),
+                        "leakage": torch.zeros_like(loss_mse),
+                    }
+                    dimension = torch.zeros_like(loss_mse)
+                    dimension_error = torch.zeros_like(loss_mse)
 
                 if stage_weights is not None:
-                    sw, effective_rate_weight, high_frequency_weight = (
-                        _scale_conditioned_objective(
-                            max(images.shape[-2:]), stage_weights, lambda_rate
-                        )
+                    (
+                        sw,
+                        effective_rate_weight,
+                        high_frequency_weight,
+                        flat_region_weight,
+                    ) = _scale_conditioned_objective(
+                        image_size, stage_weights, lambda_rate
                     )
                     edge = F.l1_loss(_edges(reconstructed), _edges(images))
                     structural = 1.0 - _ssim(reconstructed, images)
                     multiscale = _multiscale_l1(reconstructed, images)
                     high_frequency = F.l1_loss(
                         _laplacian(reconstructed), _laplacian(images)
+                    )
+                    flat_region = _flat_region_high_frequency_loss(
+                        reconstructed, images
                     )
                     lab_losses = _lab_losses(reconstructed, images)
                     lab = lab_losses["delta_e"]
@@ -1444,12 +1477,13 @@ def _hyperprior_epoch(
                         + sw["structural"] * structural
                         + sw["multiscale"] * multiscale
                         + high_frequency_weight * high_frequency
+                        + flat_region_weight * flat_region
                         + sw["lab"] * lab
                         + sw["hue"] * hue
                         + sw["saturation"] * sat
                         + sw["base"] * base
                         + sw["detail"] * detail
-                        + sw["kakeya"] * coverage
+                        + lambda_kakeya * sw["kakeya"] * kakeya_loss
                         + effective_rate_weight * rate_penalty
                     )
                 else:
@@ -1457,6 +1491,7 @@ def _hyperprior_epoch(
                     structural = torch.zeros_like(loss_mse)
                     multiscale = torch.zeros_like(loss_mse)
                     high_frequency = torch.zeros_like(loss_mse)
+                    flat_region = torch.zeros_like(loss_mse)
                     lab = torch.zeros_like(loss_mse)
                     hue = torch.zeros_like(loss_mse)
                     sat = torch.zeros_like(loss_mse)
@@ -1464,7 +1499,9 @@ def _hyperprior_epoch(
                     detail = torch.zeros_like(loss_mse)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
                     total = (
-                        loss_mse + lambda_rate * rate_penalty + lambda_kakeya * coverage
+                        loss_mse
+                        + lambda_rate * rate_penalty
+                        + lambda_kakeya * kakeya_loss
                     )
 
                 if optimizer is not None:
@@ -1501,12 +1538,18 @@ def _hyperprior_epoch(
             totals["structural"] += float(structural.detach())
             totals["multiscale"] += float(multiscale.detach())
             totals["high_frequency"] += float(high_frequency.detach())
+            totals["flat_region"] += float(flat_region.detach())
             totals["lab"] += float(lab.detach())
             totals["hue"] += float(hue.detach())
             totals["saturation"] += float(sat.detach())
             totals["base"] += float(base.detach())
             totals["detail"] += float(detail.detach())
-            totals["kakeya"] += float(coverage.detach())
+            totals["kakeya"] += float(kakeya_loss.detach())
+            totals["kakeya_tube"] += float(kakeya_components["tube"].detach())
+            totals["kakeya_direction"] += float(kakeya_components["direction"].detach())
+            totals["kakeya_leakage"] += float(kakeya_components["leakage"].detach())
+            totals["kakeya_dimension"] += float(dimension.detach())
+            totals["kakeya_dimension_error"] += float(dimension_error.detach())
             totals["rate"] += float(rate.detach())
             totals["psnr"] += float(psnr)
             totals["rate_bpp"] += float(bpp_bits.detach())
@@ -1540,7 +1583,7 @@ def train_image_codec(
 ) -> ImageCodecResult:
     """Stage-scheduled rate-distortion training for KakeyaHyperpriorCodec.
 
-    Total = MSE + lambda_rate * bpp + lambda_kakeya * kakeya_coverage.
+    Total = distortion + lambda_rate * bpp + lambda_kakeya * kakeya_tube.
     """
     seed_everything(config.seed)
     train_size = config.train_limit or 128
@@ -1579,8 +1622,8 @@ def train_image_codec(
     aux_optimizer = optim.Adam(auxiliary_parameters, lr=1e-3)
 
     lambda_rate = float(config.objective.get("lambda_rate", RATE_LOSS_WEIGHT))
-    lambda_kakeya = float(config.objective.get("lambda_kakeya", 0.001))
-    num_projections = int(config.objective.get("num_projections", 32))
+    lambda_kakeya = float(config.objective.get("lambda_kakeya", 0.1))
+    num_projections = int(config.objective.get("num_projections", 12))
     k = int(config.objective.get("k", 3))
     stage_weights_map = config.stage_weights()
 
@@ -2093,12 +2136,150 @@ def _edges(image: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _edge_strength(image: torch.Tensor) -> torch.Tensor:
+    """Return a one-channel edge magnitude used by Kakeya tube responses."""
+    edges = _edges(image)
+    return edges.reshape(image.shape[0], 2, image.shape[1], *image.shape[-2:]).mean(
+        dim=(1, 2), keepdim=False
+    )[:, None]
+
+
+@lru_cache(maxsize=32)
+def _cached_kakeya_tube_kernels(num_directions: int, length: int) -> torch.Tensor:
+    """Build anti-aliased unit-mass line kernels on the CPU."""
+    if num_directions < 2:
+        raise ValueError("num_directions must be at least 2")
+    if length < 3 or length % 2 == 0:
+        raise ValueError("tube length must be an odd integer of at least 3")
+    coordinate = torch.arange(length, dtype=torch.float32) - length // 2
+    yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+    kernels: list[torch.Tensor] = []
+    for index in range(num_directions):
+        theta = math.pi * index / num_directions
+        along = math.cos(theta) * xx + math.sin(theta) * yy
+        across = -math.sin(theta) * xx + math.cos(theta) * yy
+        # A one-pixel triangular cross-section avoids jagged diagonal kernels.
+        kernel = (1.0 - across.abs()).clamp_min(0.0)
+        kernel = kernel * (along.abs() <= length // 2 + 0.25)
+        kernels.append(kernel / kernel.sum().clamp_min(1e-8))
+    return torch.stack(kernels)[:, None]
+
+
+def _kakeya_tube_responses(
+    image: torch.Tensor, num_directions: int, num_scales: int
+) -> list[torch.Tensor]:
+    """Measure continuous edge support along fixed directions and scales."""
+    edge = _edge_strength(image)
+    lengths = KAKEYA_TUBE_LENGTHS[: max(1, min(num_scales, len(KAKEYA_TUBE_LENGTHS)))]
+    responses: list[torch.Tensor] = []
+    for length in lengths:
+        kernels = _cached_kakeya_tube_kernels(num_directions, length).to(
+            device=image.device, dtype=image.dtype
+        )
+        padding = length // 2
+        padded = F.pad(edge, (padding, padding, padding, padding), mode="replicate")
+        responses.append(F.conv2d(padded, kernels))
+    return responses
+
+
+def _kakeya_tube_loss(
+    reconstructed: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    num_directions: int = 12,
+    num_scales: int = 3,
+) -> dict[str, torch.Tensor]:
+    """Target-conditioned Kakeya loss for directional line preservation.
+
+    The local response term preserves line continuity, the direction term
+    matches the orientation distribution actually present in the target, and
+    leakage suppresses unsupported tube responses instead of forcing every
+    image to contain every possible direction.
+    """
+    reconstructed_responses = _kakeya_tube_responses(
+        reconstructed, num_directions, num_scales
+    )
+    target_responses = _kakeya_tube_responses(target, num_directions, num_scales)
+    tube_terms: list[torch.Tensor] = []
+    direction_terms: list[torch.Tensor] = []
+    leakage_terms: list[torch.Tensor] = []
+    for reconstructed_response, target_response in zip(
+        reconstructed_responses, target_responses, strict=True
+    ):
+        target_response = target_response.detach()
+        tube_terms.append(
+            F.smooth_l1_loss(reconstructed_response, target_response, beta=0.01)
+        )
+        reconstructed_histogram = reconstructed_response.mean(dim=(-2, -1))
+        target_histogram = target_response.mean(dim=(-2, -1))
+        reconstructed_histogram = reconstructed_histogram / (
+            reconstructed_histogram.sum(dim=1, keepdim=True) + 1e-6
+        )
+        target_histogram = target_histogram / (
+            target_histogram.sum(dim=1, keepdim=True) + 1e-6
+        )
+        direction_terms.append(F.l1_loss(reconstructed_histogram, target_histogram))
+        unsupported = torch.exp(-target_response / 0.02)
+        excess = F.relu(reconstructed_response - target_response - 0.005)
+        leakage_terms.append((unsupported * excess).mean())
+
+    tube = torch.stack(tube_terms).mean()
+    direction = torch.stack(direction_terms).mean()
+    leakage = torch.stack(leakage_terms).mean()
+    total = tube + KAKEYA_DIRECTION_WEIGHT * direction
+    total = total + KAKEYA_LEAKAGE_WEIGHT * leakage
+    return {
+        "total": total,
+        "tube": tube,
+        "direction": direction,
+        "leakage": leakage,
+    }
+
+
+@torch.no_grad()
+def _kakeya_dimension_proxy(image: torch.Tensor) -> torch.Tensor:
+    """Estimate a box-counting slope for monitoring, never optimization."""
+    active = _edge_strength(image) > 0.02
+    log_inverse_scale: list[torch.Tensor] = []
+    log_counts: list[torch.Tensor] = []
+    for scale in (1, 2, 4):
+        occupied = F.max_pool2d(active.float(), scale, stride=scale) > 0
+        count = occupied.flatten(1).sum(dim=1).clamp_min(1.0)
+        log_inverse_scale.append(image.new_tensor(math.log(1.0 / scale)))
+        log_counts.append(count.log())
+    x = torch.stack(log_inverse_scale)
+    y = torch.stack(log_counts, dim=1)
+    centered_x = x - x.mean()
+    slope = (y * centered_x).sum(dim=1) / centered_x.square().sum().clamp_min(1e-8)
+    return slope.mean()
+
+
 def _laplacian(image: torch.Tensor) -> torch.Tensor:
     """Second-order high-frequency response used for small-image detail."""
     channels = image.shape[1]
     kernel = image.new_tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]])
     kernel = kernel.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
     return F.conv2d(image, kernel, padding=1, groups=channels)
+
+
+def _flat_region_high_frequency_loss(
+    reconstructed: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Suppress ringing where the target is locally smooth.
+
+    A soft mask avoids penalizing legitimate text and photographic edges. The
+    one-pixel border is excluded because Laplacian padding would classify the
+    image boundary itself as high frequency.
+    """
+    target_edge = _edges(target).mean(dim=1, keepdim=True)
+    flat_weight = (1.0 - target_edge / 0.04).clamp(0.0, 1.0).detach()
+    error = (
+        (_laplacian(reconstructed) - _laplacian(target)).abs().mean(dim=1, keepdim=True)
+    )
+    if error.shape[-2] > 2 and error.shape[-1] > 2:
+        error = error[:, :, 1:-1, 1:-1]
+        flat_weight = flat_weight[:, :, 1:-1, 1:-1]
+    return (error * flat_weight).sum() / flat_weight.sum().clamp_min(1.0)
 
 
 _SRGB_TO_LIN_COEFF = 1.0 / 12.92

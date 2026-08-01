@@ -19,7 +19,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "saturation": 0.05,
         "base": 0.5,
         "detail": 0.5,
-        "kakeya": 0.002,
+        "kakeya": 0.5,
     },
     "transition": {
         "mse": 2.0,
@@ -31,7 +31,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "saturation": 0.08,
         "base": 0.75,
         "detail": 0.75,
-        "kakeya": 0.001,
+        "kakeya": 0.75,
     },
     "finetune": {
         "mse": 3.0,
@@ -43,7 +43,7 @@ DEFAULT_STAGE_WEIGHTS: dict[str, dict[str, float]] = {
         "saturation": 0.08,
         "base": 1.0,
         "detail": 1.0,
-        "kakeya": 0.0005,
+        "kakeya": 1.0,
     },
 }
 

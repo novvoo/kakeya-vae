@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+import kakeya.image_codec as image_codec_module
 from kakeya.image_codec import (
     BASE_LATENT_CHANNELS,
     TRAIN_MIX_CYCLE,
@@ -18,7 +19,11 @@ from kakeya.image_codec import (
     _compose_base_detail,
     _detail_ycocg,
     _encode_bitstream,
+    _flat_region_high_frequency_loss,
     _hyperprior_epoch,
+    _kakeya_dimension_proxy,
+    _kakeya_tube_loss,
+    _kakeya_tube_responses,
     _lab_losses,
     _laplacian,
     _low_frequency_base,
@@ -339,23 +344,25 @@ def test_small_image_objective_preserves_hd_weights() -> None:
         "multiscale": 0.4,
     }
 
-    small_weights, small_rate, high_frequency = _scale_conditioned_objective(
-        256, weights, 0.01
+    small_weights, small_rate, high_frequency, flat_region = (
+        _scale_conditioned_objective(256, weights, 0.01)
     )
-    hd_weights, hd_rate, hd_high_frequency = _scale_conditioned_objective(
-        512, weights, 0.01
+    hd_weights, hd_rate, hd_high_frequency, hd_flat_region = (
+        _scale_conditioned_objective(512, weights, 0.01)
     )
 
     assert small_weights == {
-        "edge": 5.0,
+        "edge": 4.0,
         "structural": 1.2,
         "multiscale": 0.2,
     }
     assert small_rate == pytest.approx(0.0035)
-    assert high_frequency == 1.0
+    assert high_frequency == 0.5
+    assert flat_region == 0.5
     assert hd_weights is weights
     assert hd_rate == 0.01
     assert hd_high_frequency == 0.0
+    assert hd_flat_region == 0.0
 
 
 def test_laplacian_emphasizes_edges_not_flat_regions() -> None:
@@ -368,6 +375,84 @@ def test_laplacian_emphasizes_edges_not_flat_regions() -> None:
 
     assert torch.count_nonzero(flat_response) == 0
     assert edge_response.abs().sum() > 0
+
+
+def test_flat_region_loss_penalizes_ringing_and_has_finite_gradients() -> None:
+    target = torch.full((1, 3, 16, 16), 0.5)
+    checkerboard = ((torch.arange(16)[:, None] + torch.arange(16)[None, :]) % 2).float()
+    reconstructed = (target + (checkerboard * 0.04 - 0.02)[None, None]).requires_grad_()
+
+    loss = _flat_region_high_frequency_loss(reconstructed, target)
+    loss.backward()
+
+    assert loss > 0
+    assert reconstructed.grad is not None
+    assert torch.isfinite(reconstructed.grad).all()
+
+
+def test_kakeya_tube_loss_is_zero_for_exact_reconstruction() -> None:
+    image = torch.rand(1, 3, 32, 32)
+
+    components = _kakeya_tube_loss(image, image, num_directions=12, num_scales=3)
+
+    for value in components.values():
+        torch.testing.assert_close(value, torch.zeros_like(value), atol=1e-7, rtol=0)
+
+
+def test_kakeya_tube_response_detects_line_orientation() -> None:
+    image = torch.ones(1, 3, 32, 32)
+    image[:, :, 15:17, :] = 0
+
+    response = _kakeya_tube_responses(image, 12, 1)[0]
+    peak_by_direction = response.amax(dim=(-2, -1))[0]
+
+    assert peak_by_direction[0] > peak_by_direction[6] * 2
+
+
+def test_kakeya_tube_loss_penalizes_unsupported_lines() -> None:
+    target = torch.full((1, 3, 32, 32), 0.5)
+    reconstructed = target.clone()
+    reconstructed[:, :, 15:17, :] = 0.1
+
+    components = _kakeya_tube_loss(
+        reconstructed, target, num_directions=12, num_scales=3
+    )
+
+    assert components["leakage"] > 0
+    assert components["total"] > components["tube"]
+
+
+def test_kakeya_tube_loss_backpropagates_without_dimension_gradient() -> None:
+    target = torch.ones(1, 3, 32, 32)
+    target[:, :, :, 15:17] = 0
+    reconstructed = (target * 0.9 + 0.05).requires_grad_()
+
+    components = _kakeya_tube_loss(
+        reconstructed, target, num_directions=8, num_scales=2
+    )
+    components["total"].backward()
+    dimension = _kakeya_dimension_proxy(reconstructed)
+
+    assert reconstructed.grad is not None
+    assert torch.isfinite(reconstructed.grad).all()
+    assert torch.isfinite(dimension)
+    assert not dimension.requires_grad
+
+
+def test_hd_epoch_does_not_evaluate_kakeya_tube_loss(monkeypatch) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("HD training must not evaluate the small-image tube loss")
+
+    monkeypatch.setattr(image_codec_module, "_kakeya_tube_loss", fail_if_called)
+    monkeypatch.setattr(image_codec_module, "_kakeya_dimension_proxy", fail_if_called)
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4)
+    images = torch.rand(1, 3, 288, 288)
+    loader = DataLoader(TensorDataset(images, torch.zeros(1)), batch_size=1)
+
+    metrics = _hyperprior_epoch(model, loader, torch.device("cpu"))
+
+    assert metrics["kakeya"] == 0.0
+    assert metrics["kakeya_dimension"] == 0.0
 
 
 @pytest.mark.parametrize("value", [0.0, 1e-8, 0.5, 1.0])

@@ -57,7 +57,7 @@ def test_request_builds_method_specific_objective() -> None:
     assert obj["num_projections"] == 16
     assert obj["k"] == 3
     assert obj["lambda_rate"] == 0.01
-    assert obj["lambda_kakeya"] == 0.001
+    assert obj["lambda_kakeya"] == 0.1
     # stage_weights should be present for image_codec method
     assert "stage_weights" in obj
     assert "capacity" in obj["stage_weights"]

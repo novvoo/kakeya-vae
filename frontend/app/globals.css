@@ -1464,6 +1464,10 @@ button.upload-btn:disabled {
   background: color-mix(in srgb, var(--signal) 24%, transparent);
 }
 
+.benchmark-table .paper-reference-row {
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+}
+
 .benchmark-table .highlight-row td:first-child {
   font-weight: 500;
 }
@@ -1666,6 +1670,10 @@ button.upload-btn:disabled {
 .effect-warn,
 .effect-reference {
   color: #936710;
+}
+
+.effect-paper {
+  color: #5e6470;
 }
 
 .effect-bad {

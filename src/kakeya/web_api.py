@@ -38,10 +38,10 @@ class ExperimentRequest(BaseModel):
     train_limit: Annotated[int, Field(ge=0, le=60_000)] = 128
     test_limit: Annotated[int, Field(ge=0, le=10_000)] = 0
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
-    num_projections: Annotated[int, Field(ge=4, le=1024)] = 32
+    num_projections: Annotated[int, Field(ge=4, le=24)] = 12
     k: Annotated[int, Field(ge=1, le=4096)] = 3
     lambda_rate: Annotated[float, Field(gt=0, le=100)] = 0.01
-    lambda_kakeya: Annotated[float, Field(ge=0, le=10)] = 0.001
+    lambda_kakeya: Annotated[float, Field(ge=0, le=10)] = 0.1
 
     @model_validator(mode="after")
     def validate_device(self) -> ExperimentRequest:
@@ -62,8 +62,8 @@ class ExperimentRequest(BaseModel):
 
     def experiment_config(self) -> dict[str, Any]:
         objective: dict[str, Any] = {
-            "num_projections": min(self.num_projections, 128),
-            "k": min(self.k, max(self.batch_size - 1, 1)),
+            "num_projections": min(self.num_projections, 24),
+            "k": min(self.k, 3),
             "lambda_rate": self.lambda_rate,
             "lambda_kakeya": self.lambda_kakeya,
         }

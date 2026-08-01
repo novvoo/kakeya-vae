@@ -147,15 +147,17 @@ const DEFAULT_CONFIG: ExperimentConfig = {
   num_workers: 0,
   train_limit: 128,
   test_limit: 0,
-  num_projections: 32,
+  num_projections: 12,
   k: 3,
   lambda_rate: 1.0,
-  lambda_kakeya: 0.001,
+  lambda_kakeya: 0.1,
 };
 
 const METHOD_LABELS: Record<string, string> = {
   image_codec: "Kakeya VAE (超先验 + 挂谷)",
 };
+
+const REFERENCE_IMAGE_SIZE = 256;
 
 const IMAGE_CODEC_REFERENCES = [
   {
@@ -203,6 +205,23 @@ const IMAGE_CODEC_REFERENCES = [
     gap: "当前使用其基础 EntropyBottleneck；预训练模型仍作为按需下载基线",
     reported: "官方模型库支持 pretrained=True，并提供编码、解码与评估脚本。",
     href: "https://github.com/InterDigitalInc/CompressAI",
+  },
+] as const;
+
+const PAPER_CODEC_BASELINES = [
+  {
+    codec: "VTM-23.1 (VVC)",
+    settings: "论文参照 · 按 256×256 折算",
+    bpp: 0.157,
+    psnr: 31.963,
+    quality: "传统锚点，纹理和边缘略弱",
+  },
+  {
+    codec: "SCH (Xu et al.)",
+    settings: "论文参照 · 按 256×256 折算",
+    bpp: 0.146,
+    psnr: 33.159,
+    quality: "更低码率，更清晰纹理和边缘",
   },
 ] as const;
 
@@ -964,20 +983,20 @@ function ObjectiveFields({
               }
             />
             <NumberField
-              label="随机投影数"
+              label="细管方向数"
               value={config.num_projections}
               min={4}
-              max={1024}
-              step={4}
+              max={24}
+              step={1}
               onChange={(num_projections) =>
                 setConfig({ ...config, num_projections })
               }
             />
             <NumberField
-              label="Top-k 间距"
+              label="细管尺度数"
               value={config.k}
               min={1}
-              max={4096}
+              max={3}
               step={1}
               onChange={(k) => setConfig({ ...config, k })}
             />
@@ -1005,9 +1024,9 @@ const STAGE_LOSS_KEYS = [
 ];
 
 const STAGE_DEFAULTS: Record<string, Record<string, number>> = {
-  capacity:  { mse: 3.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, base: 0.5, detail: 0.5, kakeya: 0.002 },
-  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, base: 0.75, detail: 0.75, kakeya: 0.001 },
-  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, base: 1.0, detail: 1.0, kakeya: 0.0005 },
+  capacity:  { mse: 3.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, base: 0.5, detail: 0.5, kakeya: 0.5 },
+  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, base: 0.75, detail: 0.75, kakeya: 0.75 },
+  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, base: 1.0, detail: 1.0, kakeya: 1.0 },
 };
 function StageWeightsEditor({
   config, setConfig,
@@ -1026,7 +1045,7 @@ function StageWeightsEditor({
     });
   };
   const stepForKey = (key: string) =>
-    key === "kakeya" ? 0.0005 : key === "mse" ? 0.5 : key === "structural" ? 0.05 : 0.01;
+    key === "kakeya" ? 0.05 : key === "mse" ? 0.5 : key === "structural" ? 0.05 : 0.01;
   return (
     <div className="stage-weights-editor">
       <p>分阶段损失权重</p>
@@ -1987,6 +2006,28 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
                 </tr>
               );
             })}
+            {PAPER_CODEC_BASELINES.map((item) => {
+              const estimatedBytes = Math.round(
+                (item.bpp * REFERENCE_IMAGE_SIZE * REFERENCE_IMAGE_SIZE) / 8,
+              );
+              return (
+                <tr className="paper-reference-row" key={item.codec}>
+                  <td>
+                    {item.codec}
+                    <small>{item.settings}</small>
+                  </td>
+                  <td>
+                    <span className="effect-badge effect-paper">论文参照</span>
+                  </td>
+                  <td>{formatBytes(estimatedBytes)}</td>
+                  <td>{spaceSaving(estimatedBytes, sourceBytes)}</td>
+                  <td>{item.quality}</td>
+                  <td>
+                    PSNR {item.psnr.toFixed(1)} · {item.bpp.toFixed(3)} bpp
+                  </td>
+                </tr>
+              );
+            })}
             <tr className="highlight-row">
               <td>
                 图文 Kakeya VAE
@@ -2028,6 +2069,10 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
         低于 25 dB 通常已有明显失真。SSIM 已换算为结构保真百分比，越接近 100% 越好。
         图文还必须以原图、码流解码图和误差图的实际文字清晰度为准。.kky 大小包含文件头与
         熵编码负载，但不重复计入双方都需要的编解码器程序；该文件需配合本轮检查点解码。
+      </p>
+      <p className="benchmark-note">
+        表内 VTM / SCH 是前端静态论文参照，不调用编码器，也不参与同一图文测试卡的
+        “有效 / 无效”判定；文件大小和节省空间按论文 bpp 折算到当前 256×256 测试卡口径。
       </p>
     </div>
   );

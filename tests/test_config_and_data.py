@@ -9,10 +9,8 @@ def test_config_loads_paths() -> None:
 
     assert config.method == "image_codec"
     assert config.data_dir == Path("data")
-    assert config.objective["num_projections"] == 32
+    assert config.objective["num_projections"] == 12
 
 
 def test_mnist_uses_only_pytorch_mirror() -> None:
-    assert TrustedMNIST.mirrors == [
-        "https://ossci-datasets.s3.amazonaws.com/mnist/"
-    ]
+    assert TrustedMNIST.mirrors == ["https://ossci-datasets.s3.amazonaws.com/mnist/"]
