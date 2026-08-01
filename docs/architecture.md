@@ -250,18 +250,23 @@ graph TD
         BAE --> CEB[Base EntropyBottleneck<br/>独立概率模型 p(y_base)]
         CEB --> BSD[Base Synthesis<br/>4→3 幅度投影 + 两层残差细化]
         BSD --> C_HAT[低频 Y / Co / Cg]
+        C_HAT --> BUP[bilinear ×8<br/>解码低频参考]
     end
 
-    subgraph ANALYSIS["g_a — 分析变换"]
-        IMG --> S2D1[SpaceToDepth<br/>PixelUnshuffle + Conv<br/>3→24, /2]
-        S2D1 --> BIN1[BlendedInstanceNorm<br/>初始 90% IN + 10% raw]
+    subgraph ANALYSIS["g_a — Detail 分析变换"]
+        YCOCG --> DSUB[有符号高频<br/>YCoCg - upsample Base]
+        BUP --> DSUB
+        DSUB --> HAAR[固定 Haar DWT /2<br/>3→12: LL/LH/HL/HH]
+        HAAR --> P24[weight_norm Conv 3x3<br/>12→24]
+        P24 --> BIN1[BlendedInstanceNorm<br/>初始 90% IN + 10% raw]
         BIN1 --> RB1[ResidualBlockGDN<br/>24]
         RB1 --> S2D2[SpaceToDepth<br/>24→32, /2]
         S2D2 --> BIN2[BlendedInstanceNorm]
         BIN2 --> RB2[ResidualBlockGDN<br/>32]
         RB2 --> CONV[weight_norm Conv 1x1<br/>32→64]
         CONV --> MS64[MultiScaleResidualBlock<br/>local 3x3 + dilated 3x3]
-        MS64 --> RB64[ResidualBlockGDN<br/>64]
+        MS64 --> SCH64[LightweightSCHBlock<br/>32 local + 32 window-channel<br/>4×4 windows, 4 heads]
+        SCH64 --> RB64[ResidualBlockGDN<br/>64]
         RB64 --> PROJ[weight_norm Conv 1x1<br/>64→8]
         PROJ --> TANH[tanh bound ±5<br/>y: 8×H/4×W/4]
     end
@@ -284,28 +289,27 @@ graph TD
         GC --> Y_HAT[y_hat<br/>量化潜变量]
         GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
     end
-    subgraph SYNTHESIS["g_s — 综合变换"]
+    subgraph SYNTHESIS["g_s — Detail 综合变换"]
 
         Y_HAT --> D0[weight_norm Conv 3x3<br/>8→64]
-        D0 --> DMS[MultiScaleResidualBlock<br/>local + context]
+        D0 --> DSCH[LightweightSCHBlock<br/>window-channel + local]
+        DSCH --> DMS[MultiScaleResidualBlock<br/>local + context]
         DMS --> DRB64[ResidualBlockIGDN<br/>64]
         DRB64 --> D1[weight_norm Conv 3x3<br/>64→32]
         D1 --> DRB32[ResidualBlockIGDN<br/>32]
         DRB32 --> UPS[LearnedUpsample<br/>bilinear + sharp residual]
         UPS --> D2[weight_norm Conv 3x3<br/>32→24]
         D2 --> DRB24[ResidualBlockIGDN<br/>24]
-        DRB24 --> D2S[DepthToSpace<br/>24→12, x2]
-        D2S --> BIN3[BlendedInstanceNorm]
-        BIN3 --> DC1[weight_norm Conv 3x3<br/>12→24]
-        DC1 --> SILU[SiLU]
-        SILU --> BASE[基础 RGB logits]
-        SILU --> DETAIL[零初始化高频残差头<br/>depthwise + pointwise]
-        BASE --> FUSE[base + 0.25 × detail]
-        DETAIL --> FUSE
-        FUSE --> SIG[Sigmoid<br/>基础 RGB]
-        SIG --> CFUSE[确定性频率分解<br/>Base 低频 + Detail 高频]
-        C_HAT --> CFUSE
-        CFUSE --> OUT[RGB Output<br/>H x W x 3]
+        DRB24 --> DHEAD[Haar coefficient head<br/>24→12]
+        DRB24 --> DREF[零初始化 coefficient refinement<br/>24→12]
+        DHEAD --> IDWT[固定 Haar IDWT ×2<br/>12→3 YCoCg Detail]
+        DREF --> IDWT
+        IDWT --> DTANH[bound 2 × tanh<br/>有符号高频候选]
+        C_HAT --> BASEUP[bilinear ×8<br/>绝对低频 YCoCg]
+        DTANH --> CFUSE[expand Base + signed Detail]
+        BASEUP --> CFUSE
+        CFUSE --> INV[可逆 YCoCg → RGB]
+        INV --> OUT[clamp RGB Output<br/>H x W x 3]
     end
     style INPUT fill:#e1f5fe
     style ANALYSIS fill:#f3e5f5
@@ -325,10 +329,11 @@ graph LR
         C1 --> BIN1[BlendedInstanceNorm]
     end
 
-    subgraph DepthToSpace
-        B[Input] --> C2[Conv]
-        C2 --> PS[PixelShuffle x2]
-        PS --> BIN2[BlendedInstanceNorm]
+    subgraph FixedHaarBoundary
+        B[3-channel Detail] --> DWT[固定 Haar DWT /2]
+        DWT --> BANDS[12 channels<br/>LL/LH/HL/HH]
+        BANDS --> IDWT[固定 Haar IDWT ×2]
+        IDWT --> BR[3-channel Detail<br/>数值可逆]
     end
 
     subgraph BlendedInstanceNorm
@@ -356,6 +361,23 @@ graph LR
         CODE --> BS[Base Synthesis<br/>无 IN；4→3 YCoCg]
         BS --> REPLACE[替换全部低频 Y/Co/Cg<br/>Detail 高频保持不变]
     end
+
+    subgraph DisjointDetailBranch
+        SRC[full YCoCg] --> SUB[减去 upsample Base]
+        SUB --> CODE_D[InstanceNorm/GDN Detail codec]
+        CODE_D --> SIGNED[有符号 YCoCg residual]
+        SIGNED --> COMPOSE[+ expanded decoded Base<br/>Laplacian pyramid synthesis]
+    end
+
+    subgraph LightweightSCH
+        SX[64 channels] --> SPLIT_S[1×1 Conv + split]
+        SPLIT_S --> LOCAL_S[32 local<br/>multi-scale depthwise Conv]
+        SPLIT_S --> GLOBAL_S[32 window context<br/>4×4 window-channel attention]
+        LOCAL_S --> FUSE_S[concat + 1×1 Conv]
+        GLOBAL_S --> FUSE_S
+        FUSE_S --> RES_S[residual scale 0.1]
+        SX --> RES_S
+    end
 ```
 
 | 维度 | 说明 |
@@ -364,14 +386,16 @@ graph LR
 | 激活函数 | 分析侧 Residual GDN；合成侧 Residual IGDN |
 | 归一化 | BlendedInstanceNorm，初始 90% IN + 10% 原始幅度路径 |
 | 多尺度块 | 局部 3x3 与 dilation=2 分支融合 |
-| 下采样 | SpaceToDepth x 2 = 4x（保持文字精度） |
-| 上采样 | LearnedUpsample 2x + DepthToSpace 2x |
-| 输出 | 基础 RGB logits + 0.25 × 零初始化高频残差 |
+| 下采样 | Detail 边界固定 Haar DWT 2x + SpaceToDepth 2x = 4x |
+| 上采样 | LearnedUpsample 2x + 固定 Haar IDWT 2x |
+| SCH | 64 通道各放一个对称块；32 local + 32 window-channel，4×4 window / 4 heads；高清按 2048 windows 分块以限制峰值内存 |
+| Detail 输入 | `YCoCg - upsample(low-frequency YCoCg)`；不再重复编码 Base |
+| Detail 输出 | `2·tanh` 有符号 YCoCg 残差，直接与 expanded Base 相加；无 Sigmoid |
 | Base 分支 | 完整低频 Y/Co/Cg、/8 采样、4 通道可学习 latent；无 IN，独立码流 |
-| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + low-frequency Base + λ·rate + λₖ·kakeya |
+| 损失函数 | MSE + edge + structural + multiscale + Laplacian + LAB + Base + Detail high-pass + λ·rate + λₖ·kakeya |
 | h_s 增强 | Self-Attention；大图使用 16x16 窗口 |
 | 潜空间 | 8 通道, ±5 bound, GaussianConditional 量化 |
-| checkpoint | 架构版本 5，Kakeya Hyperprior v7 `[z,y_detail,y_base]`；明确不兼容旧架构 |
+| checkpoint | 架构版本 8，Kakeya Hyperprior v10 `[z,y_detail,y_base]`；明确不兼容旧架构 |
 ---
 
 ## 3. 损失函数组成
@@ -380,7 +404,8 @@ graph LR
 
 ```math
 L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
-  + w_{hf}·Laplacian + w_l·ΔE + w_h·Hue + w_{sat}·Sat + w_c·Chroma
+  + w_{hf}·Laplacian + w_l·ΔE + w_h·Hue + w_{sat}·Sat
+  + w_b·BaseL1 + w_d·DetailL1
   + λₖ·Kakeya + λ·max(0, bpp - 2.5)
 ```
 
@@ -390,7 +415,8 @@ L = w_m·MSE + w_e·Edge + w_s·(1-SSIM) + w_{ms}·MultiL1
 - Multiscale: 多尺度 L1（256/128/64 加权）
 - Laplacian: 256 及以下启用的二阶高频损失
 - LAB: CIELAB ΔE 色差 + 色相 + 饱和度
-- Chroma: /8 低频 opponent-color L1，直接约束 `R-G` 与 `B-G` 漂移
+- BaseL1: `/8` 低频 Y/Co/Cg L1，约束绝对亮度、对比度和色度
+- DetailL1: 去除 Base 后的有符号高频 Y/Co/Cg L1，直接监督文字与纹理
 - Kakeya: 潜空间方向覆盖正则化
 - Rate: 熵编码码率（`log2`），超出 2.5 bpp 的部分产生惩罚
 - λ = 0.01（默认），λₖ = 0.001（默认）
@@ -483,7 +509,7 @@ KakeyaHyperpriorCodec 使用 Capacity → Transition → Finetune 三阶段权�
 
 ```mermaid
 flowchart TD
-    START([开始训练]) --> INIT[初始化架构版本 5<br/>Detail 主干 + 完整 YCoCg Base]
+    START([开始训练]) --> INIT[初始化架构版本 8<br/>Base-first Haar-SCH Detail + YCoCg Base]
     INIT --> SPLIT_OPT[分离优化器参数<br/>main 不含 quantiles<br/>aux 仅含 quantiles]
     SPLIT_OPT --> LOADERS[创建 DataLoaders<br/>Reference + Procedural + RealImage + Validation]
     LOADERS --> LOOP{每个 epoch<br/>1 → config.epochs}
@@ -495,7 +521,7 @@ flowchart TD
     VALID --> CALIB[_calibration_metrics<br/>确定性前向量化<br/>不构建 CDF]
     CALIB --> HD[512 高清校准<br/>PSNR/SSIM]
     HD --> CKPT{256 PSNR 创新高<br/>高清 PSNR/SSIM/Chroma<br/>回退均未越界?}
-    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 5]
+    CKPT -->|是| SAVE[保存 best.pt<br/>architecture version 8]
     SAVE --> LOOP
     CKPT -->|否| LOOP
 
@@ -518,7 +544,7 @@ flowchart TD
 5. `bpp = rate / (H * W)` — 每像素比特
 6. `coverage = kakeya_regularization(unit_normalized_latent, num_projections=32, k=3)` — 挂谷覆盖正则
 7. 按尺寸选择小图条件权重或原高清权重
-8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、完整低频 Base、rate 与 Kakeya 总损失
+8. 计算 MSE、edge、SSIM、multiscale、Laplacian、LAB、Base、Detail high-pass、rate 与 Kakeya 总损失
 9. `total.backward()` 后检查梯度有限性并裁剪到 5，再更新主参数
 10. `aux_loss` 只更新 EntropyBottleneck 的 `quantiles`
 
@@ -533,22 +559,28 @@ flowchart TD
     PARSE --> SIZE_CHK{尺寸检查<br/>16-4096px}
     SIZE_CHK -->|过大| ERR1[400: 图片过大]
     SIZE_CHK -->|过小| ERR2[400: 图片过小]
-    SIZE_CHK -->|OK| PAD[8 倍数对齐<br/>保证结构/色度网格一致]
+    SIZE_CHK -->|OK| PAD[16 倍数边缘复制对齐<br/>保证 Base / Haar / SCH 网格一致]
 
-    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 5]
+    PAD --> LOAD_CKPT[加载 checkpoint<br/>要求 architecture version 8<br/>严格校验学习参数]
     LOAD_CKPT --> MODEL[KakeyaHyperpriorCodec<br/>eval mode]
 
-    MODEL --> ENCODE[y = model.encode(img)]
+    MODEL --> BASE_ENC[YCoCg /8 Base Analysis]
+    BASE_ENC --> BCODE[Base EntropyBottleneck<br/>编码并解码 y_base]
+    BCODE --> BASE_DEC[Base Synthesis<br/>decoded Base reference]
+    MODEL --> DETAIL_SUB[YCoCg - expand decoded Base]
+    BASE_DEC --> DETAIL_SUB
+    DETAIL_SUB --> HAAR_ENC[固定 Haar DWT<br/>方向子带]
+    HAAR_ENC --> ENCODE[y_detail = Haar-SCH encode(detail)]
     ENCODE --> MODEL_UPDATE[model.update<br/>熵模型 CDF 表]
     MODEL_UPDATE --> ZCODE[EntropyBottleneck<br/>compress/decompress z]
     ZCODE --> PARAMS[h_s + Attention<br/>生成 mean/scale]
     ENCODE --> YCODE[GaussianConditional<br/>条件编码 y]
     PARAMS --> YCODE
-    MODEL --> CCODE[Color EntropyBottleneck<br/>解码 c_hat]
-    YCODE --> RECONSTRUCT[IGDN 主干 + 高频头<br/>decode y_hat]
-    RECONSTRUCT --> CFUSE[替换低频 Co/Cg]
-    CCODE --> CFUSE
-    CFUSE --> CLAMP[clamp 0, 1]
+    YCODE --> RECONSTRUCT[IGDN + SCH<br/>预测 12 Haar coefficients]
+    RECONSTRUCT --> HAAR_DEC[固定 Haar IDWT<br/>有符号 YCoCg Detail]
+    HAAR_DEC --> CFUSE[expand Base + signed Detail]
+    BASE_DEC --> CFUSE
+    CFUSE --> CLAMP[YCoCg → RGB<br/>clamp 0, 1]
 
     CLAMP --> CROP[去除 padding<br/>恢复原始尺寸]
     CROP --> METRICS[计算真实 bytes / bpp<br/>PSNR / SSIM]
@@ -729,27 +761,33 @@ graph TD
 
 ### 9.3 高清大图推理流程
 
-推理时不分块、不缩放，整图通过模型（padding 到 8 的倍数）：
+推理时不切分图片、不缩放，整图通过模型（边缘复制 padding 到 16 的倍数；
+SCH attention 内部按 window strip 分块限制临时内存）：
 
 ```mermaid
 flowchart TD
     INPUT([输入图片<br/>任意尺寸 WxH]) --> CHK{尺寸检查}
     CHK -->|W or H > 4096| REJECT[拒绝: 超过 4096px]
-    CHK -->|OK| PAD[8 倍数对齐<br/>结构与色度网格共同对齐]
+    CHK -->|OK| PAD[16 倍数边缘复制对齐<br/>Base / Haar / SCH 共同对齐]
 
-    PAD --> LOAD[加载 architecture v4 checkpoint]
-    LOAD --> ENCODE[分析主干<br/>→ H/4 x W/4 x 8]
+    PAD --> LOAD[加载 architecture v8 checkpoint<br/>严格校验学习参数]
+    LOAD --> BASE[完整低频 YCoCg<br/>/8 → 4 channel latent]
+    BASE --> BCODE[Base EntropyBottleneck<br/>编码并解码]
+    BCODE --> BASE_DEC[Base Synthesis<br/>decoded Base reference]
+    LOAD --> DETAIL_SUB[YCoCg - expand decoded Base]
+    BASE_DEC --> DETAIL_SUB
+    DETAIL_SUB --> DWT_HD[固定 Haar DWT<br/>LL/LH/HL/HH]
+    DWT_HD --> ENCODE[Haar-SCH Detail 分析<br/>→ H/4 x W/4 x 8]
     ENCODE --> Y[y = tanh bound ±5]
     Y --> HA[h_a → z]
     HA --> ZCODE[EntropyBottleneck<br/>编码并解码 z]
     ZCODE --> PARAMS[h_s + Attention<br/>mean / scale]
     Y --> YCODE[GaussianConditional<br/>条件编码并解码 y]
     PARAMS --> YCODE
-    PAD --> COLOR[RGB → Co/Cg<br/>/8 + ×32]
-    COLOR --> CCODE[Color EntropyBottleneck<br/>独立编码并解码]
-    YCODE --> DECODE[IGDN 多尺度合成主干<br/>+ 高频 RGB 残差]
-    DECODE --> CFUSE[替换基础图低频 Co/Cg]
-    CCODE --> CFUSE
+    YCODE --> DECODE[IGDN + SCH<br/>预测 Haar coefficients]
+    DECODE --> IDWT_HD[固定 Haar IDWT<br/>有符号 YCoCg Detail]
+    IDWT_HD --> CFUSE[expand Base + signed Detail]
+    BASE_DEC --> CFUSE
 
     CFUSE --> CLAMP[clamp 0, 1]
     CLAMP --> CROP[去除 padding<br/>恢复 WxH]
@@ -795,9 +833,10 @@ graph LR
         ARCH1[BlendedInstanceNorm<br/>90% IN + 10% raw 初始值<br/>每通道可学习]
         ARCH2[WeightNorm<br/>权重归一化<br/>尺寸无关]
         ARCH3[全卷积<br/>无全连接层<br/>任意尺寸]
-        ARCH4[PixelShuffle/Unshuffle<br/>2x 空间重排<br/>尺寸无关]
+        ARCH4[固定 Haar + PixelUnshuffle<br/>方向子带与空间重排<br/>尺寸无关]
         ARCH5[512 高清 checkpoint 闸门<br/>PSNR/SSIM 回退保护]
-        ARCH6[低频 Co/Cg 独立码流<br/>绕过 InstanceNorm]
+        ARCH6[完整低频 YCoCg Base<br/>绕过 InstanceNorm]
+        ARCH7[轻量 SCH<br/>增强局部窗口通道建模]
     end
 
     ARCH1 -.->|支持| I_LARGE
@@ -806,6 +845,7 @@ graph LR
     ARCH4 -.->|支持| I_LARGE
     ARCH5 -.->|保护| I_LARGE
     ARCH6 -.->|保护颜色| I_LARGE
+    ARCH7 -.->|窗口通道上下文| I_LARGE
 
     style S256 fill:#c8e6c9
     style I_SMALL fill:#c8e6c9
@@ -817,16 +857,22 @@ graph LR
 
 #### 当前方案：可学习的 Base / Detail 分解
 
-架构 v5 保留已经验证的大图 Detail 主干，但不再把低频亮度留给 InstanceNorm
-路径。RGB 先可逆转换为 YCoCg，完整的 `/8` 低频 Y/Co/Cg 由不含 InstanceNorm
-的 Base Analysis / Synthesis 编码为 4 通道潜变量。解码端在 YCoCg 域执行严格的
-频率分解：Base 提供全部绝对低频统计，原 IGDN/高频头只提供 Detail 高频。因此
-亮度、对比度和绿色/蓝色色度不再依赖被归一化的特征，同时保留高清边缘路径。
+架构 v8 先把 RGB 可逆转换为 YCoCg，再显式分解成 `/8` Base low-pass 和有符号
+Detail high-pass。完整低频 Y/Co/Cg 由不含 InstanceNorm 的 Base Analysis /
+Synthesis 编码为 4 通道潜变量；编码端先量化并重建 Base，Detail 编码器再接收
+减去这个 decoded Base 后的残差，从而能在 Detail 中补偿 Base 量化误差，
+不再为最终会被覆盖的低频重复付费。Detail 边界使用固定 Haar DWT/IDWT，把
+LL/LH/HL/HH 方向子带交给网络学习；64 通道瓶颈使用轻量 SCH，把局部多尺度卷积
+与 4×4 window-channel attention 融合。Detail 解码器预测 12 个 Haar coefficients，
+经 IDWT 生成有符号 YCoCg 残差，不经过 Sigmoid。合成仍使用严格可逆的
+Laplacian pyramid 形式 `expand(Base) + Detail`。
 
 熵模型刻意保持为 `p(z)·p(y_detail|z)·p(y_base)`，没有引入联合上下文或串行
-自回归依赖。`.kky` v7 使用 `[z,y_detail,y_base]` 三段，仍可并行解码。项目以实验
-效果优先，架构版本提升到 5，旧 checkpoint 与 v6 bitstream 明确不兼容，避免让
-兼容逻辑限制 Base 表示能力。
+自回归依赖。`.kky` v10 使用 `[z,y_detail,y_base]` 三段；编码端 Base-first，解码端仍不需要
+像素级串行自回归。项目以实验效果优先，架构版本提升到 8，旧 checkpoint 与 v9 bitstream
+明确不兼容。Haar
+不含可学习参数，SCH 只放在 H/4 的对称瓶颈，不把论文的 256/320 通道大模型或
+5-slice 自回归熵模型照搬进当前项目。
 
 训练数据通过 step mixer 按实际优化步骤执行 40% reference / 30% procedural /
 30% real；checkpoint 除 PSNR/SSIM 外还保护高清 chroma MAE。

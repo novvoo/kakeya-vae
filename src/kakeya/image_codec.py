@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.layers import GDN
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from torch import nn, optim
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.data import DataLoader, Dataset
@@ -31,7 +31,7 @@ TEST_IMAGE_HD = PROJECT_ROOT / "assets/test_images/kakeya_codec_card_v2_source.p
 HD_IMAGE_DIR = PROJECT_ROOT / "assets/hd_images"
 SOURCE_IMAGE_SIZE = 512
 TARGET_IMAGE_SIZE = 256
-# Multi-scale training sizes (must be multiples of 8 due to 3× PixelShuffle).
+# Training sizes align with the /4 Detail grid and its 4×4 SCH windows.
 # 50% of samples stay at 256² to preserve core codec quality; the other 50%
 # are drawn from these sizes so the model sees a real range of resolutions.
 MULTISCALE_TRAIN_SIZES = (128, 192, 256, 384, 512, 768)
@@ -44,10 +44,14 @@ LATENT_MEAN_BOUND = 5.0
 # / data combination simply cannot reach the threshold.
 TARGET_RATE_BPP = 2.5
 BITSTREAM_MAGIC = b"KKEYA-EB1"
+CODEC_ALIGNMENT = 16
+CODEC_ARCHITECTURE_VERSION = 8
+CODEC_BITSTREAM_FORMAT = "Kakeya Hyperprior v10"
 BASE_DOWNSAMPLE = 8
 BASE_QUANTIZATION_GAIN = 32.0
 BASE_SIGNAL_CHANNELS = 3
 BASE_LATENT_CHANNELS = 4
+DETAIL_RESIDUAL_BOUND = 2.0
 SMALL_IMAGE_MAX_SIZE = 256
 SMALL_IMAGE_RATE_MULTIPLIER = 0.35
 SMALL_IMAGE_EDGE_WEIGHT = 5.0
@@ -99,9 +103,7 @@ def _low_frequency_base(
         image.shape[-2] // BASE_DOWNSAMPLE,
         image.shape[-1] // BASE_DOWNSAMPLE,
     ):
-        return F.avg_pool2d(
-            ycocg, kernel_size=BASE_DOWNSAMPLE, stride=BASE_DOWNSAMPLE
-        )
+        return F.avg_pool2d(ycocg, kernel_size=BASE_DOWNSAMPLE, stride=BASE_DOWNSAMPLE)
     return F.adaptive_avg_pool2d(ycocg, output_size)
 
 
@@ -133,20 +135,49 @@ def _base_mae(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     )
 
 
+def _detail_ycocg(
+    image: torch.Tensor, decoded_base: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Return Detail relative to the same Base available to the decoder."""
+    if decoded_base is None:
+        output_size = (
+            max(1, image.shape[-2] // BASE_DOWNSAMPLE),
+            max(1, image.shape[-1] // BASE_DOWNSAMPLE),
+        )
+        decoded_base = _low_frequency_base(image, output_size)
+    low_frequency = F.interpolate(
+        decoded_base,
+        size=image.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return _rgb_to_ycocg(image) - low_frequency
+
+
+def _detail_mae(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Directly supervise the high-pass representation carried by y_detail."""
+    return F.l1_loss(_detail_ycocg(reconstructed), _detail_ycocg(target))
+
+
+def _compose_base_detail(
+    decoded_base: torch.Tensor, decoded_detail: torch.Tensor
+) -> torch.Tensor:
+    """Invert the Laplacian split: expand(Base) + signed Detail."""
+    base = F.interpolate(
+        decoded_base,
+        size=decoded_detail.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    return _ycocg_to_rgb(base + decoded_detail).clamp(0, 1)
+
+
 def _restore_low_frequency_base(
     reconstructed: torch.Tensor, decoded_base: torch.Tensor
 ) -> torch.Tensor:
     """Replace low-frequency Y/Co/Cg while preserving the Detail high-pass."""
-    base_size = decoded_base.shape[-2:]
-    detail_ycocg = _rgb_to_ycocg(reconstructed)
-    detail_low_frequency = F.adaptive_avg_pool2d(detail_ycocg, base_size)
-    base_delta = F.interpolate(
-        decoded_base - detail_low_frequency,
-        size=reconstructed.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
-    )
-    return _ycocg_to_rgb(detail_ycocg + base_delta).clamp(0, 1)
+    detail_ycocg = _detail_ycocg(reconstructed)
+    return _compose_base_detail(decoded_base, detail_ycocg)
 
 
 class BlendedInstanceNorm(nn.Module):
@@ -206,6 +237,69 @@ class DepthToSpace(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.net(value)
+
+
+def _haar_filters() -> torch.Tensor:
+    """Return the orthonormal LL/LH/HL/HH Haar analysis filters."""
+    return 0.5 * torch.tensor(
+        [
+            [[1.0, 1.0], [1.0, 1.0]],
+            [[1.0, -1.0], [1.0, -1.0]],
+            [[1.0, 1.0], [-1.0, -1.0]],
+            [[1.0, -1.0], [-1.0, 1.0]],
+        ]
+    ).unsqueeze(1)
+
+
+class FixedHaarAnalysis(nn.Module):
+    """Parameter-free 2× Haar DWT with four subbands per input channel."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.channels = channels
+        self.register_buffer("filters", _haar_filters().repeat(channels, 1, 1, 1))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if value.shape[1] != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {value.shape[1]}")
+        if value.shape[-2] % 2 or value.shape[-1] % 2:
+            raise ValueError("Haar analysis requires even spatial dimensions")
+        return F.conv2d(value, self.filters, stride=2, groups=self.channels)
+
+
+class FixedHaarSynthesis(nn.Module):
+    """Exact inverse of :class:`FixedHaarAnalysis` for aligned coefficients."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.channels = channels
+        self.register_buffer("filters", _haar_filters().repeat(channels, 1, 1, 1))
+
+    def forward(self, coefficients: torch.Tensor) -> torch.Tensor:
+        expected = self.channels * 4
+        if coefficients.shape[1] != expected:
+            raise ValueError(
+                f"expected {expected} channels, got {coefficients.shape[1]}"
+            )
+        return F.conv_transpose2d(
+            coefficients, self.filters, stride=2, groups=self.channels
+        )
+
+
+class HaarDetailAnalysis(nn.Module):
+    """Expose directional Detail bands before learned feature projection."""
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.haar = FixedHaarAnalysis(input_channels)
+        self.project = nn.Sequential(
+            weight_norm(nn.Conv2d(input_channels * 4, output_channels, 3, padding=1)),
+            BlendedInstanceNorm(output_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.project(self.haar(value))
 
 
 class LearnedUpsample(nn.Module):
@@ -278,6 +372,117 @@ class MultiScaleResidualBlock(nn.Module):
         return value + self.residual_scale * fused
 
 
+class WindowChannelAttention(nn.Module):
+    """Attend across channel tokens using a fixed spatial window embedding."""
+
+    def __init__(
+        self,
+        channels: int,
+        window_size: int = 4,
+        heads: int = 4,
+        max_windows_per_chunk: int = 2048,
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.window_size = window_size
+        if max_windows_per_chunk <= 0:
+            raise ValueError("max_windows_per_chunk must be positive")
+        self.max_windows_per_chunk = max_windows_per_chunk
+        embedding_dim = window_size * window_size
+        if embedding_dim % heads:
+            raise ValueError("window area must be divisible by attention heads")
+        self.cpe = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=True
+        )
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.attention = nn.MultiheadAttention(
+            embedding_dim, heads, batch_first=True, dropout=0.0
+        )
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 4),
+            nn.GELU(),
+            nn.Linear(embedding_dim * 4, embedding_dim),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        _, channels, height, width = value.shape
+        if channels != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {channels}")
+        window = self.window_size
+        pad_h = (window - height % window) % window
+        pad_w = (window - width % window) % window
+        positioned = value + self.cpe(value)
+        if pad_h or pad_w:
+            positioned = F.pad(positioned, (0, pad_w, 0, pad_h))
+        padded_height, padded_width = positioned.shape[-2:]
+        rows = padded_height // window
+        columns = padded_width // window
+        # Materialize only a bounded strip of windows at a time. Splitting only
+        # the attention call would still retain every token and chunk output.
+        rows_per_strip = max(1, self.max_windows_per_chunk // columns)
+        output_batches: list[torch.Tensor] = []
+        for sample in positioned.split(1, dim=0):
+            output_strips: list[torch.Tensor] = []
+            for row_start in range(0, rows, rows_per_strip):
+                strip_rows = min(rows_per_strip, rows - row_start)
+                strip = sample[
+                    :,
+                    :,
+                    row_start * window : (row_start + strip_rows) * window,
+                    :,
+                ]
+                tokens = (
+                    strip.unfold(2, window, window)
+                    .unfold(3, window, window)
+                    .permute(0, 2, 3, 1, 4, 5)
+                    .reshape(strip_rows * columns, channels, window * window)
+                )
+                processed: list[torch.Tensor] = []
+                for token_chunk in tokens.split(self.max_windows_per_chunk, dim=0):
+                    normalized = self.norm1(token_chunk)
+                    attended, _ = self.attention(
+                        normalized, normalized, normalized, need_weights=False
+                    )
+                    token_chunk = token_chunk + attended
+                    processed.append(token_chunk + self.mlp(self.norm2(token_chunk)))
+                strip_tokens = torch.cat(processed, dim=0)
+                output_strips.append(
+                    strip_tokens.reshape(
+                        1, strip_rows, columns, channels, window, window
+                    )
+                    .permute(0, 3, 1, 4, 2, 5)
+                    .reshape(1, channels, strip_rows * window, padded_width)
+                )
+            output_batches.append(torch.cat(output_strips, dim=2))
+        output = torch.cat(output_batches, dim=0)
+        return output[:, :, :height, :width]
+
+
+class LightweightSCHBlock(nn.Module):
+    """Combine local multi-scale convolution with window-channel attention."""
+
+    def __init__(self, channels: int, window_size: int = 4) -> None:
+        super().__init__()
+        if channels % 2:
+            raise ValueError("SCH channels must be even")
+        branch_channels = channels // 2
+        self.pre = nn.Conv2d(channels, channels, 1)
+        self.local = MultiScaleResidualBlock(branch_channels)
+        self.global_context = WindowChannelAttention(
+            branch_channels, window_size=window_size, heads=4
+        )
+        self.fuse = nn.Conv2d(channels, channels, 1)
+        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        local, global_context = self.pre(value).chunk(2, dim=1)
+        fused = self.fuse(
+            torch.cat((self.local(local), self.global_context(global_context)), dim=1)
+        )
+        return value + self.residual_scale * fused
+
+
 class BaseAnalysisTransform(nn.Module):
     """Encode absolute low-frequency Y/Co/Cg without normalization."""
 
@@ -295,9 +500,7 @@ class BaseAnalysisTransform(nn.Module):
         nn.init.zeros_(self.projection.bias)
         with torch.no_grad():
             for channel in range(BASE_SIGNAL_CHANNELS):
-                self.projection.weight[channel, channel, 0, 0] = (
-                    BASE_QUANTIZATION_GAIN
-                )
+                self.projection.weight[channel, channel, 0, 0] = BASE_QUANTIZATION_GAIN
         nn.init.zeros_(self.refinement[-1].weight)
         nn.init.zeros_(self.refinement[-1].bias)
 
@@ -338,7 +541,7 @@ class KakeyaHyperpriorCodec(nn.Module):
     The analysis transform keeps the empirically useful InstanceNorm-based
     space-to-depth path. Multi-scale residual blocks preserve both thin strokes
     and wider layout context. The synthesis transform uses inverse GDN and a
-    learned high-frequency RGB residual instead of an autoregressive decoder.
+    learned signed YCoCg high-pass instead of reconstructing redundant RGB bases.
     """
 
     def __init__(self, latent_dim: int = 8, hyper_dim: int | None = None) -> None:
@@ -346,14 +549,15 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.latent_dim = latent_dim
         hyper_dim = hyper_dim or max(8, latent_dim)
         self.hyper_dim = hyper_dim
-        # Analysis transform: SpaceToDepth × 2 → 4× downscale to 64×64
+        # Analysis transform: fixed Haar /2 + learned rearrangement /2.
         self.g_a = nn.Sequential(
-            SpaceToDepth(3, 24),
+            HaarDetailAnalysis(3, 24),
             ResidualBlockGDN(24),
             SpaceToDepth(24, 32),
             ResidualBlockGDN(32),
             weight_norm(nn.Conv2d(32, 64, 1)),
             MultiScaleResidualBlock(64),
+            LightweightSCHBlock(64),
             ResidualBlockGDN(64),
             weight_norm(nn.Conv2d(64, latent_dim, 1)),
         )
@@ -395,6 +599,7 @@ class KakeyaHyperpriorCodec(nn.Module):
         )  # scale table set after h_s output
         self.g_s_features = nn.Sequential(
             weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
+            LightweightSCHBlock(64),
             MultiScaleResidualBlock(64),
             ResidualBlockGDN(64, inverse=True),
             weight_norm(nn.Conv2d(64, 32, 3, padding=1)),
@@ -402,22 +607,22 @@ class KakeyaHyperpriorCodec(nn.Module):
             LearnedUpsample(32),
             weight_norm(nn.Conv2d(32, 24, 3, padding=1)),
             ResidualBlockGDN(24, inverse=True),
-            DepthToSpace(24, 12),
-            weight_norm(nn.Conv2d(12, 24, 3, padding=1)),
-            nn.SiLU(),
         )
-        self.rgb_head = weight_norm(nn.Conv2d(24, 3, 3, padding=1))
-        self.detail_head = nn.Sequential(
+        self.detail_coefficient_head = weight_norm(nn.Conv2d(24, 12, 3, padding=1))
+        self.detail_coefficient_refinement = nn.Sequential(
             nn.Conv2d(24, 24, 3, padding=1, groups=24),
             nn.Conv2d(24, 24, 1),
             nn.SiLU(),
-            nn.Conv2d(24, 3, 3, padding=1),
+            nn.Conv2d(24, 12, 3, padding=1),
         )
-        nn.init.zeros_(self.detail_head[-1].weight)
-        nn.init.zeros_(self.detail_head[-1].bias)
+        self.detail_haar_synthesis = FixedHaarSynthesis(BASE_SIGNAL_CHANNELS)
+        nn.init.zeros_(self.detail_coefficient_refinement[-1].weight)
+        nn.init.zeros_(self.detail_coefficient_refinement[-1].bias)
 
-    def _analysis(self, image: torch.Tensor) -> torch.Tensor:
-        latent = self.g_a(image)
+    def _analysis(
+        self, image: torch.Tensor, decoded_base: torch.Tensor
+    ) -> torch.Tensor:
+        latent = self.g_a(_detail_ycocg(image, decoded_base))
         return LATENT_MEAN_BOUND * torch.tanh(latent / LATENT_MEAN_BOUND)
 
     def _base_analysis(self, image: torch.Tensor) -> torch.Tensor:
@@ -431,13 +636,27 @@ class KakeyaHyperpriorCodec(nn.Module):
         self, latent: torch.Tensor, base_latent: torch.Tensor | None = None
     ) -> torch.Tensor:
         features = self.g_s_features(latent)
-        logits = self.rgb_head(features) + 0.25 * self.detail_head(features)
-        reconstructed = torch.sigmoid(logits)
+        coefficients = self.detail_coefficient_head(
+            features
+        ) + 0.25 * self.detail_coefficient_refinement(features)
+        detail_logits = self.detail_haar_synthesis(coefficients)
+        detail_ycocg = DETAIL_RESIDUAL_BOUND * torch.tanh(
+            detail_logits / DETAIL_RESIDUAL_BOUND
+        )
         if base_latent is None:
-            return reconstructed
+            neutral_base = torch.zeros(
+                detail_ycocg.shape[0],
+                BASE_SIGNAL_CHANNELS,
+                max(1, detail_ycocg.shape[-2] // BASE_DOWNSAMPLE),
+                max(1, detail_ycocg.shape[-1] // BASE_DOWNSAMPLE),
+                device=detail_ycocg.device,
+                dtype=detail_ycocg.dtype,
+            )
+            neutral_base[:, 0] = 0.5
+            return _compose_base_detail(neutral_base, detail_ycocg)
 
         decoded_base = self.base_synthesis(base_latent)
-        return _restore_low_frequency_base(reconstructed, decoded_base)
+        return _compose_base_detail(decoded_base, detail_ycocg)
 
     def normalization_strength(self) -> float:
         strengths = [
@@ -449,8 +668,12 @@ class KakeyaHyperpriorCodec(nn.Module):
 
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
         """Encode an image with the learned hyperprior probability model."""
-        mu = self._analysis(image)
         base = self._base_analysis(image)
+        base_strings = self.base_entropy_bottleneck.compress(base)
+        base_hat = self.base_entropy_bottleneck.decompress(
+            base_strings, base.size()[-2:]
+        )
+        mu = self._analysis(image, self.base_synthesis(base_hat))
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
@@ -466,7 +689,6 @@ class KakeyaHyperpriorCodec(nn.Module):
             )
         indexes = self.gaussian_conditional.build_indexes(scale)
         y_strings = self.gaussian_conditional.compress(mu, indexes, means=mean)
-        base_strings = self.base_entropy_bottleneck.compress(base)
         return {
             "strings": [y_strings, z_strings, base_strings],
             "shape": z.size()[-2:],
@@ -581,15 +803,19 @@ class KakeyaHyperpriorCodec(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        mu = self._analysis(image)
         base = self._base_analysis(image)
+        base_hat, base_likelihoods = self.base_entropy_bottleneck(base)
+        # Detail targets the exact Base used by synthesis. Detaching this
+        # reference keeps Detail from changing Base merely to simplify itself;
+        # Base still receives reconstruction, Base-loss, and rate gradients.
+        decoded_base_reference = self.base_synthesis(base_hat.detach())
+        mu = self._analysis(image, decoded_base_reference)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self._apply_h_s(z_hat)
         scale, mean = params.chunk(2, dim=1)
         scale = scale.abs() + 1e-6
         y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
-        base_hat, base_likelihoods = self.base_entropy_bottleneck(base)
         reconstructed = self._synthesis(y_hat, base_hat)
         return (
             reconstructed,
@@ -602,7 +828,9 @@ class KakeyaHyperpriorCodec(nn.Module):
         )
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
-        return self._analysis(image)
+        base = self._base_analysis(image)
+        base_hat, _ = self.base_entropy_bottleneck(base)
+        return self._analysis(image, self.base_synthesis(base_hat).detach())
 
     def decode(
         self, latent: torch.Tensor, base_latent: torch.Tensor | None = None
@@ -624,8 +852,11 @@ class KakeyaHyperpriorCodec(nn.Module):
         gives much finer quantization steps (~scale, typically ~0.1) compared
         to the 7 integer bins from rounding to [-3,-2,…,3].
         """
-        mu = self._analysis(image)
         base = self._base_analysis(image)
+        base_hat = self.base_entropy_bottleneck.decompress(
+            self.base_entropy_bottleneck.compress(base), base.size()[-2:]
+        )
+        mu = self._analysis(image, self.base_synthesis(base_hat))
         z = self.h_a(mu)
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
@@ -648,10 +879,42 @@ class KakeyaHyperpriorCodec(nn.Module):
         #   y_hat = round((mu - mean) / scale) * scale + mean
         # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
         y_hat, _ = self.gaussian_conditional(mu, scale, mean)
-        base_hat = self.base_entropy_bottleneck.decompress(
-            self.base_entropy_bottleneck.compress(base), base.size()[-2:]
-        )
         return self._synthesis(y_hat, base_hat)
+
+
+_REBUILT_ENTROPY_STATE_KEYS = frozenset(
+    {
+        "entropy_bottleneck._offset",
+        "entropy_bottleneck._quantized_cdf",
+        "entropy_bottleneck._cdf_length",
+        "base_entropy_bottleneck._offset",
+        "base_entropy_bottleneck._quantized_cdf",
+        "base_entropy_bottleneck._cdf_length",
+        "gaussian_conditional._offset",
+        "gaussian_conditional._quantized_cdf",
+        "gaussian_conditional._cdf_length",
+        "gaussian_conditional.scale_table",
+    }
+)
+
+
+def load_codec_model_state(
+    model: KakeyaHyperpriorCodec, state_dict: Mapping[str, Any]
+) -> None:
+    """Load every learned parameter, rebuilding only entropy CDF buffers."""
+    filtered = {
+        key: value
+        for key, value in state_dict.items()
+        if key not in _REBUILT_ENTROPY_STATE_KEYS
+    }
+    incompatible = model.load_state_dict(filtered, strict=False)
+    missing = sorted(set(incompatible.missing_keys) - _REBUILT_ENTROPY_STATE_KEYS)
+    unexpected = sorted(incompatible.unexpected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "codec checkpoint state mismatch: "
+            f"missing={missing or 'none'}, unexpected={unexpected or 'none'}"
+        )
 
 
 class ProceduralDocumentDataset(Dataset[tuple[torch.Tensor, int]]):
@@ -883,7 +1146,11 @@ def _cycle_mini_batches(
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     while True:
         for batch in loader:
-            if isinstance(batch, list) and batch and isinstance(batch[0], (tuple, list)):
+            if (
+                isinstance(batch, list)
+                and batch
+                and isinstance(batch[0], (tuple, list))
+            ):
                 yield from batch
             else:
                 yield batch
@@ -976,11 +1243,13 @@ def _checkpoint(
             "config": config.to_dict(),
             "architecture": {
                 "name": "kakeya_multiscale_hyperprior",
-                "version": 5,
+                "version": CODEC_ARCHITECTURE_VERSION,
                 "hyper_dim": model.hyper_dim,
                 "base_channels": BASE_LATENT_CHANNELS,
                 "base_downsample": BASE_DOWNSAMPLE,
                 "base_transform": "full_ycocg_v2",
+                "detail_transform": "decoded_base_residual_v2",
+                "detail_sampling": "haar_sch_v1",
             },
             "epoch": epoch,
         },
@@ -1108,6 +1377,7 @@ def _hyperprior_epoch(
         "hue": 0.0,
         "saturation": 0.0,
         "base": 0.0,
+        "detail": 0.0,
         "kakeya": 0.0,
         "rate": 0.0,
         "psnr": 0.0,
@@ -1165,6 +1435,7 @@ def _hyperprior_epoch(
                     hue = lab_losses["hue"]
                     sat = lab_losses["saturation"]
                     base = _base_mae(reconstructed, images)
+                    detail = _detail_mae(reconstructed, images)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
 
                     total = (
@@ -1177,6 +1448,7 @@ def _hyperprior_epoch(
                         + sw["hue"] * hue
                         + sw["saturation"] * sat
                         + sw["base"] * base
+                        + sw["detail"] * detail
                         + sw["kakeya"] * coverage
                         + effective_rate_weight * rate_penalty
                     )
@@ -1189,6 +1461,7 @@ def _hyperprior_epoch(
                     hue = torch.zeros_like(loss_mse)
                     sat = torch.zeros_like(loss_mse)
                     base = torch.zeros_like(loss_mse)
+                    detail = torch.zeros_like(loss_mse)
                     rate_penalty = F.relu(bpp_bits - TARGET_RATE_BPP)
                     total = (
                         loss_mse + lambda_rate * rate_penalty + lambda_kakeya * coverage
@@ -1232,6 +1505,7 @@ def _hyperprior_epoch(
             totals["hue"] += float(hue.detach())
             totals["saturation"] += float(sat.detach())
             totals["base"] += float(base.detach())
+            totals["detail"] += float(detail.detach())
             totals["kakeya"] += float(coverage.detach())
             totals["rate"] += float(rate.detach())
             totals["psnr"] += float(psnr)
@@ -1427,9 +1701,7 @@ def train_image_codec(
         hd_calibration = _calibration_metrics(model, hd_reference)
         best_hd_psnr_seen = max(best_hd_psnr_seen, hd_calibration["psnr"])
         best_hd_ssim_seen = max(best_hd_ssim_seen, hd_calibration["ssim"])
-        best_hd_chroma_seen = min(
-            best_hd_chroma_seen, hd_calibration["chroma_mae"]
-        )
+        best_hd_chroma_seen = min(best_hd_chroma_seen, hd_calibration["chroma_mae"])
 
         # Capacity gate check (only when still in capacity stage)
         if capacity_stage:
@@ -1646,14 +1918,19 @@ def _evaluate_hd_chart(
     """
     if not TEST_IMAGE_HD.is_file():
         return {}
-    hd_image = Image.open(TEST_IMAGE_HD).convert("RGB")
-    # Pad to a multiple of 8 so structure and chroma grids align.
+    original_hd_image = Image.open(TEST_IMAGE_HD).convert("RGB")
+    hd_image = original_hd_image
+    # Align both the /8 Base grid and the 4x4 windows on the /4 Detail grid.
     w, h = hd_image.size
-    pad_w = (8 - w % 8) % 8
-    pad_h = (8 - h % 8) % 8
+    pad_w = (CODEC_ALIGNMENT - w % CODEC_ALIGNMENT) % CODEC_ALIGNMENT
+    pad_h = (CODEC_ALIGNMENT - h % CODEC_ALIGNMENT) % CODEC_ALIGNMENT
     if pad_w or pad_h:
-        hd_image = ImageOps.expand(
-            hd_image, border=(0, 0, pad_w, pad_h), fill=(0, 0, 0)
+        hd_image = Image.fromarray(
+            np.pad(
+                np.asarray(hd_image),
+                ((0, pad_h), (0, pad_w), (0, 0)),
+                mode="edge",
+            )
         )
     hd_tensor = torch.from_numpy(np.asarray(hd_image, dtype=np.float32) / 255.0)
     hd_tensor = hd_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
@@ -1662,12 +1939,15 @@ def _evaluate_hd_chart(
             model, hd_tensor, run_dir, write_file=False
         )
         recon_hd = recon_hd.clamp(0, 1)
+    if pad_w or pad_h:
+        recon_hd = recon_hd[:, :, :h, :w]
+        hd_tensor = hd_tensor[:, :, :h, :w]
     mse_hd = float(F.mse_loss(recon_hd, hd_tensor))
     psnr_hd = 99.0 if mse_hd == 0 else 10 * math.log10(1.0 / mse_hd)
     ssim_hd = float(_ssim(recon_hd, hd_tensor))
     chroma_mae_hd = float(_chroma_mae(recon_hd, hd_tensor))
     pixels = w * h
-    hd_image.save(report_dir / "original_hd.png")
+    original_hd_image.save(report_dir / "original_hd.png")
     _to_image(recon_hd[0]).save(report_dir / "reconstruction_hd.png")
     diff_hd = (recon_hd - hd_tensor).abs()[0]
     heat_hd = torch.stack(
@@ -1965,7 +2245,7 @@ def _encode_bitstream(
     *,
     write_file: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Encode Detail and learned low-frequency Base into the real v7 payload."""
+    """Encode Base-first Haar-SCH Detail into the real v10 payload."""
     import struct as _struct
 
     model.eval()
@@ -1995,11 +2275,9 @@ def _encode_bitstream(
     return reconstructed, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
-        "format": "Kakeya Hyperprior v7",
+        "format": CODEC_BITSTREAM_FORMAT,
         "bytes": file_bytes,
-        "payload_bytes": (
-            len(z_strings[0]) + len(y_strings[0]) + len(base_strings[0])
-        ),
+        "payload_bytes": (len(z_strings[0]) + len(y_strings[0]) + len(base_strings[0])),
         "structure_bytes": len(z_strings[0]) + len(y_strings[0]) + 8,
         "base_bytes": len(base_strings[0]) + 4,
         "header_bytes": 12,

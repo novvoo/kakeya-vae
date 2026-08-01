@@ -1000,13 +1000,14 @@ const STAGE_LOSS_KEYS = [
   "hue",
   "saturation",
   "base",
+  "detail",
   "kakeya",
 ];
 
 const STAGE_DEFAULTS: Record<string, Record<string, number>> = {
-  capacity:  { mse: 3.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, base: 0.5, kakeya: 0.002 },
-  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, base: 0.75, kakeya: 0.001 },
-  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, base: 1.0, kakeya: 0.0005 },
+  capacity:  { mse: 3.0, edge: 1.0, structural: 0.2, multiscale: 0.2, lab: 0.05, hue: 0.05, saturation: 0.05, base: 0.5, detail: 0.5, kakeya: 0.002 },
+  transition: { mse: 2.0, edge: 1.5, structural: 0.4, multiscale: 0.3, lab: 0.08, hue: 0.08, saturation: 0.08, base: 0.75, detail: 0.75, kakeya: 0.001 },
+  finetune:   { mse: 3.0, edge: 2.0, structural: 0.6, multiscale: 0.4, lab: 0.12, hue: 0.06, saturation: 0.08, base: 1.0, detail: 1.0, kakeya: 0.0005 },
 };
 function StageWeightsEditor({
   config, setConfig,
@@ -1990,7 +1991,7 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
               <td>
                 图文 Kakeya VAE
                 <small>
-                  Hyperprior v7 · 条件高斯 + YCoCg Base · {latentShape.join("×")}
+                  Hyperprior v10 · Base-first Haar-SCH Detail + YCoCg Base · {latentShape.join("×")}
                   {bitstream?.base_bytes
                     ? ` · Base ${formatBytes(bitstream.base_bytes)}`
                     : ""}

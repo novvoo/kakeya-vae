@@ -234,12 +234,14 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     from PIL import Image
 
     from kakeya.image_codec import (
+        CODEC_ARCHITECTURE_VERSION,
         TEST_IMAGE,
         KakeyaHyperpriorCodec,
         _encode_bitstream,
         _evaluate_hd_chart,
         _ssim,
         _to_image,
+        load_codec_model_state,
     )
 
     record = manager.get(job_id)
@@ -261,7 +263,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != 5:
+    if architecture.get("version") != CODEC_ARCHITECTURE_VERSION:
         raise HTTPException(
             status_code=409,
             detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
@@ -272,25 +274,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
         hyper_dim=int(architecture.get("hyper_dim", max(8, latent_dim))),
     ).to(device)
 
-    skip_keys = {
-        "entropy_bottleneck._offset",
-        "entropy_bottleneck._quantized_cdf",
-        "entropy_bottleneck._cdf_length",
-        "base_entropy_bottleneck._offset",
-        "base_entropy_bottleneck._quantized_cdf",
-        "base_entropy_bottleneck._cdf_length",
-        "y_entropy_bottleneck._offset",
-        "y_entropy_bottleneck._quantized_cdf",
-        "y_entropy_bottleneck._cdf_length",
-        "gaussian_conditional._offset",
-        "gaussian_conditional._quantized_cdf",
-        "gaussian_conditional._cdf_length",
-        "gaussian_conditional.scale_table",
-    }
-    filtered_sd = {
-        k: v for k, v in payload["model_state_dict"].items() if k not in skip_keys
-    }
-    model.load_state_dict(filtered_sd, strict=False)
+    load_codec_model_state(model, payload["model_state_dict"])
     model.init_scale_table()
     model.update()
     model.eval()
@@ -448,7 +432,13 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     import torch
     import torch.nn.functional as F
 
-    from kakeya.image_codec import KakeyaHyperpriorCodec, _encode_bitstream
+    from kakeya.image_codec import (
+        CODEC_ALIGNMENT,
+        CODEC_ARCHITECTURE_VERSION,
+        KakeyaHyperpriorCodec,
+        _encode_bitstream,
+        load_codec_model_state,
+    )
 
     try:
         source_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -463,12 +453,17 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     if w < 16 or h < 16:
         raise HTTPException(status_code=400, detail="图片尺寸过小（下限 16×16）")
 
-    pad_w = (8 - w % 8) % 8
-    pad_h = (8 - h % 8) % 8
+    pad_w = (CODEC_ALIGNMENT - w % CODEC_ALIGNMENT) % CODEC_ALIGNMENT
+    pad_h = (CODEC_ALIGNMENT - h % CODEC_ALIGNMENT) % CODEC_ALIGNMENT
     if pad_w or pad_h:
-        padded = Image.new("RGB", (w + pad_w, h + pad_h), (0, 0, 0))
-        padded.paste(source_image, (0, 0))
-        source_image = padded
+        # Replicate the edge rather than injecting black pixels into partial
+        # Haar/SCH windows at the right and bottom image boundaries.
+        padded_array = np.pad(
+            np.asarray(source_image),
+            ((0, pad_h), (0, pad_w), (0, 0)),
+            mode="edge",
+        )
+        source_image = Image.fromarray(padded_array)
 
     device = torch.device(
         "cuda"
@@ -484,7 +479,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
 
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != 5:
+    if architecture.get("version") != CODEC_ARCHITECTURE_VERSION:
         raise HTTPException(
             status_code=409,
             detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
@@ -495,26 +490,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
             latent_dim=latent_dim,
             hyper_dim=int(architecture.get("hyper_dim", max(8, latent_dim))),
         ).to(device)
-        # Exclude CDF buffers that mismatch shapes; update() repopulates them.
-        skip_keys = {
-            "entropy_bottleneck._offset",
-            "entropy_bottleneck._quantized_cdf",
-            "entropy_bottleneck._cdf_length",
-            "base_entropy_bottleneck._offset",
-            "base_entropy_bottleneck._quantized_cdf",
-            "base_entropy_bottleneck._cdf_length",
-            "y_entropy_bottleneck._offset",
-            "y_entropy_bottleneck._quantized_cdf",
-            "y_entropy_bottleneck._cdf_length",
-            "gaussian_conditional._offset",
-            "gaussian_conditional._quantized_cdf",
-            "gaussian_conditional._cdf_length",
-            "gaussian_conditional.scale_table",
-        }
-        filtered_sd = {
-            k: v for k, v in payload["model_state_dict"].items() if k not in skip_keys
-        }
-        model.load_state_dict(filtered_sd, strict=False)
+        load_codec_model_state(model, payload["model_state_dict"])
         model.init_scale_table()
         model.update()
         model.eval()
@@ -529,7 +505,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
 
     # Whole-image encode / compress / decode path.  The multi-scale trained
     # model handles any resolution directly, so no tiling or rescaling is
-    # needed; padding to a multiple of 8 (above) keeps the encoder happy.
+    # needed; padding to a multiple of 16 keeps Haar and SCH windows aligned.
     with torch.no_grad():
         with tempfile.TemporaryDirectory() as temp_dir:
             reconstructed, bitstream = _encode_bitstream(

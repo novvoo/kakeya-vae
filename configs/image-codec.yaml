@@ -25,6 +25,7 @@ objective:
       hue: 0.02
       saturation: 0.02
       base: 0.5
+      detail: 0.5
     transition:
       kakeya: 0.001
       mse: 5.0
@@ -33,6 +34,7 @@ objective:
       hue: 0.05
       saturation: 0.05
       base: 0.75
+      detail: 0.75
     finetune:
       kakeya: 0.0005
       mse: 5.0
@@ -41,3 +43,4 @@ objective:
       hue: 0.10
       saturation: 0.10
       base: 1.0
+      detail: 1.0

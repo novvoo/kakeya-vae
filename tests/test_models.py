@@ -9,8 +9,14 @@ from kakeya.image_codec import (
     TRAIN_MIX_CYCLE,
     BlendedInstanceNorm,
     DepthToSpace,
+    FixedHaarAnalysis,
+    FixedHaarSynthesis,
     KakeyaHyperpriorCodec,
+    LightweightSCHBlock,
     SpaceToDepth,
+    WindowChannelAttention,
+    _compose_base_detail,
+    _detail_ycocg,
     _encode_bitstream,
     _hyperprior_epoch,
     _lab_losses,
@@ -23,6 +29,7 @@ from kakeya.image_codec import (
     _scale_conditioned_objective,
     _training_step_count,
     _ycocg_to_rgb,
+    load_codec_model_state,
 )
 from kakeya.models import VAE
 
@@ -80,6 +87,64 @@ def test_space_depth_blocks_preserve_expected_shapes() -> None:
     assert up(down(image)).shape == image.shape
 
 
+def test_fixed_haar_transform_is_exactly_reversible() -> None:
+    analysis = FixedHaarAnalysis(3)
+    synthesis = FixedHaarSynthesis(3)
+    image = torch.randn(2, 3, 32, 48)
+
+    coefficients = analysis(image)
+    reconstructed = synthesis(coefficients)
+
+    assert coefficients.shape == (2, 12, 16, 24)
+    assert not list(analysis.parameters())
+    assert not list(synthesis.parameters())
+    torch.testing.assert_close(reconstructed, image, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected_band"),
+    [
+        (torch.tensor([[1.0, -1.0], [1.0, -1.0]]), 1),
+        (torch.tensor([[1.0, 1.0], [-1.0, -1.0]]), 2),
+        (torch.tensor([[1.0, -1.0], [-1.0, 1.0]]), 3),
+    ],
+)
+def test_haar_subbands_separate_edge_directions(
+    pattern: torch.Tensor, expected_band: int
+) -> None:
+    image = pattern.repeat(4, 4).view(1, 1, 8, 8)
+    coefficients = FixedHaarAnalysis(1)(image)
+    energies = coefficients.square().mean(dim=(0, 2, 3))
+
+    assert int(energies.argmax()) == expected_band
+    assert energies[expected_band] > 0
+
+
+def test_lightweight_sch_supports_non_aligned_spatial_shapes() -> None:
+    block = LightweightSCHBlock(64, window_size=4)
+    value = torch.randn(2, 64, 10, 14, requires_grad=True)
+
+    output = block(value)
+    output.mean().backward()
+
+    assert output.shape == value.shape
+    assert value.grad is not None
+    assert torch.isfinite(value.grad).all()
+
+
+def test_window_channel_attention_chunking_preserves_results() -> None:
+    unchunked = WindowChannelAttention(8, window_size=4, max_windows_per_chunk=64)
+    chunked = WindowChannelAttention(8, window_size=4, max_windows_per_chunk=1)
+    chunked.load_state_dict(unchunked.state_dict())
+    value = torch.randn(1, 8, 10, 14)
+
+    with torch.no_grad():
+        expected = unchunked(value)
+        actual = chunked(value)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 def test_training_mix_is_real_optimizer_step_ratio() -> None:
     assert len(TRAIN_MIX_CYCLE) == 10
     assert TRAIN_MIX_CYCLE.count("reference") == 4
@@ -119,7 +184,7 @@ def test_hyperprior_bitstream_round_trip_uses_conditional_model(
 
     assert decoded.shape == image.shape
     assert torch.isfinite(decoded).all()
-    assert metadata["format"] == "Kakeya Hyperprior v7"
+    assert metadata["format"] == "Kakeya Hyperprior v10"
     assert metadata["bytes"] == (tmp_path / "reports/reconstruction.kky").stat().st_size
     assert metadata["bytes"] > metadata["header_bytes"]
     assert metadata["base_bytes"] > 4
@@ -131,7 +196,9 @@ def test_base_stream_restores_low_frequency_luminance_and_chroma() -> None:
     target[:, 1] = 0.7
     target[:, 2] = 0.3
     base = torch.full_like(target, 0.4)
-    decoded_base = torch.nn.functional.adaptive_avg_pool2d(_rgb_to_ycocg(target), (4, 4))
+    decoded_base = torch.nn.functional.adaptive_avg_pool2d(
+        _rgb_to_ycocg(target), (4, 4)
+    )
 
     restored = _restore_low_frequency_base(base, decoded_base)
     base_error = torch.nn.functional.l1_loss(_rgb_to_ycocg(base), _rgb_to_ycocg(target))
@@ -139,9 +206,7 @@ def test_base_stream_restores_low_frequency_luminance_and_chroma() -> None:
         _rgb_to_ycocg(restored), _rgb_to_ycocg(target)
     )
     target_luminance = (target[:, 0] + 2 * target[:, 1] + target[:, 2]) / 4
-    restored_luminance = (
-        restored[:, 0] + 2 * restored[:, 1] + restored[:, 2]
-    ) / 4
+    restored_luminance = (restored[:, 0] + 2 * restored[:, 1] + restored[:, 2]) / 4
 
     assert restored_error < base_error * 0.01
     torch.testing.assert_close(restored_luminance, target_luminance)
@@ -149,9 +214,7 @@ def test_base_stream_restores_low_frequency_luminance_and_chroma() -> None:
 
 def test_ycocg_base_fusion_preserves_detail_high_pass() -> None:
     reconstructed = torch.full((1, 3, 32, 32), 0.4)
-    checkerboard = (
-        (torch.arange(32)[:, None] + torch.arange(32)[None, :]) % 2
-    ).float()
+    checkerboard = ((torch.arange(32)[:, None] + torch.arange(32)[None, :]) % 2).float()
     reconstructed += (checkerboard * 0.1 - 0.05)[None, None]
     decoded_base = torch.zeros(1, 3, 4, 4)
     decoded_base[:, 0] = 0.5
@@ -181,6 +244,56 @@ def test_ycocg_transform_is_reversible() -> None:
     torch.testing.assert_close(_ycocg_to_rgb(_rgb_to_ycocg(image)), image)
 
 
+def test_detail_signal_excludes_absolute_brightness() -> None:
+    image = torch.rand(1, 3, 32, 32) * 0.6 + 0.2
+    brighter = image + 0.1
+
+    torch.testing.assert_close(
+        _detail_ycocg(brighter), _detail_ycocg(image), atol=1e-6, rtol=1e-5
+    )
+
+
+def test_laplacian_base_detail_split_is_exactly_reversible() -> None:
+    image = torch.rand(1, 3, 32, 32) * 0.8 + 0.1
+    base = _low_frequency_base(image, (4, 4))
+    detail = _detail_ycocg(image)
+
+    torch.testing.assert_close(
+        _compose_base_detail(base, detail), image, atol=1e-6, rtol=1e-5
+    )
+
+
+def test_detail_can_compensate_the_decoded_base_reference() -> None:
+    image = torch.rand(1, 3, 32, 32) * 0.6 + 0.2
+    decoded_base = _low_frequency_base(image, (4, 4)).clone()
+    decoded_base[:, 0] += 0.01
+
+    detail = _detail_ycocg(image, decoded_base)
+
+    torch.testing.assert_close(
+        _compose_base_detail(decoded_base, detail), image, atol=1e-6, rtol=1e-5
+    )
+
+
+def test_forward_encodes_detail_against_quantized_base() -> None:
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8).eval()
+    image = torch.rand(1, 3, 32, 32) * 0.6 + 0.2
+    base = model._base_analysis(image)
+    base_hat, _ = model.base_entropy_bottleneck(base)
+    expected = _detail_ycocg(image, model.base_synthesis(base_hat))
+    captured: list[torch.Tensor] = []
+    handle = model.g_a[0].register_forward_pre_hook(
+        lambda _module, inputs: captured.append(inputs[0].detach())
+    )
+
+    with torch.no_grad():
+        model(image)
+    handle.remove()
+
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0], expected)
+
+
 def test_learned_base_branch_starts_as_full_ycocg_transform() -> None:
     model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8)
     image = torch.rand(1, 3, 32, 32)
@@ -199,6 +312,24 @@ def test_learned_base_branch_starts_as_full_ycocg_transform() -> None:
     assert torch.isfinite(model.base_analysis.projection.weight.grad).all()
     assert torch.isfinite(model.base_analysis.refinement[-1].weight.grad).all()
     assert torch.isfinite(model.base_synthesis.refinement[-1].weight.grad).all()
+
+
+def test_codec_state_loader_rejects_missing_learned_parameters() -> None:
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8)
+    state = dict(model.state_dict())
+    state.pop("g_a.1.net.1.bias")
+
+    with pytest.raises(RuntimeError, match="missing=.*g_a.1.net.1.bias"):
+        load_codec_model_state(model, state)
+
+
+def test_codec_state_loader_rebuilds_only_entropy_buffers() -> None:
+    source = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8)
+    target = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=8)
+
+    load_codec_model_state(target, source.state_dict())
+
+    torch.testing.assert_close(target.g_a[1].net[1].weight, source.g_a[1].net[1].weight)
 
 
 def test_small_image_objective_preserves_hd_weights() -> None:
@@ -306,8 +437,8 @@ def test_custom_backbone_detail_head_receives_gradients() -> None:
     reconstruction.mean().backward()
 
     assert model.hyper_dim == 8
-    assert model.detail_head[-1].weight.grad is not None
-    assert torch.isfinite(model.detail_head[-1].weight.grad).all()
+    assert model.detail_coefficient_refinement[-1].weight.grad is not None
+    assert torch.isfinite(model.detail_coefficient_refinement[-1].weight.grad).all()
     assert model.g_a[-1].out_channels == 4
 
 
