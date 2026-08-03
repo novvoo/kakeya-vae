@@ -333,7 +333,7 @@ graph LR
 | 多尺度块 | 局部 3x3 与 dilation=2 分支融合 |
 | 下采样 | Detail 边界固定 Haar DWT 2x + SpaceToDepth 2x = 4x |
 | 上采样 | LearnedUpsample 2x + 固定 Haar IDWT 2x |
-| SCH | 64 通道各放一个对称块；32 local + 32 window-channel，4×4 window / 4 heads；高清按 2048 windows 分块以限制峰值内存 |
+| SCH | 64 通道瓶颈各放一个对称块；32 local + 32 window-channel，4×4 window / 4 heads；高清按 2048 windows 分块以限制峰值内存 |
 | Detail 输入 | `YCoCg - upsample(low-frequency YCoCg)`；不再重复编码 Base |
 | Detail 输出 | `2·tanh` 有符号 YCoCg 残差，直接与 expanded Base 相加；无 Sigmoid |
 | Base 分支 | 完整低频 Y/Co/Cg、/8 采样、4 通道可学习 latent；无 IN，独立码流 |
@@ -693,7 +693,7 @@ graph TD
         NEW_CAP_PROG --> MERGE
         NEW_CAP_REAL --> MERGE
         MERGE --> NEW_REH
-        NEW_REH -->|保证| GATE[闸门可通过<br/>参考图 PSNR≥26<br/>或 epoch≥40 强制过闸]
+        NEW_REH -->|保证| GATE[闸门可通过<br/>参考图 PSNR≥26, SSIM≥0.96<br/>或 epoch≥40 强制过闸]
         MERGE -->|保证| GEN[真实梯度比例 40/30/30<br/>不再只是指标加权]
     end
 
@@ -810,14 +810,15 @@ Synthesis 编码为 4 通道潜变量；编码端先量化并重建 Base，Detai
 减去这个 decoded Base 后的残差，从而能在 Detail 中补偿 Base 量化误差，
 不再为最终会被覆盖的低频重复付费。Detail 边界使用固定 Haar DWT/IDWT，把
 LL/LH/HL/HH 方向子带交给网络学习；64 通道瓶颈使用轻量 SCH，把局部多尺度卷积
-与 4×4 window-channel attention 融合。Detail 解码器预测 12 个 Haar coefficients，
+与 4×4 window-channel attention 融合。
+Detail 解码器预测 12 个 Haar coefficients，
 经 IDWT 生成有符号 YCoCg 残差，不经过 Sigmoid。合成仍使用严格可逆的
 Laplacian pyramid 形式 `expand(Base) + Detail`。
 
 熵模型刻意保持为 `p(z)·p(y_detail|z)·p(y_base)`，没有引入联合上下文或串行
 自回归依赖。`.kky` v10 使用 `[z,y_detail,y_base]` 三段；编码端 Base-first，解码端仍不需要
-像素级串行自回归。项目以实验效果优先，架构版本提升到 8，旧 checkpoint 与 v9 bitstream
-明确不兼容。Haar
+像素级串行自回归。项目以实验效果优先，架构版本为 8，旧 checkpoint
+与 v9 bitstream 明确不兼容。Haar
 不含可学习参数，SCH 只放在 H/4 的对称瓶颈，不把论文的 256/320 通道大模型或
 5-slice 自回归熵模型照搬进当前项目。
 
