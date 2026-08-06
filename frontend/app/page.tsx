@@ -165,7 +165,7 @@ const IMAGE_CODEC_REFERENCES = [
     venue: "CVPR 2026",
     focus: "稀疏注意力与自适应频率的学习式图像压缩",
     relation: "直接优化率失真，并在 256×256 图像块上训练",
-    gap: "当前已有基础因子化熵瓶颈；下一步是超先验、上下文模型和自适应频率建模",
+    gap: "当前已有超先验 + 通道维分组上下文（Minnen 2020）；下一步是 Checkerboard 空间上下文与自适应频率建模",
     reported:
       "论文报告：相对 VTM-9.1，Kodak / CLIC / Tecnick BD-rate 为 −17.40% / −17.35% / −20.57%。",
     href: "https://openaccess.thecvf.com/content/CVPR2026/papers/Ma_Learned_Image_Compression_via_Sparse_Attention_and_Adaptive_Frequency_CVPR_2026_paper.pdf",
@@ -202,7 +202,7 @@ const IMAGE_CODEC_REFERENCES = [
     venue: "OFFICIAL PRETRAINED",
     focus: "可下载的学习式图像压缩预训练模型与统一评估工具",
     relation: "适合作为后续按需下载的可复现实测基线，无需重新训练",
-    gap: "当前使用其基础 EntropyBottleneck；预训练模型仍作为按需下载基线",
+    gap: "当前使用其 EntropyBottleneck + GaussianConditional + 通道维分组上下文；预训练模型仍作为按需下载基线",
     reported: "官方模型库支持 pretrained=True，并提供编码、解码与评估脚本。",
     href: "https://github.com/InterDigitalInc/CompressAI",
   },
@@ -1419,7 +1419,7 @@ function SandboxPlayground({
         </div>
         <div className="sandbox-body">
           <p className="sandbox-intro">
-            上传别人训练好的 Kakeya ImageCodecVAE checkpoint（.pt 文件）和一张测试图，
+            上传别人训练好的 Kakeya checkpoint（.pt 文件，需为架构 v9 / Hyperprior v11）和一张测试图，
             立即看压缩还原效果。不需要训练，所有计算都在你本机完成。
           </p>
           <div className="sandbox-upload-grid">
@@ -1853,7 +1853,8 @@ function ImageCodecResults({
               {bitstream.format} · {bitstream.bpp.toFixed(3)} bpp
             </strong>
             <p>
-              码流包含格式头和量化潜变量；解码还需要本次训练的模型检查点。
+              码流包含格式头和量化潜变量（z + y_detail_g1 + y_detail_g2 + y_base 四段）；
+              解码还需要本次训练的模型检查点。
               点击右侧下载 final.pt（可配合 <code>scripts/codec_cli.py</code> 压缩/解压图片）。
             </p>
           </div>
@@ -1889,7 +1890,8 @@ function ImageCodecResults({
       <ImageCodecFrontier />
       <p className="benchmark-note">
         当前版本验证同分布图文重建质量；陌生图片泛化仍需要真实图文数据集。文件大小来自
-        CompressAI EntropyBottleneck 生成的实际码流，不再用潜变量元素数估算。
+        ChannelGroupContext + GaussianConditional + EntropyBottleneck 联合熵编码生成的实际码流，
+        不再用潜变量元素数估算。
       </p>
     </>
   );
@@ -2032,7 +2034,7 @@ function CodecBaselineComparison({ result }: { result: ResultPayload }) {
               <td>
                 图文 Kakeya VAE
                 <small>
-                  Hyperprior v10 · Base-first Haar-SCH Detail + YCoCg Base · {latentShape.join("×")}
+                  {bitstream?.format ?? "Kakeya Hyperprior v11"} · Base-first Haar-SCH Detail + YCoCg Base + 通道分组上下文 · {latentShape.join("×")}
                   {bitstream?.base_bytes
                     ? ` · Base ${formatBytes(bitstream.base_bytes)}`
                     : ""}

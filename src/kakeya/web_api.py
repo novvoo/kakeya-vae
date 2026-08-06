@@ -235,6 +235,7 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
 
     from kakeya.image_codec import (
         CODEC_ARCHITECTURE_VERSION,
+        CODEC_BITSTREAM_FORMAT,
         TEST_IMAGE,
         KakeyaHyperpriorCodec,
         _encode_bitstream,
@@ -263,10 +264,15 @@ def regenerate_experiment(job_id: str) -> dict[str, Any]:
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != CODEC_ARCHITECTURE_VERSION:
+    ckpt_version = architecture.get("version")
+    if ckpt_version != CODEC_ARCHITECTURE_VERSION:
         raise HTTPException(
             status_code=409,
-            detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
+            detail=(
+                f"检查点架构版本 v{ckpt_version} 与当前主干 v{CODEC_ARCHITECTURE_VERSION}"
+                f"（{CODEC_BITSTREAM_FORMAT}，含通道维分组上下文）不兼容，"
+                "请用当前主干重新训练"
+            ),
         )
     latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     model = KakeyaHyperpriorCodec(
@@ -435,6 +441,7 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
     from kakeya.image_codec import (
         CODEC_ALIGNMENT,
         CODEC_ARCHITECTURE_VERSION,
+        CODEC_BITSTREAM_FORMAT,
         KakeyaHyperpriorCodec,
         _encode_bitstream,
         load_codec_model_state,
@@ -479,10 +486,15 @@ def _do_reconstruct(checkpoint_path: Path, image_bytes: bytes) -> dict[str, Any]
 
     config = payload.get("config", {}) if isinstance(payload, dict) else {}
     architecture = payload.get("architecture", {}) if isinstance(payload, dict) else {}
-    if architecture.get("version") != CODEC_ARCHITECTURE_VERSION:
+    ckpt_version = architecture.get("version")
+    if ckpt_version != CODEC_ARCHITECTURE_VERSION:
         raise HTTPException(
             status_code=409,
-            detail="该检查点属于旧主干，请用当前多尺度主干重新训练",
+            detail=(
+                f"检查点架构版本 v{ckpt_version} 与当前主干 v{CODEC_ARCHITECTURE_VERSION}"
+                f"（{CODEC_BITSTREAM_FORMAT}，含通道维分组上下文）不兼容，"
+                "请用当前主干重新训练"
+            ),
         )
     latent_dim = config.get("latent_dim", 8) if isinstance(config, dict) else 8
     try:

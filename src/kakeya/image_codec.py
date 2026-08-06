@@ -45,8 +45,14 @@ LATENT_MEAN_BOUND = 5.0
 TARGET_RATE_BPP = 2.5
 BITSTREAM_MAGIC = b"KKEYA-EB1"
 CODEC_ALIGNMENT = 16
-CODEC_ARCHITECTURE_VERSION = 8
-CODEC_BITSTREAM_FORMAT = "Kakeya Hyperprior v10"
+CODEC_ARCHITECTURE_VERSION = 9
+CODEC_BITSTREAM_FORMAT = "Kakeya Hyperprior v11"
+# Channel-wise autoregressive context (Minnen 2020): the Detail latent is
+# split into CONTEXT_GROUP_COUNT equal groups. Group 1 is decoded from the
+# hyperprior only; its quantized values then condition group 2's entropy
+# parameters via ChannelGroupContext. Keeps parallel decoding (no pixel-level
+# autoregression) while lowering the conditional entropy of y_detail.
+CONTEXT_GROUP_COUNT = 2
 BASE_DOWNSAMPLE = 8
 BASE_QUANTIZATION_GAIN = 32.0
 BASE_SIGNAL_CHANNELS = 3
@@ -487,6 +493,88 @@ class LightweightSCHBlock(nn.Module):
         return value + self.residual_scale * fused
 
 
+class ChannelGroupContext(nn.Module):
+    """Channel-wise autoregressive context for the second latent group.
+
+    Following Minnen 2020 ("Channel-wise Autoregressive Entropy Models for
+    Learned Image Compression"), the Detail latent is split into two channel
+    groups. After group 1 is quantized from the hyperprior, its reconstructed
+    values ``y_hat_g1`` are fed through a small conv stack to predict a
+    context feature for group 2. A 1×1 fusion combines this context with the
+    hyperprior parameters of group 2, yielding the final ``(scale, mean)`` for
+    ``GaussianConditional`` on group 2. Decoding stays parallel within each
+    group — only two sequential channel-group passes are needed.
+
+    Initialization strategy (v9.1, fixes the capacity-stage naked-quantization
+    regression observed in the 0806 run):
+
+    * ``fusion`` is **identity-initialized** so that at the start of training
+      ``scale_g2 ≈ hyper_scale_g2`` and ``mean_g2 ≈ hyper_mean_g2`` — i.e.
+      group 2 begins from the exact v8 hyperprior-only behavior. The context
+      branch output is zeroed (via the zero-init ``context_proj``) so it
+      contributes nothing until the network has learned useful corrections.
+      This avoids the 40-epoch "naked quantization" window where group 2 had
+      ``scale=1e-6, mean=0`` and the transform network learned a broken
+      quantization-noise distribution.
+    * ``context_net`` is a single 3×3 conv (down from two 5×5 convs) to cut
+      parameter count by ~70% and reduce the train→val rate gap (10.6% in
+      the 0806 run vs 2.4% for v8).
+    """
+
+    def __init__(self, group1_channels: int, group2_channels: int) -> None:
+        super().__init__()
+        self.group2_channels = group2_channels
+        # Context features from already-decoded group 1. Single 3×3 conv keeps
+        # the branch small — the 0806 run showed the two-5×5 stack overfit the
+        # 128-image training set (rate train-val gap 10.6%).
+        self.context_net = weight_norm(
+            nn.Conv2d(group1_channels, group2_channels * 2, 3, padding=1)
+        )
+        # Project context features to a residual correction on the hyperprior
+        # params. Zero-initialized so the context contributes nothing at start.
+        self.context_proj = nn.Conv2d(group2_channels * 2, group2_channels * 2, 1)
+        nn.init.zeros_(self.context_proj.weight)
+        nn.init.zeros_(self.context_proj.bias)
+        # Fusion is identity-initialized: it passes hyperprior params through
+        # unchanged at init, so group 2 starts from v8 behavior. No weight_norm
+        # here so the identity init actually takes effect.
+        self.fusion = nn.Conv2d(group2_channels * 4, group2_channels * 2, 1)
+        self._init_fusion_identity(group2_channels)
+
+    def _init_fusion_identity(self, g2: int) -> None:
+        """Initialize ``fusion`` so it returns ``hyper_scale, hyper_mean`` as-is.
+
+        Input layout (cat): [hyper_scale_g2 (g2), hyper_mean_g2 (g2), context (g2*2)].
+        Output layout (chunk 2): [scale_g2 (g2), mean_g2 (g2)].
+        We want scale_g2 = hyper_scale_g2 and mean_g2 = hyper_mean_g2 at init,
+        so the fusion weight is an identity block on the first 2·g2 input
+        channels and zero on the context channels.
+        """
+        nn.init.zeros_(self.fusion.weight)
+        nn.init.zeros_(self.fusion.bias)
+        with torch.no_grad():
+            for c in range(g2):
+                # scale_g2[c] = hyper_scale_g2[c]  (input channel c → output c)
+                self.fusion.weight[c, c] = 1.0
+                # mean_g2[c] = hyper_mean_g2[c]    (input channel g2+c → output g2+c)
+                self.fusion.weight[g2 + c, g2 + c] = 1.0
+
+    def forward(
+        self,
+        y_hat_g1: torch.Tensor,
+        hyper_scale_g2: torch.Tensor,
+        hyper_mean_g2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = self.context_net(y_hat_g1)
+        context_correction = self.context_proj(context)
+        fused = self.fusion(
+            torch.cat((hyper_scale_g2, hyper_mean_g2, context_correction), dim=1)
+        )
+        scale_g2, mean_g2 = fused.chunk(2, dim=1)
+        scale_g2 = scale_g2.abs() + 1e-6
+        return scale_g2, mean_g2
+
+
 class BaseAnalysisTransform(nn.Module):
     """Encode absolute low-frequency Y/Co/Cg without normalization."""
 
@@ -550,7 +638,16 @@ class KakeyaHyperpriorCodec(nn.Module):
 
     def __init__(self, latent_dim: int = 8, hyper_dim: int | None = None) -> None:
         super().__init__()
+        if latent_dim % CONTEXT_GROUP_COUNT:
+            raise ValueError(
+                f"latent_dim ({latent_dim}) must be divisible by "
+                f"CONTEXT_GROUP_COUNT ({CONTEXT_GROUP_COUNT})"
+            )
         self.latent_dim = latent_dim
+        # Channel-wise autoregressive split: group 1 decoded from hyperprior,
+        # group 2 conditioned on group 1's quantized values.
+        self.group1_channels = latent_dim // CONTEXT_GROUP_COUNT
+        self.group2_channels = latent_dim - self.group1_channels
         hyper_dim = hyper_dim or max(8, latent_dim)
         self.hyper_dim = hyper_dim
         # Analysis transform: fixed Haar /2 + learned rearrangement /2.
@@ -601,6 +698,10 @@ class KakeyaHyperpriorCodec(nn.Module):
         self.gaussian_conditional = GaussianConditional(
             None
         )  # scale table set after h_s output
+        # Channel-wise autoregressive context for group 2 (Minnen 2020).
+        self.channel_context = ChannelGroupContext(
+            self.group1_channels, self.group2_channels
+        )
         self.g_s_features = nn.Sequential(
             weight_norm(nn.Conv2d(latent_dim, 64, 3, padding=1)),
             LightweightSCHBlock(64),
@@ -670,8 +771,29 @@ class KakeyaHyperpriorCodec(nn.Module):
         ]
         return float(torch.stack(strengths).mean()) if strengths else 0.0
 
+    def _hyper_scale_mean(
+        self, z_hat: torch.Tensor, target_size: tuple[int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run h_s(z_hat) → (scale, mean) aligned to the latent spatial size."""
+        params = self._apply_h_s(z_hat)
+        scale, mean = params.chunk(2, dim=1)
+        scale = scale.abs() + 1e-6
+        if scale.shape[-2:] != target_size:
+            scale = F.interpolate(
+                scale, size=target_size, mode="bilinear", align_corners=False
+            )
+            mean = F.interpolate(
+                mean, size=target_size, mode="bilinear", align_corners=False
+            )
+        return scale, mean
+
     def compress(self, image: torch.Tensor) -> dict[str, Any]:
-        """Encode an image with the learned hyperprior probability model."""
+        """Encode an image with the channel-grouped hyperprior entropy model.
+
+        Group 1 of the Detail latent is range-coded from the hyperprior
+        parameters; its decoded values then condition group 2's parameters
+        via :class:`ChannelGroupContext`, which is range-coded separately.
+        """
         base = self._base_analysis(image)
         base_strings = self.base_entropy_bottleneck.compress(base)
         base_hat = self.base_entropy_bottleneck.decompress(
@@ -681,20 +803,23 @@ class KakeyaHyperpriorCodec(nn.Module):
         z = self.h_a(mu)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-        params = self._apply_h_s(z_hat)
-        scale, mean = params.chunk(2, dim=1)
-        scale = scale.abs() + 1e-6
-        if scale.shape[-2:] != mu.shape[-2:]:
-            scale = F.interpolate(
-                scale, size=mu.shape[-2:], mode="bilinear", align_corners=False
-            )
-            mean = F.interpolate(
-                mean, size=mu.shape[-2:], mode="bilinear", align_corners=False
-            )
-        indexes = self.gaussian_conditional.build_indexes(scale)
-        y_strings = self.gaussian_conditional.compress(mu, indexes, means=mean)
+        scale, mean = self._hyper_scale_mean(z_hat, mu.shape[-2:])
+        g1, g2 = self.group1_channels, self.group2_channels
+        scale1, mean1 = scale[:, :g1], mean[:, :g1]
+        indexes1 = self.gaussian_conditional.build_indexes(scale1)
+        y_strings1 = self.gaussian_conditional.compress(
+            mu[:, :g1], indexes1, means=mean1
+        )
+        y_hat1 = self.gaussian_conditional.decompress(
+            y_strings1, indexes1, means=mean1
+        )
+        scale2, mean2 = self.channel_context(y_hat1, scale[:, g1:], mean[:, g1:])
+        indexes2 = self.gaussian_conditional.build_indexes(scale2)
+        y_strings2 = self.gaussian_conditional.compress(
+            mu[:, g1:], indexes2, means=mean2
+        )
         return {
-            "strings": [y_strings, z_strings, base_strings],
+            "strings": [y_strings1, y_strings2, z_strings, base_strings],
             "shape": z.size()[-2:],
             "y_shape": mu.size()[-2:],
             "base_shape": base.size()[-2:],
@@ -707,21 +832,22 @@ class KakeyaHyperpriorCodec(nn.Module):
         y_shape: tuple[int, int],
         base_shape: tuple[int, int],
     ) -> torch.Tensor:
-        """Decode an image using z to reconstruct y's conditional distribution."""
-        y_strings, z_strings, base_strings = strings
+        """Decode using z → group1 → group2 channel-wise autoregression."""
+        y_strings1, y_strings2, z_strings, base_strings = strings
         z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
-        params = self._apply_h_s(z_hat)
-        scale, mean = params.chunk(2, dim=1)
-        scale = scale.abs() + 1e-6
-        if scale.shape[-2:] != y_shape:
-            scale = F.interpolate(
-                scale, size=y_shape, mode="bilinear", align_corners=False
-            )
-            mean = F.interpolate(
-                mean, size=y_shape, mode="bilinear", align_corners=False
-            )
-        indexes = self.gaussian_conditional.build_indexes(scale)
-        y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=mean)
+        scale, mean = self._hyper_scale_mean(z_hat, y_shape)
+        g1, g2 = self.group1_channels, self.group2_channels
+        scale1, mean1 = scale[:, :g1], mean[:, :g1]
+        indexes1 = self.gaussian_conditional.build_indexes(scale1)
+        y_hat1 = self.gaussian_conditional.decompress(
+            y_strings1, indexes1, means=mean1
+        )
+        scale2, mean2 = self.channel_context(y_hat1, scale[:, g1:], mean[:, g1:])
+        indexes2 = self.gaussian_conditional.build_indexes(scale2)
+        y_hat2 = self.gaussian_conditional.decompress(
+            y_strings2, indexes2, means=mean2
+        )
+        y_hat = torch.cat((y_hat1, y_hat2), dim=1)
         base_hat = self.base_entropy_bottleneck.decompress(base_strings, base_shape)
         return self._synthesis(y_hat, base_hat)
 
@@ -816,10 +942,17 @@ class KakeyaHyperpriorCodec(nn.Module):
         mu = self._analysis(image, decoded_base_reference)
         z = self.h_a(mu)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        params = self._apply_h_s(z_hat)
-        scale, mean = params.chunk(2, dim=1)
-        scale = scale.abs() + 1e-6
-        y_hat, y_likelihoods = self.gaussian_conditional(mu, scale, mean)
+        scale, mean = self._hyper_scale_mean(z_hat, mu.shape[-2:])
+        g1, g2 = self.group1_channels, self.group2_channels
+        # Pass 1: group 1 from hyperprior only.
+        y_hat1, y_likelihoods1 = self.gaussian_conditional(
+            mu[:, :g1], scale[:, :g1], mean[:, :g1]
+        )
+        # Pass 2: group 2 conditioned on the quantized group 1.
+        scale2, mean2 = self.channel_context(y_hat1, scale[:, g1:], mean[:, g1:])
+        y_hat2, y_likelihoods2 = self.gaussian_conditional(mu[:, g1:], scale2, mean2)
+        y_hat = torch.cat((y_hat1, y_hat2), dim=1)
+        y_likelihoods = torch.cat((y_likelihoods1, y_likelihoods2), dim=1)
         reconstructed = self._synthesis(y_hat, base_hat)
         return (
             reconstructed,
@@ -865,24 +998,17 @@ class KakeyaHyperpriorCodec(nn.Module):
         z_hat = self.entropy_bottleneck.decompress(
             self.entropy_bottleneck.compress(z), z.size()[-2:]
         )
-        params = self._apply_h_s(z_hat)
-        scale, mean = params.chunk(2, dim=1)
-        scale = scale.abs() + 1e-6
-        # The hyperprior decoder (h_s) uses transposed convolutions that may
-        # produce a slightly different spatial size than g_a's output for
-        # non-power-of-2 image dimensions.  Interpolate to match mu so the
-        # GaussianConditional doesn't crash with a size mismatch.
-        if scale.shape[-2:] != mu.shape[-2:]:
-            scale = F.interpolate(
-                scale, size=mu.shape[-2:], mode="bilinear", align_corners=False
-            )
-            mean = F.interpolate(
-                mean, size=mu.shape[-2:], mode="bilinear", align_corners=False
-            )
+        scale, mean = self._hyper_scale_mean(z_hat, mu.shape[-2:])
+        g1, g2 = self.group1_channels, self.group2_channels
         # GaussianConditional quantizes y with learned step size:
         #   y_hat = round((mu - mean) / scale) * scale + mean
-        # This yields finer gradations (~0.1 steps vs 1.0 for integer round).
-        y_hat, _ = self.gaussian_conditional(mu, scale, mean)
+        # Group 1 uses hyperprior params; group 2 uses the channel context.
+        y_hat1, _ = self.gaussian_conditional(
+            mu[:, :g1], scale[:, :g1], mean[:, :g1]
+        )
+        scale2, mean2 = self.channel_context(y_hat1, scale[:, g1:], mean[:, g1:])
+        y_hat2, _ = self.gaussian_conditional(mu[:, g1:], scale2, mean2)
+        y_hat = torch.cat((y_hat1, y_hat2), dim=1)
         return self._synthesis(y_hat, base_hat)
 
 
@@ -1248,12 +1374,17 @@ def _checkpoint(
             "architecture": {
                 "name": "kakeya_multiscale_hyperprior",
                 "version": CODEC_ARCHITECTURE_VERSION,
+                "bitstream_format": CODEC_BITSTREAM_FORMAT,
                 "hyper_dim": model.hyper_dim,
                 "base_channels": BASE_LATENT_CHANNELS,
                 "base_downsample": BASE_DOWNSAMPLE,
                 "base_transform": "full_ycocg_v2",
                 "detail_transform": "decoded_base_residual_v2",
                 "detail_sampling": "haar_sch_v1",
+                "channel_group_context": "minnen_2020",
+                "context_group_count": CONTEXT_GROUP_COUNT,
+                "group1_channels": model.group1_channels,
+                "group2_channels": model.group2_channels,
             },
             "epoch": epoch,
         },
@@ -2463,14 +2594,19 @@ def _encode_bitstream(
     *,
     write_file: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Encode Base-first Haar-SCH Detail into the real v10 payload."""
+    """Encode Base-first Haar-SCH Detail into the real v11 payload.
+
+    Payload layout: ``[z_len][z][y1_len][y1][y2_len][y2][base_len][base]``
+    where ``y1``/``y2`` are the two channel-group Detail streams (group 1
+    from the hyperprior, group 2 conditioned on group 1).
+    """
     import struct as _struct
 
     model.eval()
     model.update()
 
     compressed = model.compress(image)
-    y_strings, z_strings, base_strings = compressed["strings"]
+    y_strings1, y_strings2, z_strings, base_strings = compressed["strings"]
     reconstructed = model.decompress(
         compressed["strings"],
         compressed["shape"],
@@ -2478,9 +2614,10 @@ def _encode_bitstream(
         compressed["base_shape"],
     )
 
-    # Pack: [z_len:4B][z_data][y_len:4B][y_data][base_len:4B][base_data]
+    # Pack: [z_len:4B][z][y1_len:4B][y1][y2_len:4B][y2][base_len:4B][base]
     payload = _struct.pack(">I", len(z_strings[0])) + z_strings[0]
-    payload += _struct.pack(">I", len(y_strings[0])) + y_strings[0]
+    payload += _struct.pack(">I", len(y_strings1[0])) + y_strings1[0]
+    payload += _struct.pack(">I", len(y_strings2[0])) + y_strings2[0]
     payload += _struct.pack(">I", len(base_strings[0])) + base_strings[0]
 
     file_bytes = len(payload)
@@ -2490,15 +2627,16 @@ def _encode_bitstream(
         bitstream_path.write_bytes(payload)
     height, width = image.shape[-2:]
     bitstream_bpp = file_bytes * 8 / (height * width)
+    y_total = len(y_strings1[0]) + len(y_strings2[0])
     return reconstructed, {
         "path": "reports/reconstruction.kky",
         "filename": "reconstruction.kky",
         "format": CODEC_BITSTREAM_FORMAT,
         "bytes": file_bytes,
-        "payload_bytes": (len(z_strings[0]) + len(y_strings[0]) + len(base_strings[0])),
-        "structure_bytes": len(z_strings[0]) + len(y_strings[0]) + 8,
+        "payload_bytes": (len(z_strings[0]) + y_total + len(base_strings[0])),
+        "structure_bytes": len(z_strings[0]) + y_total + 12,
         "base_bytes": len(base_strings[0]) + 4,
-        "header_bytes": 12,
+        "header_bytes": 16,
         "bpp": bitstream_bpp,
         "requires_checkpoint": True,
         "checkpoint": "checkpoints/final.pt",

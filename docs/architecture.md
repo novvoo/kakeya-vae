@@ -177,6 +177,10 @@ flowchart TD
     style F1 fill:#c8e6c9
 ```
 
+> 挂谷正则约束的是方向管的几何分布，与变换网络的序列建模技术（CNN / Transformer / SSM）正交，
+> 因此在 §9.7 演进谱系中，无论变换网络如何演进（SCH → LKA → Mamba/SSM），挂谷正则都作为
+> 独立的高频方向约束项持续生效，不受架构演进影响。
+
 
 ---
 
@@ -228,11 +232,16 @@ graph TD
         HD3 --> H_SPLIT[按通道分为两组<br/>→ scale + mean]
     end
 
-    subgraph CONDITIONAL["条件高斯熵模型"]
-        TANH --> GC[GaussianConditional<br/>N(y_hat | mean, scale)]
-        H_SPLIT -->|scale, mean| GC
-        GC --> Y_HAT[y_hat<br/>量化潜变量]
-        GC --> RATE[-log p(y_hat)<br/>空间自适应码率]
+    subgraph CONDITIONAL["通道维上下文条件高斯熵模型"]
+        TANH --> Q1[量化 y_g1 → y_hat_g1<br/>仅超先验条件]
+        Q1 --> CH_GRP[ChannelGroupContext<br/>8 通道分 2 组<br/>y_hat_g1 → group2 (scale,mean)]
+        H_SPLIT -->|scale, mean| GC1[GaussianConditional<br/>N(y_hat_g1 | mean1, scale1)]
+        CH_GRP --> GC2[GaussianConditional<br/>N(y_hat_g2 | mean2, scale2)]
+        Q1 --> GC1
+        GC1 --> Y_HAT[y_hat = cat(y_hat_g1, y_hat_g2)<br/>量化潜变量]
+        GC2 --> Y_HAT
+        GC1 --> RATE1[-log p(y_hat_g1 | z)]
+        GC2 --> RATE2[-log p(y_hat_g2 | z, y_hat_g1)<br/>通道维自适应码率]
     end
     subgraph SYNTHESIS["g_s — Detail 综合变换"]
 
@@ -327,20 +336,21 @@ graph LR
 
 | 维度 | 说明 |
 |---|---|
-| 熵模型 | 独立因子分解 `p(z)·p(y_detail\|z)·p(y_base)`：EntropyBottleneck（z/Base）+ GaussianConditional（Detail） |
+| 熵模型 | 通道维上下文自适应 `p(y_detail_g2\|z, y_detail_g1)·p(y_detail_g1\|z)·p(z)·p(y_base)`：EntropyBottleneck（z/Base）+ 通道维分组上下文 ChannelGroupContext（Minnen 2020，2 组：group1 由超先验解码、group2 由 group1 条件化）+ GaussianConditional（Detail）。Checkerboard 空间上下文待落地 |
 | 激活函数 | 分析侧 Residual GDN；合成侧 Residual IGDN |
 | 归一化 | BlendedInstanceNorm，初始 90% IN + 10% 原始幅度路径 |
 | 多尺度块 | 局部 3x3 与 dilation=2 分支融合 |
 | 下采样 | Detail 边界固定 Haar DWT 2x + SpaceToDepth 2x = 4x |
 | 上采样 | LearnedUpsample 2x + 固定 Haar IDWT 2x |
 | SCH | 64 通道瓶颈各放一个对称块；32 local + 32 window-channel，4×4 window / 4 heads；高清按 2048 windows 分块以限制峰值内存 |
+| SCH 前沿对标 | 当前固定 4×4 窗口；2023 Mixed Transformer-CNN/HAT（窗口注意力）、2024 NAT 邻域注意力（滑窗）、2024-2025 LKA/D-LKA（大核/可变形）、2024-2025 Mamba/SSM（线性复杂度全局）均为可选演进方向，待上下文熵模型落地后评估（详见 §9.7） |
 | Detail 输入 | `YCoCg - upsample(low-frequency YCoCg)`；不再重复编码 Base |
 | Detail 输出 | `2·tanh` 有符号 YCoCg 残差，直接与 expanded Base 相加；无 Sigmoid |
 | Base 分支 | 完整低频 Y/Co/Cg、/8 采样、4 通道可学习 latent；无 IN，独立码流 |
 | 损失函数 | MSE + edge + structural + multiscale + Laplacian + flat-region anti-ringing + LAB + Base + Detail + λ·rate + λₖ·kakeya |
 | h_s 增强 | Self-Attention；大图使用 16x16 窗口 |
 | 潜空间 | 8 通道, ±5 bound, GaussianConditional 量化 |
-| checkpoint | 架构版本 8，Kakeya Hyperprior v10 `[z,y_detail,y_base]`；明确不兼容旧架构 |
+| checkpoint | 架构版本 9，Kakeya Hyperprior v11 `[z,y_detail_g1,y_detail_g2,y_base]`；新增 `channel_context`，明确不兼容 v8 checkpoint 与 v10 bitstream |
 ---
 
 ## 3. 损失函数组成
@@ -717,7 +727,7 @@ flowchart TD
     CHK -->|W or H > 4096| REJECT[拒绝: 超过 4096px]
     CHK -->|OK| PAD[16 倍数边缘复制对齐<br/>Base / Haar / SCH 共同对齐]
 
-    PAD --> LOAD[加载 architecture v8 checkpoint<br/>严格校验学习参数]
+    PAD --> LOAD[加载 architecture v9 checkpoint<br/>严格校验学习参数<br/>含 channel_context]
     LOAD --> BASE[完整低频 YCoCg<br/>/8 → 4 channel latent]
     BASE --> BCODE[Base EntropyBottleneck<br/>编码并解码]
     BCODE --> BASE_DEC[Base Synthesis<br/>decoded Base reference]
@@ -729,7 +739,9 @@ flowchart TD
     Y --> HA[h_a → z]
     HA --> ZCODE[EntropyBottleneck<br/>编码并解码 z]
     ZCODE --> PARAMS[h_s + Attention<br/>mean / scale]
-    Y --> YCODE[GaussianConditional<br/>条件编码并解码 y]
+    Y --> CB_ENC[Checkerboard 空间上下文<br/>2-pass 并行编码]
+    CB_ENC --> CH_ENC[通道维分组上下文<br/>8 通道分 2 组]
+    CH_ENC --> YCODE[GaussianConditional<br/>条件编码并解码 y]
     PARAMS --> YCODE
     YCODE --> DECODE[IGDN + SCH<br/>预测 Haar coefficients]
     DECODE --> IDWT_HD[固定 Haar IDWT<br/>有符号 YCoCg Detail]
@@ -804,7 +816,7 @@ graph LR
 
 #### 当前方案：可学习的 Base / Detail 分解
 
-架构 v8 先把 RGB 可逆转换为 YCoCg，再显式分解成 `/8` Base low-pass 和有符号
+架构 v9 先把 RGB 可逆转换为 YCoCg，再显式分解成 `/8` Base low-pass 和有符号
 Detail high-pass。完整低频 Y/Co/Cg 由不含 InstanceNorm 的 Base Analysis /
 Synthesis 编码为 4 通道潜变量；编码端先量化并重建 Base，Detail 编码器再接收
 减去这个 decoded Base 后的残差，从而能在 Detail 中补偿 Base 量化误差，
@@ -815,12 +827,25 @@ Detail 解码器预测 12 个 Haar coefficients，
 经 IDWT 生成有符号 YCoCg 残差，不经过 Sigmoid。合成仍使用严格可逆的
 Laplacian pyramid 形式 `expand(Base) + Detail`。
 
-熵模型刻意保持为 `p(z)·p(y_detail|z)·p(y_base)`，没有引入联合上下文或串行
-自回归依赖。`.kky` v10 使用 `[z,y_detail,y_base]` 三段；编码端 Base-first，解码端仍不需要
-像素级串行自回归。项目以实验效果优先，架构版本为 8，旧 checkpoint
-与 v9 bitstream 明确不兼容。Haar
-不含可学习参数，SCH 只放在 H/4 的对称瓶颈，不把论文的 256/320 通道大模型或
-5-slice 自回归熵模型照搬进当前项目。
+熵模型升级为通道维上下文自适应 `p(y_detail_g2|z, y_detail_g1)·p(y_detail_g1|z)·p(z)·p(y_base)`，
+在超先验基础上引入通道维分组上下文（Minnen 2020 channel-wise autoregressive）：Detail 潜变量
+按通道分 2 组，group 1 仅由超先验参数解码，group 1 量化值再经 `ChannelGroupContext` 与超先验
+参数融合得到 group 2 的 `(scale, mean)`。两次通道组 pass 仍为并行解码（组内全并行、组间仅 2 步），
+不引入像素级串行自回归。该设计基于空间-通道上下文建模的经典框架（Minnen 2020 channel-wise
+autoregressive；ELIC CVPR 2022 空间-通道上下文），并参考 2024-2026 年前沿趋势：变换网络侧，
+Mixed Transformer-CNN（CVPR 2023）以 Swin 窗口注意力与 CNN 局部分支混合取得 Kodak/CLIC SOTA、
+邻域注意力 NAT（2024 高效有损编码 RNAB + 多阶段并行上下文 MCM）以滑窗注意力替代固定窗口、
+LKA/D-LKA（2024-2025）以大核/可变形卷积近似自注意力感受野、Mamba/SSM（2024-2025，Mamba-3
+进入 ICLR 2026 评审）以线性复杂度替代全注意力；熵模型侧，2026 CVPR 的扩散/生成式压缩
+（GNVC-VD 视频扩散先验）与 BinaryAttention 1-bit 注意力分别代表"主观质量优先"与"算力压缩"
+两条线，前者与本项目 PSNR 目标冲突，明确不采用。
+kakeya 选择"通道分组上下文熵模型 + Haar 频域分解 + 轻量窗口注意力"三条主线，在保持并行解码的前提下
+显著降低条件熵。`.kky` v11 使用 `[z, y_detail_g1, y_detail_g2, y_base]` 四段；编码端 Base-first，
+解码端 group1→group2 通道维两步并行。项目以实验效果优先，架构版本为 9，旧 checkpoint（v8）
+与 v10 bitstream 明确不兼容（新增 `channel_context` 参数）。Checkerboard 空间上下文
+（ELIC 2022）为 P0 剩余的另一半，待通道分组验证收益后落地。Haar 不含可学习参数，SCH 只放在
+H/4 的对称瓶颈，不把论文的 256/320 通道大模型或 5-slice 自回归熵模型照搬进当前项目。
+完整演进谱系与取舍见 §9.7。
 
 训练数据通过 step mixer 按实际优化步骤执行 40% reference / 30% procedural /
 30% real；checkpoint 除 PSNR/SSIM 外还保护高清 chroma MAE。
@@ -1012,3 +1037,109 @@ flowchart LR
     style BAD fill:#ffcdd2
     style MAX_DEV fill:#fff9c4
 ```
+
+### 9.7 技术演进与前沿对标
+
+下图标明 kakeya 当前架构在 2018→2026 学习型图像压缩演进谱系中的位置，以及下一步可借鉴的前沿方向。kakeya 目标是 PSNR 优先、轻量可部署，因此选择性吸收"上下文熵模型 + 频域分解 + 线性复杂度全局建模"三条主线，不照搬大模型生成式压缩（与 PSNR 目标冲突）。
+
+```mermaid
+flowchart TD
+    subgraph 2018["2018 — mbt2018 基线"]
+        MBT[Min/Ballé/Toderici<br/>超先验 + GaussianConditional<br/>p(z)·p(y|z) 因子分解<br/>GDN 变换]
+    end
+
+    subgraph 2020["2020 — 通道维上下文"]
+        CW[Minnen 2020<br/>Channel-wise Autoregressive<br/>前组通道→后组条件<br/>显著降条件熵]
+    end
+
+    subgraph 2022["2022 — 空间-通道联合上下文"]
+        ELIC[ELIC CVPR 2022 oral<br/>Checkerboard 空间 2-pass 并行<br/>+ 通道分组<br/>Inverted Residual 变换]
+    end
+
+    subgraph 2023["2023 — 注意力变换网络"]
+        MIX[Mixed Transformer-CNN<br/>CVPR 2023<br/>CNN 局部 + Swin 窗口全局<br/>Kodak/CLIC SOTA]
+        HAT[HAT CVPR 2023<br/>通道注意力 + 窗口自注意力<br/>交叉窗口聚合]
+    end
+
+    subgraph 2024["2024 — 邻域/窗口注意力压缩"]
+        NAT[高效有损编码<br/>Residual Neighborhood Attention<br/>+ 多阶段并行上下文 MCM]
+        WIN[Window-based Attention<br/>for Image Compression<br/>窗口注意力替代全注意力]
+        LKA[LKA / D-LKA<br/>大核分离卷积<br/>可变形大核注意力<br/>近似自注意力感受野]
+    end
+
+    subgraph 2024_2025["2024-2025 — 线性复杂度全局建模"]
+        SSM[Mamba / SSM<br/>状态空间模型<br/>线性复杂度替代 Transformer<br/>Mamba-3 进入 ICLR 2026 评审]
+    end
+
+    subgraph 2026["2026 — 高效/生成式前沿"]
+        BIN[BinaryAttention CVPR 2026<br/>1-bit 注意力<br/>算力大幅下降]
+        GNVC[GNVC-VD CVPR 2026<br/>扩散先验生成式视频压缩<br/>主观质量优先/极低码率]
+    end
+
+    subgraph KAKEYA["kakeya 当前定位（v9）"]
+        K1[Haar DWT/IDWT 频域分解<br/>+ Base/Detail 分层]
+        K2[LightweightSCHBlock<br/>4×4 窗口通道注意力]
+        K3[超先验 + 通道维分组上下文<br/>p(y_g2|z,y_g1)·p(y_g1|z)·p(z)·p(y_base)<br/>Checkerboard 空间上下文待引入]
+        K4[挂谷正则<br/>方向管正则化]
+    end
+
+    MBT --> CW --> ELIC
+    ELIC --> MIX
+    ELIC --> HAT
+    MIX --> NAT
+    HAT --> NAT
+    MIX --> WIN
+    NAT --> LKA
+    WIN --> LKA
+    ELIC --> SSM
+    LKA --> 2026
+    SSM --> 2026
+
+    MBT -.->|频域分层借鉴| K1
+    CW -.->|已落地: 通道维分组上下文| K3
+    ELIC -.->|待引入: Checkerboard 空间上下文| K3
+    MIX -.->|借鉴: CNN+窗口注意力混合| K2
+    HAT -.->|借鉴: 通道+窗口混合注意力| K2
+    NAT -.->|可选: 邻域注意力替代固定窗口| K2
+    LKA -.->|可选: 大核增强局部感受野| K2
+    SSM -.->|可选: 替代 SCH 全局建模| K2
+    BIN -.->|可选: SCH 注意力二值化| K2
+    GNVC -.->|不采用: 与 PSNR 目标冲突| K3
+
+    style KAKEYA fill:#fff9c4
+    style 2024_2025 fill:#e8f5e9
+    style 2026 fill:#fce4ec
+    style 2018 fill:#e1f5fe
+    style 2020 fill:#f3e5f5
+    style 2022 fill:#e8eaf6
+    style 2023 fill:#fff3e0
+    style 2024 fill:#e0f7fa
+```
+
+#### 演进判断与 kakeya 取舍
+
+| 前沿方向 | 成熟度 | 与 kakeya 契合度 | 取舍 |
+|---|---|---|---|
+| Checkerboard 空间上下文（ELIC 2022） | 工程成熟 | 高：并行解码，不破坏码流 | **下一步引入**，与已落地的通道分组上下文组合为完整空间-通道上下文 |
+| 通道维分组上下文（Minnen 2020） | 工程成熟 | 高：8 通道天然可分组 | **已落地**（v9 `ChannelGroupContext`），预期 +1.0~1.5 dB，待训练验证 |
+| 混合 Transformer-CNN 变换（CVPR 2023） | 工程可用 | 中：SCH 已是 CNN+注意力混合 | 借鉴其 Swin 窗口聚合思路优化 SCH |
+| 邻域注意力 NAT + 多阶段并行上下文（2024） | 工程可用 | 高：可替代固定 4×4 窗口、并行解码 | 备选，待上下文熵模型落地后评估 |
+| 大核/可变形 LKA（2024-2025） | 工程可用 | 中：可增强 SCH 局部感受野 | 备选，与 NAT 二选一 |
+| Mamba/SSM 线性全局建模（2024-2025，Mamba-3 ICLR 2026 评审） | 论文阶段，算子生态不完善 | 中：SCH 已做窗口全局，SSM 收益边际 | 观望，待 `mamba-ssm` 生态稳定 |
+| 扩散/生成式压缩 GNVC-VD（CVPR 2026） | 论文阶段 | 低：PSNR 会降，主观质量优先 | 不采用，除非转向感知质量目标 |
+| BinaryAttention 1-bit（CVPR 2026） | 论文阶段 | 中：可降低 SCH 算力 | 观望，轻量化备选 |
+
+#### kakeya 与 SOTA 的差距分解
+
+以 2.5 bpp、Kodak 256² 为参照：
+
+| 差距来源 | 估计 dB | 对应技术 | 优先级 |
+|---|---|---|---|
+| 无空间上下文（通道分组已落地） | -0.5~1.0 | ELIC Checkerboard 空间上下文 | P0（剩余） |
+| GDN 变换参数效率低 | -0.5~1.0 | ELIC Inverted Residual + SE | P1 |
+| 单组超先验表达力不足 | -0.3~0.5 | 分组超先验 | P2 |
+| SCH 窗口固定不重叠 | -0.2~0.4 | LKA 或 NAT 滑窗 | P3 |
+| 量化粗糙 | -0.2~0.3 | 可学习量化步长 | P4 |
+
+通道维分组上下文（v9 已落地）预期先缩小约 1.0~1.5 dB；Checkerboard 空间上下文落地后再缩小 0.5~1.0 dB。合计 P0 完整落地可缩小约 1.5~2.5 dB。
+

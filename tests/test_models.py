@@ -2,11 +2,16 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import kakeya.image_codec as image_codec_module
 from kakeya.image_codec import (
     BASE_LATENT_CHANNELS,
+    CODEC_ARCHITECTURE_VERSION,
+    CODEC_BITSTREAM_FORMAT,
+    ChannelGroupContext,
+    CONTEXT_GROUP_COUNT,
     TRAIN_MIX_CYCLE,
     BlendedInstanceNorm,
     DepthToSpace,
@@ -16,6 +21,7 @@ from kakeya.image_codec import (
     LightweightSCHBlock,
     SpaceToDepth,
     WindowChannelAttention,
+    _checkpoint,
     _compose_base_detail,
     _detail_ycocg,
     _encode_bitstream,
@@ -189,7 +195,7 @@ def test_hyperprior_bitstream_round_trip_uses_conditional_model(
 
     assert decoded.shape == image.shape
     assert torch.isfinite(decoded).all()
-    assert metadata["format"] == "Kakeya Hyperprior v10"
+    assert metadata["format"] == "Kakeya Hyperprior v11"
     assert metadata["bytes"] == (tmp_path / "reports/reconstruction.kky").stat().st_size
     assert metadata["bytes"] > metadata["header_bytes"]
     assert metadata["base_bytes"] > 4
@@ -574,3 +580,195 @@ def test_entropy_cdf_remains_finite_after_training_step() -> None:
 
     assert torch.isfinite(torch.tensor(metrics["total"]))
     assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Channel-wise autoregressive context (Minnen 2020) — v9 architecture
+# ---------------------------------------------------------------------------
+
+
+def test_channel_group_context_splits_latent_into_equal_groups() -> None:
+    model = KakeyaHyperpriorCodec(latent_dim=8, hyper_dim=8)
+
+    assert CONTEXT_GROUP_COUNT == 2
+    assert model.group1_channels == 4
+    assert model.group2_channels == 4
+    assert model.group1_channels + model.group2_channels == model.latent_dim
+
+
+def test_channel_group_context_rejects_undivisible_latent_dim() -> None:
+    with pytest.raises(ValueError, match="divisible by CONTEXT_GROUP_COUNT"):
+        KakeyaHyperpriorCodec(latent_dim=7)
+
+
+def test_channel_group_context_forward_shapes_and_positive_scale() -> None:
+    g1, g2 = 3, 5
+    ctx = ChannelGroupContext(g1, g2)
+    y_hat_g1 = torch.randn(2, g1, 8, 10)
+    hyper_scale_g2 = torch.rand(2, g2, 8, 10) + 0.1
+    hyper_mean_g2 = torch.randn(2, g2, 8, 10)
+
+    scale_g2, mean_g2 = ctx(y_hat_g1, hyper_scale_g2, hyper_mean_g2)
+
+    assert scale_g2.shape == mean_g2.shape == (2, g2, 8, 10)
+    assert (scale_g2 > 0).all()
+    assert torch.isfinite(scale_g2).all()
+    assert torch.isfinite(mean_g2).all()
+
+
+def test_channel_group_context_fusion_starts_identity_initialized() -> None:
+    """At init, fusion passes hyperprior params through → group 2 starts from v8 behavior.
+
+    This is the critical fix for the 0806 regression: the old zero-init made
+    scale_g2≈1e-6 (naked quantization) for 40 epochs. Identity init makes
+    scale_g2≈hyper_scale_g2 and mean_g2≈hyper_mean_g2 from step 1.
+    """
+    g1, g2 = 4, 4
+    ctx = ChannelGroupContext(g1, g2)
+    # context_proj is zero-init so context contributes nothing at start.
+    assert torch.allclose(ctx.context_proj.weight, torch.zeros_like(ctx.context_proj.weight))
+    assert torch.allclose(ctx.context_proj.bias, torch.zeros_like(ctx.context_proj.bias))
+
+    y_hat_g1 = torch.randn(1, g1, 4, 4)
+    hyper_scale_g2 = torch.rand(1, g2, 4, 4) + 0.1
+    hyper_mean_g2 = torch.randn(1, g2, 4, 4)
+
+    scale_g2, mean_g2 = ctx(y_hat_g1, hyper_scale_g2, hyper_mean_g2)
+
+    # Identity init + zero context_proj → scale_g2 ≈ |hyper_scale_g2| + 1e-6,
+    # mean_g2 ≈ hyper_mean_g2. Since hyper_scale_g2 > 0, |x|+1e-6 ≈ x.
+    torch.testing.assert_close(
+        scale_g2, hyper_scale_g2 + 1e-6, atol=1e-7, rtol=1e-6
+    )
+    torch.testing.assert_close(mean_g2, hyper_mean_g2, atol=1e-7, rtol=1e-6)
+
+
+def test_channel_group_context_context_net_is_single_3x3_conv() -> None:
+    """v9.1 reduces context_net from two 5×5 convs to one 3×3 to curb overfitting."""
+    g1, g2 = 4, 4
+    ctx = ChannelGroupContext(g1, g2)
+
+    # context_net is a single weight_norm-wrapped Conv2d (no Sequential).
+    assert isinstance(ctx.context_net, nn.Module)
+    underlying = ctx.context_net
+    # The weight_norm parametrization wraps a Conv2d; check kernel size.
+    assert hasattr(underlying, "weight")
+    assert underlying.weight.shape == (g2 * 2, g1, 3, 3), (
+        f"expected (g2*2, g1, 3, 3), got {underlying.weight.shape}"
+    )
+
+
+def test_channel_group_context_backpropagates_to_context_net() -> None:
+    g1, g2 = 4, 4
+    ctx = ChannelGroupContext(g1, g2)
+    y_hat_g1 = torch.randn(1, g1, 8, 8, requires_grad=True)
+    hyper_scale_g2 = torch.rand(1, g2, 8, 8) + 0.1
+    hyper_mean_g2 = torch.randn(1, g2, 8, 8)
+
+    scale_g2, mean_g2 = ctx(y_hat_g1, hyper_scale_g2, hyper_mean_g2)
+    (scale_g2.mean() + mean_g2.mean()).backward()
+
+    # fusion is a plain Conv2d (leaf tensor) so its weight grad is populated.
+    assert ctx.fusion.weight.grad is not None
+    assert torch.isfinite(ctx.fusion.weight.grad).all()
+    # context_proj is also a plain Conv2d; its grad should be populated.
+    assert ctx.context_proj.weight.grad is not None
+    assert torch.isfinite(ctx.context_proj.weight.grad).all()
+    # y_hat_g1 receives gradient through context_net.
+    assert y_hat_g1.grad is not None
+    assert torch.isfinite(y_hat_g1.grad).all()
+
+
+def test_forward_uses_two_pass_channel_group_quantization() -> None:
+    """forward() must split y_hat into group1 (hyperprior) + group2 (context)."""
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4).eval()
+    model.update()
+    image = torch.rand(1, 3, 32, 32)
+
+    with torch.no_grad():
+        reconstructed, mu, _, y_hat, y_likelihoods, _, _ = model(image)
+
+    g1 = model.group1_channels
+    assert y_hat.shape == mu.shape == (1, 4, 8, 8)
+    assert y_likelihoods.shape == mu.shape
+    # Likelihoods for group 1 and group 2 are concatenated along channels.
+    assert y_likelihoods[:, :g1].shape == (1, g1, 8, 8)
+    assert y_likelihoods[:, g1:].shape == (1, model.group2_channels, 8, 8)
+    assert torch.isfinite(y_hat).all()
+
+
+def test_compress_returns_four_segment_strings() -> None:
+    """compress() must produce [y_strings1, y_strings2, z_strings, base_strings]."""
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4).eval()
+    model.update()
+    image = torch.rand(1, 3, 32, 32)
+
+    compressed = model.compress(image)
+
+    assert len(compressed["strings"]) == 4
+    y_strings1, y_strings2, z_strings, base_strings = compressed["strings"]
+    assert len(y_strings1[0]) > 0
+    assert len(y_strings2[0]) > 0
+    assert len(z_strings[0]) > 0
+    assert len(base_strings[0]) > 0
+    assert isinstance(compressed["shape"], tuple)
+    assert isinstance(compressed["y_shape"], tuple)
+    assert isinstance(compressed["base_shape"], tuple)
+
+
+def test_compress_decompress_round_trip_matches_reconstruct() -> None:
+    """Range-coded compress → decompress must match reconstruct() deterministically."""
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4).eval()
+    model.update()
+    image = torch.rand(1, 3, 32, 32)
+
+    compressed = model.compress(image)
+    decoded = model.decompress(
+        compressed["strings"],
+        compressed["shape"],
+        compressed["y_shape"],
+        compressed["base_shape"],
+    )
+    with torch.no_grad():
+        replay = model.reconstruct(image)
+
+    torch.testing.assert_close(decoded, replay, atol=1e-6, rtol=1e-5)
+    assert decoded.shape == image.shape
+
+
+def test_decompress_rejects_wrong_string_count() -> None:
+    model = KakeyaHyperpriorCodec(latent_dim=4, hyper_dim=4).eval()
+    model.update()
+    image = torch.rand(1, 3, 32, 32)
+    compressed = model.compress(image)
+    # Drop the last segment (base_strings) to simulate a v10 3-segment payload.
+    truncated = compressed["strings"][:3]
+
+    with pytest.raises((ValueError, TypeError)):
+        model.decompress(
+            truncated,
+            compressed["shape"],
+            compressed["y_shape"],
+            compressed["base_shape"],
+        )
+
+
+def test_checkpoint_architecture_records_channel_group_metadata(tmp_path) -> None:
+    """_checkpoint must persist v9 architecture + channel-group metadata."""
+    from kakeya.config import ExperimentConfig
+
+    model = KakeyaHyperpriorCodec(latent_dim=8, hyper_dim=8)
+    config = ExperimentConfig(method="image_codec")
+    ckpt_path = tmp_path / "final.pt"
+    _checkpoint(ckpt_path, model, config, epoch=1)
+
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    architecture = payload["architecture"]
+
+    assert architecture["version"] == CODEC_ARCHITECTURE_VERSION == 9
+    assert architecture["bitstream_format"] == CODEC_BITSTREAM_FORMAT
+    assert architecture["channel_group_context"] == "minnen_2020"
+    assert architecture["context_group_count"] == CONTEXT_GROUP_COUNT == 2
+    assert architecture["group1_channels"] == model.group1_channels == 4
+    assert architecture["group2_channels"] == model.group2_channels == 4
+    assert architecture["hyper_dim"] == model.hyper_dim

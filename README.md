@@ -340,11 +340,11 @@ python scripts/codec_cli.py decode \
 如果 `assets/hd_images/` 目录为空，训练会自动 fallback 到参考图文卡，
 但颜色与细节泛化效果会受限。
 
-传统图文模型（`ImageCodecVAE`）采用容量闸门控制的两阶段训练。
-超先验模型（`KakeyaHyperpriorCodec`）使用 Capacity → Transition → Finetune
+传统图文模型早期采用容量闸门控制的两阶段训练。
+当前图文模型（`KakeyaHyperpriorCodec`，架构 v9）使用 Capacity → Transition → Finetune
 三阶段权重调度。容量阶段优先建立结构与颜色还原能力，过闸后逐步加入完整码率
-约束。训练使用
-CompressAI EntropyBottleneck 的同一套中心量化路径做 straight-through 训练，
+约束。训练使用 CompressAI 的 EntropyBottleneck + GaussianConditional +
+通道维分组上下文（`ChannelGroupContext`，Minnen 2020）做 straight-through 量化，
 让训练、验证和最终 `.kky` 解码看到一致的离散潜变量，并只优化文字加权重建、
 MSE、边缘、结构与多尺度损失；量化测试卡达到 PSNR 30 且结构保真 97% 后，
 才进入压缩微调。若在最大轮次内未通过闸门，模型会继续专注还原，
